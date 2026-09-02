@@ -289,40 +289,42 @@ pub fn file_op(
     inputs.push(graph.edge(source_tree));
     let src_index = (inputs.len() - 1) as i64;
 
-    let copy = pb::FileActionCopy {
-        src: src_path.join(","),
-        dest: dest_path.clone(),
-        // chown requires resolving a uid/gid (base-image user lookup at build
-        // time); v1 does not fabricate one. The `--chown` string is preserved
-        // in image history/metadata, resolved during file apply by buildkit
-        // from the exec environment where possible.
-        owner: None,
-        mode: 0,
-        follow_symlink: false,
-        dir_copy_contents: false,
-        attempt_unpack_docker_compatibility: is_add,
-        create_dest_path: true,
-        allow_wildcard: true,
-        allow_empty_wildcard: false,
-        timestamp: 0,
-        include_patterns: vec![],
-        exclude_patterns: vec![],
-        always_replace_existing_dest_paths: false,
-        mode_str: chmod.unwrap_or_default(),
-    };
-
-    let action = pb::file_action::Action::Copy(copy);
-    let file_action = pb::FileAction {
-        input: dest_index,     // destination tree (or Empty for scratch)
-        secondary_input: src_index, // source tree
-        output: 0,
-        action: Some(action),
-    };
+    // One FileActionCopy per source (`COPY a b /dst/` is not a single glob; the
+    // comma-joined src becomes a literal path buildkit can't checksum). All
+    // actions copy into `dest_path`; only the last action is the op's output.
+    let mut actions = Vec::new();
+    for (i, src) in src_path.iter().enumerate() {
+        let copy = pb::FileActionCopy {
+            src: src.clone(),
+            dest: dest_path.clone(),
+            // chown requires resolving a uid/gid (base-image user lookup at
+            // build time); v1 does not fabricate one.
+            owner: None,
+            mode: 0,
+            follow_symlink: false,
+            dir_copy_contents: false,
+            attempt_unpack_docker_compatibility: is_add,
+            create_dest_path: true,
+            allow_wildcard: true,
+            allow_empty_wildcard: false,
+            timestamp: 0,
+            include_patterns: vec![],
+            exclude_patterns: vec![],
+            always_replace_existing_dest_paths: false,
+            mode_str: chmod.clone().unwrap_or_default(),
+        };
+        let action = pb::file_action::Action::Copy(copy);
+        let is_last = i + 1 == src_path.len();
+        actions.push(pb::FileAction {
+            input: dest_index, // destination tree (or Empty for scratch)
+            secondary_input: src_index, // source tree
+            output: if is_last { 0 } else { -1 },
+            action: Some(action),
+        });
+    }
     let _ = chown;
 
-    let file_op = pb::FileOp {
-        actions: vec![file_action],
-    };
+    let file_op = pb::FileOp { actions };
 
     let op = pb::Op {
         inputs,

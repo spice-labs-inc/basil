@@ -179,8 +179,16 @@ pub fn emit_target(
                 for m in &r.mounts {
                     extra.push(mount_to_extra(graph, m, session_id, platform.clone()));
                 }
-                // exec env = accumulated ENV + ARG values not shadowed + cmd env
+                // exec env = accumulated ENV + ARG values not shadowed + cmd env.
+                // If the stage never set PATH, seed a builder default so tools
+                // like cargo/apt (in /usr/local/cargo/bin or /usr/local/bin)
+                // resolve — buildkit otherwise runs the exec with our empty env.
                 let mut exec_env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                if !env.contains_key("PATH") && !cmd_env.iter().any(|e| e.starts_with("PATH=")) {
+                    exec_env.push(
+                        "PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                    );
+                }
                 for (k, v) in &arg_values {
                     if !env.contains_key(k) {
                         exec_env.push(format!("{k}={v}"));
