@@ -144,13 +144,20 @@ pub struct RegistryClient {
 
 impl RegistryClient {
     pub fn new(base_url: &str) -> Self {
+        // Certificate verification is bypassed only when the operator opts in
+        // via BASIL_INSECURE_REGISTRY (e.g. a self-signed test registry). Never
+        // accept invalid certs by default.
+        let insecure = std::env::var("BASIL_INSECURE_REGISTRY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+            .unwrap_or(false);
+        let mut builder = reqwest::Client::builder();
+        if insecure {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
         RegistryClient {
             base: base_url.trim_end_matches('/').to_string(),
             headers: HashMap::new(),
-            client: reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .expect("reqwest client"),
+            client: builder.build().expect("reqwest client"),
         }
     }
 
