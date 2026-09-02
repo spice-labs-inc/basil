@@ -1,0 +1,11 @@
+# Build artifacts — never ship or hash these.
+target/
+
+# Version control + local tooling.
+.git/
+.bazel/
+.idea/
+.vscode/
+
+# Local container/registry dev lands elsewhere; not part of source.
+*.log

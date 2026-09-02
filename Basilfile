@@ -1,0 +1,20 @@
+# Build basil with basil (dogfood). The builder is a static-musl Rust image
+# (rust:alpine targets musl by default), so the deliverable runs on `scratch`.
+
+# --- static builder ---
+FROM rust:1.84-alpine@sha256:fdff417c3845c92360b439382f7d6dabca6c998f59c8dce6cd2a16a2e9e85498 AS builder
+ARG VERSION
+WORKDIR /src
+COPY Cargo.toml Cargo.lock /src/
+RUN mkdir -p /src/src && cargo fetch
+COPY . /src/
+RUN cargo build --release --bin basil
+
+# --- deliverable: the static binary on scratch ---
+FROM scratch AS 127.0.0.1:5001/basil
+COPY --from=builder /src/target/release/basil /basil
+ENV PATH=/usr/local/bin:/usr/bin:/bin
+ENTRYPOINT ["/basil"]
+
+# Build on every push to main.
+ON push(main) BUILD 127.0.0.1:5001/basil

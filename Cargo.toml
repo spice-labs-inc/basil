@@ -30,5 +30,6 @@ prost-build = "0.13"
 # buildkit master's control.proto: its SolveRequest initializer omits the new
 # compatibility_version / proxy_network / source_policy_session fields (which
 # get zero-defaulted). We patch in `..Default::default()`. Root fix is intended
-# upstream; keep the delta minimal and re-sync on the next release.
-buildkit-client = { path = "/home/astewart/Projects/github.com/AprilNEA/buildkit-client" }
+# upstream; keep the delta minimal and re-sync on the next release. Vendored at
+# a relative path so basil's own build (and any context-captured copy) resolves.
+buildkit-client = { path = "third_party/buildkit-client" }
