@@ -57,7 +57,63 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Build(args) => {
-            anyhow::bail!("build subcommand not implemented yet: {}", args.file)
+            // Set up a tokio runtime and connect to buildkitd (external mode).
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                let mut client = buildkit_client::client::BuildKitClient::connect(&args.addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("connecting to {}: {}", args.addr, e))?;
+                client.health_check().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                // A session is required for the solve + context filesync.
+                let mut session = buildkit_client::session::Session::new();
+                let ctx_path = std::path::PathBuf::from(&args.context);
+                session.add_file_sync(ctx_path).await;
+                session
+                    .start(client.control().clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("starting session: {}", e))?;
+
+                // Read event from --event or stdin.
+                let event_json = match &args.event {
+                    Some(p) => Some(std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("{e}"))?),
+                    None => {
+                        let mut s = String::new();
+                        use std::io::Read;
+                        std::io::stdin().read_to_string(&mut s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        if s.trim().is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
+                    }
+                };
+
+                let inp = basil::solver::orchestrate::BuildInput {
+                    file: &args.file,
+                    context: std::path::Path::new(&args.context),
+                    event_json: event_json.as_deref(),
+                    target_filter: args.target.as_ref(),
+                };
+                // A separate channel for the bridge/orchestrator (tonic Channel
+                // is Clone; build one from the same addr).
+                let channel = tonic::transport::Endpoint::from_shared(args.addr.clone())
+                    .map_err(|e| anyhow::anyhow!("bad addr: {e}"))?
+                    .connect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("connecting bridge channel: {e}"))?;
+                let results = basil::solver::orchestrate::run(
+                    channel,
+                    &session.get_id(),
+                    inp,
+                )
+                .await?;
+                for (k, v) in &results {
+                    println!("{k} = {v}");
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
         }
         Command::Gc(args) => {
             anyhow::bail!("gc subcommand not implemented yet: {}", args.age)

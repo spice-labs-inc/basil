@@ -18,6 +18,11 @@ flate2 = "1"
 tar = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prost-types = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
 
 [patch.crates-io]
 # Upstream buildkit-client 0.1.4/0.1.5 fails to compile against current

@@ -1,0 +1,4 @@
+FROM alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e AS 127.0.0.1:5001/execrun
+RUN echo hello > /hello.txt
+
+ON push(main) BUILD 127.0.0.1:5001/execrun

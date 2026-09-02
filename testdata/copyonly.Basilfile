@@ -1,0 +1,6 @@
+FROM scratch AS 127.0.0.1:5001/copyonly
+COPY hello.txt /hello.txt
+ENV FOO=bar
+CMD ["/bin/true"]
+
+ON push(main) BUILD 127.0.0.1:5001/copyonly

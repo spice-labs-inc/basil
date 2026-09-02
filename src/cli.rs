@@ -35,9 +35,15 @@ pub struct BuildArgs {
     /// The DSL file to parse.
     #[arg(default_value = "Basilfile")]
     pub file: String,
+    /// Build context root (where COPY/ADD and `.dockerignore` resolve).
+    #[arg(long, default_value = ".")]
+    pub context: String,
     /// Event JSON delivered on stdin (GitHub Actions payload).
     #[arg(long)]
     pub event: Option<String>,
+    /// buildkitd gRPC address (defaults to $BUILDKIT_HOST).
+    #[arg(long, env = "BUILDKIT_HOST", default_value = "tcp://127.0.0.1:8818")]
+    pub addr: String,
     /// Manual trigger: run a specific target's reaction.
     #[arg(short = 't', long)]
     pub target: Option<String>,

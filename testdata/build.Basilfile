@@ -1,0 +1,10 @@
+FROM golang:1.23@sha256:60deed95d3888cc5e4d9ff8a10c54e5edc008c6ae3fba6187be6fb592e19e8c0 AS build
+COPY hello.txt /src/hello.txt
+RUN cat /src/hello.txt
+
+FROM scratch AS 127.0.0.1:5001/app
+COPY --from=build /src/hello.txt /hello.txt
+ENV FOO=bar
+CMD ["/bin/true"]
+
+ON push(main) BUILD 127.0.0.1:5001/app

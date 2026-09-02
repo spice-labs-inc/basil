@@ -67,7 +67,7 @@ impl Graph {
         self.ops.len()
     }
 
-    #[cfg(test)]
+    /// Access a vertex (for tests/diagnostics).
     pub fn op(&self, i: usize) -> &pb::Op {
         &self.ops[i]
     }
@@ -80,12 +80,10 @@ impl Graph {
         }
     }
 
-    /// Build a `Definition` from a set of output "roots" (the resolved target
-    /// outputs). `roots` are vertex indices; `max_index` is the highest output
-    /// index used. All reachable vertices are numerically ordered; buildkit
-    /// only needs a valid set of `def` (marshaled) + metadata. We include every
-    /// op we created; unreachable-but-present is harmless.
-    pub fn finish(self, _roots: &[usize]) -> pb::Definition {
+    /// Build a `Definition` from `root`, the deliverable output. buildkit
+    /// reads the last `def` entry as the root result, which must be a marker
+    /// vertex (no op type, one input) — mirroring client/llb/state.go. Add it.
+    pub fn finish(self, root: Output) -> pb::Definition {
         let mut def = pb::Definition::default();
         for (i, op) in self.ops.iter().enumerate() {
             def.def.push(op.encode_to_vec());
@@ -93,6 +91,21 @@ impl Graph {
             md.description = HashMap::new();
             def.metadata.insert(self.digest_of[i].clone(), md);
         }
+        // Root marker vertex: no op type, single input = the deliverable output.
+        let root_op = pb::Op {
+            inputs: vec![self.edge(root)],
+            ..Default::default()
+        };
+        let dt = root_op.encode_to_vec();
+        let mut h = Sha256::new();
+        h.update(&dt);
+        let dgst = format!("sha256:{}", hex(&h.finalize()));
+        let mut md = pb::OpMetadata::default();
+        md.caps.insert("constraints".to_string(), true);
+        md.caps.insert("platform".to_string(), true);
+        md.description = HashMap::new();
+        def.def.push(dt);
+        def.metadata.insert(dgst, md);
         def
     }
 }
@@ -113,48 +126,43 @@ pub fn source_image(graph: &mut Graph, reference: &str, platform: Option<pb::Pla
 }
 
 /// A source op for a local context (`local://<id>`), e.g. the build context.
-/// Output 0 is the directory tree.
-pub fn source_local(graph: &mut Graph, id: &str, platform: Option<pb::Platform>) -> Output {
+/// Output 0 is the directory tree. `session_id` associates the source with the
+/// client session whose filesync serves the files (required for transfer).
+pub fn source_local(
+    graph: &mut Graph,
+    id: &str,
+    session_id: &str,
+    platform: Option<pb::Platform>,
+) -> Output {
+    let mut attrs = HashMap::new();
+    if !session_id.is_empty() {
+        // buildkit key `local.sessionid` — `<sharedkey>:<session>` or bare uuid;
+        // here we use the session uuid so sm.Get resolves it.
+        attrs.insert("local.sessionid".to_string(), session_id.to_string());
+        attrs.insert("local.unique".to_string(), id.to_string());
+    }
     let op = pb::Op {
         inputs: vec![],
         platform,
         constraints: None,
         op: Some(pb::op::Op::Source(pb::SourceOp {
             identifier: format!("local://{id}"),
-            attrs: HashMap::new(),
+            attrs,
         })),
     };
     let v = graph.vertex(op);
     graph.output(v, 0)
 }
 
-/// An empty (scratch) rootfs.
-pub fn scratch(graph: &mut Graph) -> Output {
-    let op = pb::Op {
-        inputs: vec![],
-        platform: None,
-        constraints: None,
-        op: Some(pb::op::Op::Merge(pb::MergeOp {
-            inputs: vec![pb::MergeInput { input: -1 }],
-        })),
-    };
-    let v = graph.vertex(op);
-    graph.output(v, 0)
-}
-
-/// An exec op. `root` is the base rootfs output; `args`/`env`/`cwd`/`user` the
-/// exec meta; `mounts` extra mounts (bind/secret/cache/ssh) each with an
-/// optional source output. Returns the exec's root output (index 0, the `/`
-/// mount) and a separate output for any explicit `--mount=...,output=<path>`
-/// if provided (basil v1 does not expose output mounts; skip).
+/// An exec op. `root` is the base rootfs output (`None` = scratch/empty).
+/// `args`/`env`/`cwd`/`user` the exec meta; `mounts` extra mounts. Returns the
+/// exec's root output (index of the `/` mount).
 ///
-/// Mounts are sorted by dest; the `/` root mount is last in sort order, giving
-/// it the last output index — but buildkit's exec root is the output of the
-/// `/` mount. We follow the go rule: the returned exec output is the `/`
-/// mount's output index.
+/// Mounts are sorted by dest; the `/` root mount is the exec output. The
+/// extra mounts (bind/secret/cache/ssh) are passed ready-made.
 pub fn run(
     graph: &mut Graph,
-    root: Output,
+    root: Option<Output>,
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
@@ -162,7 +170,7 @@ pub fn run(
     platform: Option<pb::Platform>,
     extra_mounts: Vec<ExtraMount>,
 ) -> Output {
-    let mut mounts: Vec<(Option<Output>, String, bool)> = vec![(Some(root), "/".to_string(), false)];
+    let mut mounts: Vec<(Option<Output>, String, bool)> = vec![(root, "/".to_string(), false)];
     for m in extra_mounts {
         mounts.push((m.source, m.dest, m.readonly));
     }
@@ -242,13 +250,13 @@ pub fn run(
     graph.output(v, root_output_index)
 }
 
-/// A file-operation (COPY/ADD). `Input` is the destination tree (current
-/// state); `source` is either a context/file source output. For `COPY
+/// A file-operation (COPY/ADD). `input_tree` is the destination tree (current
+/// state; `None` = empty/scratch); `source_tree` is the source. For `COPY
 /// --from=<stage>`, the source is the stage's output. Returns the resulting
 /// tree output.
 pub fn file_op(
     graph: &mut Graph,
-    input_tree: Output,
+    input_tree: Option<Output>,
     source_tree: Output,
     src_path: Vec<String>,
     dest_path: String,
@@ -257,6 +265,18 @@ pub fn file_op(
     is_add: bool,
     platform: Option<pb::Platform>,
 ) -> Output {
+    // Input edges: [input_tree (dest, if any), source_tree]. The dest is
+    // optional (scratch) → Empty input.
+    let mut inputs = Vec::new();
+    let dest_index: i64 = if let Some(d) = input_tree {
+        inputs.push(graph.edge(d));
+        (inputs.len() - 1) as i64
+    } else {
+        -1
+    };
+    inputs.push(graph.edge(source_tree));
+    let src_index = (inputs.len() - 1) as i64;
+
     let copy = pb::FileActionCopy {
         src: src_path.join(","),
         dest: dest_path.clone(),
@@ -281,8 +301,8 @@ pub fn file_op(
 
     let action = pb::file_action::Action::Copy(copy);
     let file_action = pb::FileAction {
-        input: 0,            // input_tree is input 0
-        secondary_input: 1,  // source_tree is secondary input
+        input: dest_index,     // destination tree (or Empty for scratch)
+        secondary_input: src_index, // source tree
         output: 0,
         action: Some(action),
     };
@@ -292,8 +312,6 @@ pub fn file_op(
         actions: vec![file_action],
     };
 
-    // Input edges: [input_tree, source_tree].
-    let inputs = vec![graph.edge(input_tree), graph.edge(source_tree)];
     let op = pb::Op {
         inputs,
         platform,

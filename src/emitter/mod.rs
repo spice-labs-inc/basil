@@ -43,6 +43,27 @@ pub struct EmitResult {
     pub targets: Vec<Emitted>,
 }
 
+fn normalize_image_ref(raw: &str, tag: Option<&str>, digest: Option<&str>) -> String {
+    // Normalize a bare name to a fully-qualified reference (buildkit's
+    // containerimage source requires it; a bare `alpine` URL-parses as
+    // host:port and breaks). docker/library names become docker.io/library/...
+    let named = if raw.contains('.') || raw.contains(':') || raw == "localhost" {
+        raw.to_string()
+    } else {
+        format!("docker.io/library/{raw}")
+    };
+    let mut s = named;
+    if let Some(t) = tag {
+        s.push(':');
+        s.push_str(t);
+    }
+    if let Some(d) = digest {
+        s.push('@');
+        s.push_str(d);
+    }
+    s
+}
+
 /// Emit the LLB for one target placed in `graph`, resolving stage deps from
 /// `stage_outputs`. Returns the target's final output + composed config.
 pub fn emit_target(
@@ -50,23 +71,22 @@ pub fn emit_target(
     target: &Target,
     stage_outputs: &HashMap<String, Output>,
     context_local_id: &str,
+    session_id: &str,
     platform: Option<pb::Platform>,
 ) -> Result<Emitted, String> {
-    let mut state = match &target.base {
+    let mut state: Option<Output> = match &target.base {
         BaseImage { raw, tag, digest } => {
-            // `scratch` → empty rootfs.
+            // `scratch` → empty rootfs (no output yet).
             if raw.eq_ignore_ascii_case("scratch") {
-                llb::scratch(graph)
+                None
             } else if let Some(stage_out) = stage_outputs.get(raw) {
-                *stage_out
+                Some(*stage_out)
             } else {
-                // External image. If pinned, include the digest so buildkit pulls
-                // exactly; LLB source identifier supports the full ref.
-                let refstr = match (raw.as_str(), tag.as_deref(), digest.as_deref()) {
-                    (r, t, Some(d)) => format!("{r}{}@{d}", t.map(|x| format!(":{x}")).unwrap_or_default()),
-                    (r, t, None) => format!("{r}{}", t.map(|x| format!(":{x}")).unwrap_or_default()),
-                };
-                llb::source_image(graph, &refstr, platform.clone())
+                // External image. Normalize to a fully-qualified ref (buildkit
+                // source needs `docker.io/library/...`, not a bare name) and
+                // include the tag/digest.
+                let refstr = normalize_image_ref(raw, tag.as_deref(), digest.as_deref());
+                Some(llb::source_image(graph, &refstr, platform.clone()))
             }
         }
     };
@@ -102,10 +122,10 @@ pub fn emit_target(
                     if context_local_id.is_empty() {
                         return Err("COPY from context requires a context source".to_string());
                     }
-                    llb::source_local(graph, context_local_id, platform.clone())
+                    llb::source_local(graph, context_local_id, session_id, platform.clone())
                 };
                 // The sources are copied from `source` (context dir or stage FS).
-                state = llb::file_op(
+                state = Some(llb::file_op(
                     graph,
                     state,
                     source,
@@ -115,13 +135,13 @@ pub fn emit_target(
                     c.chmod.clone(),
                     false,
                     platform.clone(),
-                );
+                ));
             }
             Instruction::Add(a) => {
                 // ADD from context; URLs (non-hermetic) are a separate path —
                 // v1 rejects remote ADD at parse (TODO) or treats URL in program.
-                let source = llb::source_local(graph, context_local_id, platform.clone());
-                state = llb::file_op(
+                let source = llb::source_local(graph, context_local_id, session_id, platform.clone());
+                state = Some(llb::file_op(
                     graph,
                     state,
                     source,
@@ -131,18 +151,18 @@ pub fn emit_target(
                     None,
                     true,
                     platform.clone(),
-                );
+                ));
             }
             Instruction::Run(r) => {
                 let (args, cmd_env) = command_to_meta(&r.command);
                 let mut extra = Vec::new();
                 for m in &r.mounts {
-                    extra.push(mount_to_extra(graph, m, platform.clone()));
+                    extra.push(mount_to_extra(graph, m, session_id, platform.clone()));
                 }
                 // exec env = accumulated ENV + any command-specific env
                 let mut exec_env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 exec_env.extend(cmd_env);
-                state = llb::run(
+                state = Some(llb::run(
                     graph,
                     state,
                     args,
@@ -151,7 +171,7 @@ pub fn emit_target(
                     user.clone(),
                     platform.clone(),
                     extra,
-                );
+                ));
             }
             Instruction::Cmd(c) => {
                 config.cmd = Some(command_to_vec(c));
@@ -186,7 +206,9 @@ pub fn emit_target(
 
     Ok(Emitted {
         target: target.name.clone(),
-        output: state,
+        output: state.ok_or_else(|| {
+            format!("target `{}` is an empty scratch stage with no output to export", target.name)
+        })?,
         config,
     })
 }
@@ -195,6 +217,7 @@ pub fn emit_target(
 pub fn emit_file(
     targets: &[Target],
     context_local_id: &str,
+    session_id: &str,
     platform: Option<pb::Platform>,
 ) -> Result<EmitResult, String> {
     let mut graph = Graph::new();
@@ -204,7 +227,7 @@ pub fn emit_file(
     // Resolve in order — assume targets are already topologically ordered (the
     // identity layer validates stage order). Emit each stage.
     for t in targets {
-        let e = emit_target(&mut graph, t, &stage_outputs, context_local_id, platform.clone())?;
+        let e = emit_target(&mut graph, t, &stage_outputs, context_local_id, session_id, platform.clone())?;
         stage_outputs.insert(t.name.clone(), e.output);
         emitted.push(e);
     }
@@ -228,13 +251,13 @@ fn command_to_vec(cmd: &Command) -> Vec<String> {
     }
 }
 
-fn mount_to_extra(graph: &mut Graph, m: &Mount, platform: Option<pb::Platform>) -> ExtraMount {
+fn mount_to_extra(graph: &mut Graph, m: &Mount, session_id: &str, platform: Option<pb::Platform>) -> ExtraMount {
     match m {
         Mount::Bind { source, target, read_only } => {
             let src = source
                 .as_deref()
                 .filter(|s| !s.is_empty() && *s != ".")
-                .map(|s| llb::source_local(graph, s, platform));
+                .map(|s| llb::source_local(graph, s, session_id, platform));
             ExtraMount {
                 source: src,
                 dest: target.clone(),
@@ -267,7 +290,7 @@ mod tests {
 
     fn emit(dsl: &str, id: &str) -> EmitResult {
         let file = parse(dsl).unwrap();
-        emit_file(&file.targets, id, None).unwrap()
+        emit_file(&file.targets, id, "", None).unwrap()
     }
 
     #[test]
@@ -276,7 +299,7 @@ mod tests {
         // [source_image, exec]
         assert_eq!(r.graph.op_count(), 2);
         if let Some(pb::op::Op::Source(s)) = r.graph.op(0).op.as_ref() {
-            assert!(s.identifier.starts_with("docker-image://alpine:3.23"));
+            assert!(s.identifier.starts_with("docker-image://docker.io/library/alpine:3.23"));
         } else {
             panic!("op 0 should be a source");
         }
@@ -298,10 +321,12 @@ mod tests {
             "ctx",
         );
         let n = r.graph.op_count();
+        // The final op is the file op for COPY --from=build; its destination is
+        // scratch (empty, no input edge) so it carries just the build-stage
+        // source input.
         let last = r.graph.op(n - 1);
         assert!(matches!(last.op.as_ref(), Some(pb::op::Op::File(_))));
-        // the fileop's inputs: [scratch, build_exec_output]
-        assert_eq!(last.inputs.len(), 2);
+        assert_eq!(last.inputs.len(), 1);
     }
 
     #[test]
@@ -327,7 +352,7 @@ mod tests {
         )
         .unwrap();
         let mut graph = Graph::new();
-        let e = emit_target(&mut graph, &file.targets[0], &HashMap::new(), "ctx", None).unwrap();
+        let e = emit_target(&mut graph, &file.targets[0], &HashMap::new(), "ctx", "", None).unwrap();
         assert!(e.config.env.iter().any(|v| v == "FOO=bar"));
         assert_eq!(e.config.working_dir, "/app");
         assert_eq!(e.config.user.as_deref(), Some("1000"));
@@ -339,7 +364,7 @@ mod tests {
     fn command_shell_form_maps_to_sh_c() {
         let file = parse("FROM alpine\nCMD echo hi\n").unwrap();
         let mut graph = Graph::new();
-        let e = emit_target(&mut graph, &file.targets[0], &HashMap::new(), "ctx", None).unwrap();
+        let e = emit_target(&mut graph, &file.targets[0], &HashMap::new(), "ctx", "", None).unwrap();
         assert_eq!(
             e.config.cmd,
             Some(vec![

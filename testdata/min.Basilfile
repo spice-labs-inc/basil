@@ -1,0 +1,5 @@
+FROM scratch AS 127.0.0.1:5001/min
+ENV FOO=bar
+CMD ["/bin/true"]
+
+ON push(main) BUILD 127.0.0.1:5001/min

@@ -6,4 +6,6 @@
 pub mod dsl;
 pub mod emitter;
 pub mod event;
+pub mod gateway_proto;
 pub mod identity;
+pub mod solver;
