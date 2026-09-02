@@ -53,6 +53,9 @@ pub struct BuildArgs {
 pub struct GcArgs {
     /// Age with unit (e.g. `30d`, `4w`, `1y`).
     pub age: String,
+    /// The DSL file whose qualified AS targets are pruned (ignored with --repo).
+    #[arg(default_value = "Basilfile")]
+    pub file: String,
     /// Restrict pruning to one repo.
     #[arg(long)]
     pub repo: Option<String>,

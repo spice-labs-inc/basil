@@ -22,7 +22,67 @@ pub struct ImageRef {
 /// Default registry host when none is specified.
 const DOCKER_HUB: &str = "index.docker.io";
 
-/// Parse an image reference, normalizing bare names to `docker.io/library/...`.
+/// Parse an RFC3339 timestamp (UTC or numeric offset) into unix seconds.
+/// Minimal: handles `YYYY-MM-DDThh:mm:ss[.fff](Z|±hh:mm|±hhmm)`.
+pub fn parse_rfc3339(s: &str) -> Option<u64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+    let num = |i: usize, len: usize| s[i..i + len].parse::<i64>().ok();
+    let year = num(0, 4)?;
+    let month = num(5, 2)?;
+    let day = num(8, 2)?;
+    // Time starts after 'T' (index 11).
+    let hours = num(11, 2)?;
+    let mins = num(14, 2)?;
+    let secs = num(17, 2)?;
+
+    let mut offset: i64 = 0;
+    let mut idx = 19; // past seconds
+    if bytes.get(idx) == Some(&b'.') {
+        idx += 1;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+    }
+    if idx < bytes.len() {
+        match bytes[idx] {
+            b'Z' | b'z' => {}
+            b'+' | b'-' => {
+                let sign = if bytes[idx] == b'-' { -1 } else { 1 };
+                // ±hh:mm or ±hhmm
+                let rest = &s[idx + 1..];
+                let (hstr, mstr) = if rest.len() >= 5 && rest.as_bytes().get(2) == Some(&b':') {
+                    (&rest[..2], &rest[3..5])
+                } else {
+                    (&rest[..2], &rest[2..4])
+                };
+                let oh: i64 = hstr.parse().ok()?;
+                let om: i64 = mstr.parse().ok()?;
+                offset = sign * (oh * 3600 + om * 60);
+            }
+            _ => return None,
+        }
+    }
+
+    // Days to unix (civil algorithm) for the UTC date.
+    let y = year;
+    let m = month;
+    let d = day;
+    if !(1970..=3000).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+    let yoe = yy - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs_utc = days * 86400 + hours * 3600 + mins * 60 + secs;
+    Some((secs_utc - offset) as u64)
+}
 pub fn parse_ref(name: &str, default_tag: &str) -> Result<ImageRef, String> {
     let s = name;
     let (host, path) = match s.find('/') {
@@ -143,7 +203,28 @@ impl RegistryClient {
             req = req.header(k, v);
         }
         let resp = req.send().await.map_err(|e| format!("registry delete {url}: {e}"))?;
-        if !resp.status().is_success() && resp.status().as_u16() != 404 {
+        let status = resp.status().as_u16();
+        if (400..=499).contains(&status) && status != 404 {
+            // Some registries (e.g. registry:2) only accept DELETE by manifest
+            // digest, not by tag. Resolve the tag to a digest and delete that.
+            let (digest, _) = self.get_manifest(repo, tag).await?;
+            if digest.is_empty() {
+                return Err(format!("registry delete {url}: status {status} and could not resolve digest"));
+            }
+            return self.delete_digest(repo, &digest).await;
+        }
+        Ok(())
+    }
+
+    /// Delete a manifest by digest (the registry's canonical prune unit).
+    pub async fn delete_digest(&self, repo: &str, digest: &str) -> Result<(), String> {
+        let url = format!("{}/v2/{repo}/manifests/{digest}", self.base);
+        let mut req = self.client.delete(&url);
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(|e| format!("registry delete {url}: {e}"))?;
+        if !resp.status().is_success() {
             return Err(format!("registry delete {url}: status {}", resp.status()));
         }
         Ok(())
@@ -179,10 +260,38 @@ impl RegistryClient {
         Ok((digest, body.to_vec()))
     }
 
+    /// Resolve the image's `created` time (unix seconds) for `repo:tag`, if an
+    /// OCI config `created` field is parseable.
+    pub async fn get_config_created(&self, repo: &str, tag: &str) -> Result<Option<u64>, String> {
+        let (_, manifest) = self.get_manifest(repo, tag).await?;
+        let m: serde_json::Value =
+            serde_json::from_slice(&manifest).map_err(|e| format!("parse manifest: {e}"))?;
+        let cfg_digest = m.get("config").and_then(|c| c.get("digest")).and_then(serde_json::Value::as_str);
+        let Some(cfg_digest) = cfg_digest else {
+            return Ok(None);
+        };
+        let url = format!("{}/v2/{repo}/blobs/{cfg_digest}", self.base);
+        let mut req = self.client.get(&url);
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(|e| format!("registry config {url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse config blob: {e}"))?;
+        if let Some(c) = body.get("created").and_then(serde_json::Value::as_str) {
+            return Ok(parse_rfc3339(c));
+        }
+        Ok(None)
+    }
+
     /// Re-tag: copy the manifest under `src` to `tag`, checking immutability.
     /// Returns the source digest it was anchored to.
-pub async fn retag(&self, repo: &str, src: &str, tag: &str) -> Result<String, String> {
-        // Immutability: an existing `<repo>:<tag>` pointing at a different
+pub async fn retag(&self, repo: &str, src: &str, tag: &str) -> Result<String, String> {        // Immutability: an existing `<repo>:<tag>` pointing at a different
         // manifest is refused rather than overwritten.
         if self.manifest_exists(repo, tag).await? {
             let (exist_digest, _) = self.get_manifest(repo, tag).await?;
@@ -247,5 +356,17 @@ mod tests {
     fn defaults_tag() {
         let r = parse_ref("ghcr.io/a/b", "latest").unwrap();
         assert_eq!(r.tag, "latest");
+    }
+}
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::*;
+    #[test]
+    fn parses_fractional_and_plain() {
+        // 2024-01-15 00:00:00 UTC = 1705276800.
+        assert_eq!(parse_rfc3339("2024-01-15T00:00:00.123456789Z"), Some(1705276800));
+        assert_eq!(parse_rfc3339("2024-01-15T00:00:00Z"), Some(1705276800));
+        assert_eq!(parse_rfc3339("2024-01-15T01:00:00+01:00"), Some(1705276800));
+        assert_eq!(parse_rfc3339("garbage"), None);
     }
 }
