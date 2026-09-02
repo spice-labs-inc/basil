@@ -12,25 +12,27 @@ use crate::dsl::ast::{BaseImage, Command, Instruction, Target};
 /// `targets` is the topologically-ordered set; `deliverable` must be one of
 /// them (the final stage). Returns the Containerfile text.
 pub fn render_containerfile(targets: &[Target], deliverable: &str) -> String {
+    // Emit every stage (multi-stage deps like COPY --from must resolve), with
+    // the deliverable forced to be the last stage (that's what buildah tags).
+    let mut order: Vec<&Target> = targets.iter().collect();
+    if let Some(pos) = order.iter().position(|t| t.name == deliverable) {
+        let d = order.remove(pos);
+        order.push(d);
+    }
+
     let mut out = String::new();
-    let mut in_scope = false;
-    for t in targets {
-        // Emit stages through the deliverable (it's last in a valid file).
-        if t.name == deliverable {
-            in_scope = true;
-        }
-        if !in_scope {
-            continue;
-        }
+    for (i, t) in order.iter().enumerate() {
         let is_deliverable = t.name == deliverable;
-        let alias = if is_deliverable { String::new() } else { format!(" AS {}", t.name) };
+        let is_last = i + 1 == order.len();
+        let alias = if is_deliverable || is_last {
+            String::new() // the tagged image doesn't need an AS alias
+        } else {
+            format!(" AS {}", t.name)
+        };
         out.push_str(&format!("FROM {}{}\n", render_base(&t.base), alias));
         for instr in &t.instructions {
             out.push_str(&render_instruction(instr));
             out.push('\n');
-        }
-        if is_deliverable {
-            break; // deliverable is the last stage
         }
     }
     out
@@ -219,4 +221,29 @@ async fn buildah_from(image: &str) -> anyhow::Result<String> {
         anyhow::bail!("buildah from {} failed: {}", image, String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::parser::parse;
+
+    #[test]
+    fn renders_multi_stage_from_dsl() {
+        let src = "FROM golang AS build\n\
+RUN go build -o /bin/app\n\
+FROM scratch AS 127.0.0.1:5001/app\n\
+COPY --from=build /bin/app /app\n\
+ENV FOO=bar\n\
+CMD [\"/app\"]\n\
+ON push(main) BUILD 127.0.0.1:5001/app\n";
+        let f = parse(src).unwrap();
+        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        assert!(cf.starts_with("FROM golang AS build\n"));
+        // The deliverable is the final stage, tagged (no AS alias needed).
+        assert!(cf.contains("FROM scratch\n"));
+        assert!(cf.contains("COPY --from=build /bin/app /app"));
+        assert!(cf.contains("CMD [\"/app\"]"));
+        assert!(!cf.contains("ON push"));
+    }
 }

@@ -1,0 +1,10 @@
+FROM alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e AS build
+COPY src.txt /src.txt
+RUN cat /src.txt > /built.txt
+
+FROM scratch AS 127.0.0.1:5001/bhmulti
+COPY --from=build /built.txt /out.txt
+ENV M=multi
+CMD ["/bin/cat", "/out.txt"]
+
+ON push(main) BUILD 127.0.0.1:5001/bhmulti
