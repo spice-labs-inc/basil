@@ -73,6 +73,9 @@ pub enum Instruction {
     Label(Vec<(String, String)>),
     Expose(Vec<String>),
     Volume(Vec<String>),
+    /// `OUTPUT <container-src> <host-dest>` — reverse COPY: copy a file out of
+    /// the built image onto the host (relative dest only).
+    Output(Output),
 }
 
 /// `ARG name[=default]`.
@@ -96,6 +99,17 @@ pub struct Copy {
     pub chown: Option<String>,
     pub chmod: Option<String>,
     pub sources: Vec<String>,
+    pub dest: String,
+}
+
+/// `OUTPUT <container-src> <host-dest>` — a reverse COPY: after building, copy
+/// a file out of the image's root filesystem to the host. `dest` is relative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    /// Path inside the built image (its rootfs).
+    pub source: String,
+    /// Host destination, relative to the build context. Only relative paths are
+    /// allowed (no absolute host path — prevents escaping the context).
     pub dest: String,
 }
 

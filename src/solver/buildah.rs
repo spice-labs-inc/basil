@@ -112,6 +112,9 @@ fn render_instruction(i: &Instruction) -> String {
         }
         Instruction::Expose(ports) => format!("EXPOSE {}", ports.join(" ")),
         Instruction::Volume(vols) => format!("VOLUME {}", vols.join(" ")),
+        // OUTPUT is a basil post-build step (reverse COPY), not a buildah
+        // instruction; it must not be emitted into the Containerfile.
+        Instruction::Output(_) => String::new(),
     }
 }
 
@@ -186,7 +189,79 @@ pub async fn build_deliverable(
         anyhow::bail!("buildah push failed (exit {pstatus})");
     }
     println!("basil: pushed {deliverable}:{tag}");
+
+    // Reverse COPY: extract any OUTPUT files from the built image to the host.
+    let outputs: Vec<(String, String)> = targets
+        .iter()
+        .filter(|t| &t.name == deliverable)
+        .flat_map(|t| {
+            t.instructions.iter().filter_map(|i| match i {
+                Instruction::Output(o) => Some((o.source.clone(), o.dest.clone())),
+                _ => None,
+            })
+        })
+        .collect();
+    if !outputs.is_empty() {
+        extract_outputs(&tag_ref, context, &outputs).await?;
+    }
     Ok(())
+}
+
+/// Reverse COPY: extract `(container-src, host-dest)` files out of the built
+/// image onto the host. Uses `buildah run --volume <hostdir>:/hostout` to bind
+/// the host destination dir into the working container and `cp` the file out
+/// (no rootless `buildah mount`/`unshare` needed). Host dests are relative to
+/// the context and already validated relative at parse time.
+async fn extract_outputs(
+    tag_ref: &str,
+    context: &std::path::Path,
+    outputs: &[(String, String)],
+) -> anyhow::Result<()> {
+    let working = buildah_from(tag_ref).await?;
+    let tmp = std::env::temp_dir().join(format!("basil-output-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).map_err(|e| anyhow::anyhow!("creating output tmp: {e}"))?;
+
+    let result = async {
+        for (src, dest) in outputs {
+            let host_dest = context.join(dest);
+            if let Some(parent) = host_dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow::anyhow!("creating host destination dir: {e}"))?;
+            }
+            let fname = src.rsplit('/').next().unwrap_or(src);
+            let mut cmd = tokio::process::Command::new("buildah");
+            cmd.arg("run")
+                .arg("--volume")
+                .arg(format!("{}:/hostout", tmp.display()))
+                .arg(&working)
+                .args(["cp", src, &format!("/hostout/{fname}")])
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit());
+            let status = cmd
+                .status()
+                .await
+                .map_err(|e| anyhow::anyhow!("buildah run (OUTPUT): {e}"))?;
+            if !status.success() {
+                anyhow::bail!("OUTPUT failed to extract `{src}` (exit {status})");
+            }
+            // Move the extracted file from tmp into its final host location.
+            let moved = tmp.join(fname);
+            std::fs::rename(&moved, &host_dest).map_err(|e| {
+                anyhow::anyhow!("copying OUTPUT `{src}` -> `{dest}`: {e}")
+            })?;
+            println!("basil: output {src} -> {dest}");
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = tokio::process::Command::new("buildah")
+        .args(["rm", &working])
+        .output()
+        .await;
+    result
 }
 
 /// Run a task command in `image` via `buildah run` (create a working

@@ -59,6 +59,7 @@ pub fn render_instruction(instr: &Instruction) -> String {
         }
         Expose(ps) => format!("EXPOSE {}", ps.join(" ")),
         Volume(ps) => format!("VOLUME {}", ps.join(" ")),
+        Output(o) => format!("OUTPUT {} {}", o.source, o.dest),
     }
 }
 

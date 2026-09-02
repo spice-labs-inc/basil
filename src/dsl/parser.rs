@@ -212,6 +212,7 @@ impl Parser {
                 Instruction::Expose(words)
             }
             "VOLUME" => self.parse_volume(rest, line)?,
+            "OUTPUT" => self.parse_output(rest, line)?,
             _ => {
                 return self.err(line, format!("unknown instruction `{kw}`"))
             }
@@ -293,6 +294,27 @@ impl Parser {
             sources,
             dest,
         }))
+    }
+
+    fn parse_output(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
+        let (flags, args) = parse_flags(rest).map_err(|m| self.err_at(line, m))?;
+        if !flags.is_empty() {
+            return self.err(line, "OUTPUT does not take flags");
+        }
+        if args.len() != 2 {
+            return self.err(line, "OUTPUT requires exactly <container-src> <host-dest>");
+        }
+        let source = args[0].clone();
+        let dest = args[1].clone();
+        // Only relative host paths: no leading slash, and no `..` that would
+        // escape the build context.
+        if dest.starts_with('/') {
+            return self.err(line, "OUTPUT host destination must be a relative path");
+        }
+        if dest.split(['/', '\\']).any(|c| c == "..") {
+            return self.err(line, "OUTPUT host destination may not contain `..`");
+        }
+        Ok(Instruction::Output(Output { source, dest }))
     }
 
     fn parse_add(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
@@ -470,6 +492,7 @@ fn is_known_or_deferred(kw: &str) -> bool {
             | "LABEL"
             | "EXPOSE"
             | "VOLUME"
+            | "OUTPUT"
             | "TASK"
             | "SHELL"
             | "STOPSIGNAL"
@@ -992,5 +1015,34 @@ ON image-published  DO notify smoke
         assert!(matches!(f.reactions[1].event.token, EventToken::Custom(_)));
         assert_eq!(f.reactions[1].do_list.len(), 2);
         assert!(matches!(f.targets[2].task.as_ref().unwrap().command, Command::Exec(_)));
+    }
+
+    #[test]
+    fn parses_output_relative() {
+        let f = parse("FROM alpine AS x\nOUTPUT /app/result.txt out/result.txt\n").unwrap();
+        let out = &f.targets[0].instructions[0];
+        let Instruction::Output(o) = out else {
+            panic!("expected OUTPUT instruction, got {out:?}");
+        };
+        assert_eq!(o.source, "/app/result.txt");
+        assert_eq!(o.dest, "out/result.txt");
+    }
+
+    #[test]
+    fn rejects_absolute_output_dest() {
+        let e = parse("FROM alpine\nOUTPUT /a.txt /tmp/evil.txt\n").unwrap_err();
+        assert!(e.message.contains("relative"), "unexpected: {}", e.message);
+    }
+
+    #[test]
+    fn rejects_dotdot_output_dest() {
+        let e = parse("FROM alpine\nOUTPUT /a.txt ../evil.txt\n").unwrap_err();
+        assert!(e.message.contains("`..`"), "unexpected: {}", e.message);
+    }
+
+    #[test]
+    fn rejects_output_bad_arity() {
+        let e = parse("FROM alpine\nOUTPUT /a.txt\n").unwrap_err();
+        assert!(e.message.contains("exactly"), "unexpected: {}", e.message);
     }
 }
