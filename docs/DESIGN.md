@@ -63,6 +63,16 @@ ON image-published  DO notify smoke
   default** (targets without their own inherit it). No `PLATFORM` = the builder's
   native platform. Multiple platforms make the content tag an OCI index (manifest
   list).
+- **`OUTPUT <container-src> <host-dest>`** — a **reverse `COPY`**: after the
+  deliverable is built/pushed, copy a file out of the built image's root
+  filesystem onto the host. `host-dest` is **relative to the build context only**
+  (no leading `/`, no `..` escaping the context) — validated at parse time, so it
+  can never write outside the context. It executes on every build of the
+  deliverable **including an idempotent-skip**: when the image is already
+  published and no rebuild happens, basil pulls `<name>:<tagHash>` and extracts
+  the OUTPUT from it. `OUTPUT` is not a container build step (never fed to the
+  builder) but is folded into the target's `programHash`, so changing it changes
+  the content tag.
 - Targets depend on each other, so the LLB is a DAG across targets (edges from
   `COPY --from=<target>` and `FROM <target>`). `FROM <x>` resolves like
   Dockerfile: a local `AS` alias shadows a registry reference, so a base that
@@ -190,14 +200,15 @@ require it:
 
 ```
 ┌──────────────── basil (one binary) ─────────────────┐
-│  parse DSL → derive closure → event check → emit LLB  │
-│  → solve via buildkit-client → push/cache             │
-│  → run DO'd TASKs (outside the solve)                 │
-│  → daemon lifecycle (owned buildkitd)                 │
+│  parse DSL → derive closure → event check            │
+│  → buildah build/push (<name>:<tagHash>)              │
+│  → idempotent check (skip rebuild if already pushed)  │
+│  → run DO'd TASKs / extract OUTPUTs (outside build)   │
+│  → promote version tags, gc                           │
 └───────────────────────────────────────────────────────┘
-            │ gRPC session + filesync + tunnel
+            │ buildah subprocess (plain-process, no daemon)
             ▼
-        buildkitd  ──(we own start/stop)──
+      containers/storage  ──(runc/crun exec steps)──
 ```
 
 - The pipeline has three phases: **emit+solve** (build/push/cache), then
