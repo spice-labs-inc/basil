@@ -131,26 +131,50 @@ pub fn compute_closure(
         let mut progressed = false;
         let mut next = Vec::new();
         for (name, target) in remaining {
-            // Determine base.
+            // Associate arg values for this target.
+            let args = Args::from_target(target, overrides);
+
+            // Stage dependencies: the FROM base (if a local stage) plus every
+            // COPY --from=<stage> source. Both must be resolved before this
+            // target; their closure hashes are folded into the tagHash (the
+            // DOC-string invariant `∪ C(B) for each depended stage B`).
+            let mut stage_deps: Vec<String> = Vec::new();
+            let crate::dsl::ast::BaseImage { raw, .. } = &target.base;
+            if let Some(bs) = by_name.get(raw.as_str()) {
+                if bs.name != name {
+                    stage_deps.push(bs.name.to_string());
+                }
+            }
+            for instr in &target.instructions {
+                if let crate::dsl::ast::Instruction::Copy(c) = instr {
+                    if let Some(from) = &c.from {
+                        // `COPY --from=<stage>`: fold that stage's closure.
+                        // Image refs (contain : or /) are not local stages.
+                        if by_name.contains_key(from.as_str()) {
+                            stage_deps.push(from.clone());
+                        }
+                    }
+                }
+            }
+            stage_deps.sort();
+            stage_deps.dedup();
+
+            // If any stage dep isn't resolved yet, defer this target. (stage_deps
+            // only contains real stages, so an unresolved dep is an upstream
+            // target still in the queue; genuine cycles surface via the
+            // `!progressed` check below.)
+            if stage_deps.iter().any(|d| !done.contains(d.as_str())) {
+                next.push((name, target));
+                continue;
+            }
+
+            // Resolve the base reference.
             let base_ref = match &target.base {
                 crate::dsl::ast::BaseImage { raw, tag, digest } => {
-                    // A local stage alias shadows a registry reference, per
-                    // Dockerfile semantics. But `FROM X` where X is this
-                    // target's own (implicit) name — e.g. `FROM alpine` naming
-                    // the stage `alpine` — is an external image, not a
-                    // self-reference. So a base is a stage only if it names a
-                    // *different* target.
                     if let Some(bs_name) = by_name.get(raw.as_str()).map(|t| t.name.as_str()) {
                         if bs_name != name {
-                            let bs = by_name[raw.as_str()];
-                            if done.contains(bs.name.as_str()) {
-                                Some(BaseRef::Stage(hex(&result[&bs.name])))
-                            } else {
-                                next.push((name, target));
-                                continue;
-                            }
+                            Some(BaseRef::Stage(hex(&result[bs_name])))
                         } else {
-                            // External image (self name).
                             Some(BaseRef::External(
                                 resolver
                                     .resolve(raw, tag.as_deref(), digest.as_deref())
@@ -158,7 +182,6 @@ pub fn compute_closure(
                             ))
                         }
                     } else {
-                        // external image
                         Some(BaseRef::External(
                             resolver
                                 .resolve(raw, tag.as_deref(), digest.as_deref())
@@ -168,8 +191,6 @@ pub fn compute_closure(
                 }
             };
 
-            // Build associated args for this target.
-            let args = Args::from_target(target, overrides);
 
             // Derive data (context files this target reads).
             let derived = derived_data::derived_data_digest(target, context)
@@ -203,6 +224,13 @@ pub fn compute_closure(
             }
             if let Some(BaseRef::Stage(hash)) = &base_ref {
                 push(&mut record, &format!("base.stage.{}", stage_clean(name)), hash);
+            }
+            // Fold every stage dependency's closure hash (incl. COPY --from
+            // sources): changes to a depended stage must change the deliverable.
+            for dep in &stage_deps {
+                if let Some(h) = result.get(dep) {
+                    push(&mut record, &format!("dep.stage.{}", stage_clean(dep)), &hex(h));
+                }
             }
 
             let tag = sha256(record_sorted(record));
@@ -369,6 +397,25 @@ COPY --from=build /a /a
         assert!(r.contains_key("build"));
         assert!(r.contains_key("ghcr.io/mycompany/app"));
         assert_ne!(r["build"], r["ghcr.io/mycompany/app"]);
+
+        // A change to the build stage (its COPY source content) must change the
+        // deliverable that depends on it via COPY --from — the identity must
+        // fold the depended stage's closure, not just the FROM base.
+        std::fs::write(dir.join("dep"), "v2").unwrap();
+        let dsl2 = "\
+FROM golang AS build
+COPY dep /dep
+
+FROM scratch AS ghcr.io/mycompany/app
+COPY --from=build /a /a
+";
+        let f2 = parse(dsl2).unwrap();
+        let r2 = compute_closure(&f2.targets, &[], &dir, &HashMap::new(), &mut FakeResolver).unwrap();
+        assert_ne!(
+            r["ghcr.io/mycompany/app"],
+            r2["ghcr.io/mycompany/app"],
+            "COPY --from stage input change must change the deliverable's tagHash"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
