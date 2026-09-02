@@ -1,5 +1,12 @@
 # Design: buildah backend (execute on buildah instead of buildkit)
 
+Status: **S1 implemented and proven** (commits `a791ba7`, `0d17df8`) — single-
+and multi-stage builds via `buildah build`/`push`, correct OCI config attached
+natively, closure tagHash identity, `--backend buildah|buildkit` (buildkit path
+intact). Remaining: S2 (cache refs `--cache-from`), S3 (task verify), S4
+(default flip + deletion), S5 (conformance).
+
+_Original proposal retained below for review._
 Status: **proposal for review** — no code written. Follows the rule to finish the
 design and get approval before implementing.
 

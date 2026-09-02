@@ -187,10 +187,11 @@ pub async fn build_deliverable(
 pub async fn run_task(image: &str, cmd: &Command, env: &[String]) -> anyhow::Result<i32> {
     let running = buildah_from(image).await?;
     let mut run = tokio::process::Command::new("buildah");
-    run.arg("run").arg(&running);
+    run.arg("run");
     for e in env {
         run.arg("--env").arg(e);
     }
+    run.arg(&running);
     match cmd {
         Command::Shell(s) => {
             run.args(["/bin/sh", "-c", s]);
