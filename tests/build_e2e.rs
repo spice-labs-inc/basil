@@ -51,6 +51,7 @@ async fn builds_scratch_deliverable_with_config() {
         context: std::path::Path::new(ctx),
         event_json: Some(event),
         target_filter: None,
+        tar_output: None,
     };
     let results = orchestrate::run(channel, &session_id, inp).await.unwrap();
     // The orchestrator returns exporter digest; assert we got a digest.
@@ -131,6 +132,7 @@ async fn tag_event_promotes_deliverable() {
         context: std::path::Path::new("testdata"),
         event_json: Some(r#"{"ref":"refs/tags/v9.9.9"}"#),
         target_filter: None,
+        tar_output: None,
     };
     let results = basil::solver::orchestrate::run(channel, &sid, inp).await.unwrap();
     assert!(!results.is_empty());

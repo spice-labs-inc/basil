@@ -79,6 +79,7 @@ async fn config_matches_dockerfile_v0() {
         context: std::path::Path::new("tests/differential"),
         event_json: Some(r#"{"ref":"refs/heads/main","before":"0","after":"1"}"#),
         target_filter: None,
+        tar_output: None,
     };
     basil::solver::orchestrate::run(channel, &sid, inp).await.unwrap();
 

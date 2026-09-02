@@ -51,6 +51,13 @@ pub struct BuildArgs {
     /// Path to a buildkitd binary for --ephemeral.
     #[arg(long, env = "BASIL_BUILDKITD")]
     pub buildkitd: Option<String>,
+    /// Export mode: `image` (registry, default) or `tar` (write the output
+    /// tar to --output).
+    #[arg(long, default_value = "image")]
+    pub exporter: String,
+    /// Destination for --exporter tar (a .tar file).
+    #[arg(long)]
+    pub output: Option<String>,
     /// Manual trigger: run a specific target's reaction.
     #[arg(short = 't', long)]
     pub target: Option<String>,

@@ -79,6 +79,17 @@ fn main() -> anyhow::Result<()> {
                 let mut session = buildkit_client::session::Session::new();
                 let ctx_path = std::path::PathBuf::from(&args.context);
                 session.add_file_sync(ctx_path).await;
+                // `tar` exporter streams its output back over the session;
+                // register a FileSend sink for the destination file.
+                let tar_output = if args.exporter == "tar" {
+                    let out = args.output.clone().ok_or_else(|| {
+                        anyhow::anyhow!("--exporter tar requires --output <file>")
+                    })?;
+                    session.add_file_send(std::path::PathBuf::from(&out)).await;
+                    Some(out)
+                } else {
+                    None
+                };
                 session
                     .start(client.control().clone())
                     .await
@@ -104,6 +115,7 @@ fn main() -> anyhow::Result<()> {
                     context: std::path::Path::new(&args.context),
                     event_json: event_json.as_deref(),
                     target_filter: args.target.as_ref(),
+                    tar_output,
                 };
                 // A separate channel for the bridge/orchestrator (tonic Channel
                 // is Clone; build one from the same addr).

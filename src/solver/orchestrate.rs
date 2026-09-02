@@ -30,6 +30,9 @@ pub struct BuildInput<'a> {
     pub context: &'a std::path::Path,
     pub event_json: Option<&'a str>,
     pub target_filter: Option<&'a String>,
+    /// When set, export the result as a tar written to this file (via the
+    /// session's FileSend sink) instead of pushing an image.
+    pub tar_output: Option<String>,
 }
 
 /// Run a build end-to-end and return the exporter digest.
@@ -200,6 +203,17 @@ pub async fn run(
             // the last emitted output is the deliverable.
             config_by_output.insert(e.output.vertex, e.config.clone());
         }
+    }
+
+    // `--exporter tar`: buildkit streams the output tar back over the session's
+    // FileSend sink (already registered in main.rs). The frontend-less bridge
+    // solve does not yet drive the buildctl-style FileSend export path, so a
+    // tar request is rejected rather than silently writing nothing.
+    if inp.tar_output.is_some() {
+        anyhow::bail!(
+            "--exporter tar is not wired to the FileSend export path yet; use the \
+             default image/registry exporter"
+        );
     }
 
     // The bridge Solve takes ONE Definition; we emit the whole file graph. The
