@@ -2,12 +2,16 @@
 # (rust:alpine targets musl by default), so the deliverable runs on `scratch`.
 
 # --- static builder ---
-FROM rust:1.84-alpine@sha256:fdff417c3845c92360b439382f7d6dabca6c998f59c8dce6cd2a16a2e9e85498 AS builder
-ARG VERSION
+FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS builder
+ARG VERSION=""
 WORKDIR /src
-COPY Cargo.toml Cargo.lock /src/
-RUN mkdir -p /src/src && cargo fetch
-COPY . /src/
+COPY Cargo.toml Cargo.lock .
+# A placeholder target so `cargo fetch` can resolve the manifest before the
+# real sources are copied in (cargo needs a lib/main to pick a target).
+RUN mkdir -p src/main && echo 'fn main() {}' > src/main.rs && cargo fetch
+COPY . .
+# ring/other native crates need the musl C toolchain + headers.
+RUN apk add --no-cache musl-dev gcc binutils
 RUN cargo build --release --bin basil
 
 # --- deliverable: the static binary on scratch ---
