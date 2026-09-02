@@ -4,3 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+buildkit-client = { version = "0.1", default-features = false }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tonic = "0.12"
+prost = "0.13"
+sha2 = "0.10"
+glob = "0.3"
+flate2 = "1"
+tar = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+# Upstream buildkit-client 0.1.4/0.1.5 fails to compile against current
+# buildkit master's control.proto: its SolveRequest initializer omits the new
+# compatibility_version / proxy_network / source_policy_session fields (which
+# get zero-defaulted). We patch in `..Default::default()`. Root fix is intended
+# upstream; keep the delta minimal and re-sync on the next release.
+buildkit-client = { path = "/home/astewart/Projects/github.com/AprilNEA/buildkit-client" }

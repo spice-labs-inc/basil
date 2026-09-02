@@ -1,0 +1,3 @@
+# Context files for the conformance fixture.
+# Deterministic inputs whose closure digest the test suite recomputes.
+*.tmp

@@ -1,0 +1,13 @@
+FROM golang AS build
+COPY . /src
+RUN go build -o /src/app
+
+FROM scratch AS ghcr.io/mycompany/app
+COPY --from=build /src/app /app
+
+FROM alpine AS notify
+COPY notify-my-thing.sh /usr/local/bin/
+TASK notify-my-thing.sh
+
+ON pr-merged BUILD ghcr.io/mycompany/app DO migrate migrate-again
+ON push(main) BUILD ghcr.io/mycompany/app

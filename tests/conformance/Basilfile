@@ -1,0 +1,6 @@
+FROM golang:1.23@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef AS build
+COPY greeting.txt /src/greeting.txt
+RUN cat /src/greeting.txt > /src/out.txt
+
+FROM scratch AS ghcr.io/conformance/app
+COPY --from=build /src/out.txt /out.txt

@@ -1,0 +1,6 @@
+FROM golang:1.23@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef AS build
+COPY . /src
+RUN go build -o /src/app
+
+FROM scratch AS ghcr.io/mycompany/app
+COPY --from=build /src/app /app
