@@ -11,6 +11,7 @@
 pub mod llb;
 
 use crate::dsl::ast::{BaseImage, Command, Instruction, Mount, Target};
+use crate::identity::program_hash::expand_vars;
 use buildkit_client::proto::pb;
 use llb::{ExtraMount, Graph, Output};
 use std::collections::HashMap;
@@ -66,6 +67,8 @@ fn normalize_image_ref(raw: &str, tag: Option<&str>, digest: Option<&str>) -> St
 
 /// Emit the LLB for one target placed in `graph`, resolving stage deps from
 /// `stage_outputs`. Returns the target's final output + composed config.
+/// `build_args` are build-arg overrides (e.g. `VERSION` on a tag event); they
+/// become available to ARG resolution and `$VAR` expansion in RUN/COPY/etc.
 pub fn emit_target(
     graph: &mut Graph,
     target: &Target,
@@ -73,6 +76,7 @@ pub fn emit_target(
     context_local_id: &str,
     session_id: &str,
     platform: Option<pb::Platform>,
+    build_args: &HashMap<String, String>,
 ) -> Result<Emitted, String> {
     let mut state: Option<Output> = match &target.base {
         BaseImage { raw, tag, digest } => {
@@ -94,6 +98,9 @@ pub fn emit_target(
     let mut config = ImageConfig::default();
     // Accumulate env/workdir/user for exec meta (RUN/commands inherit).
     let mut env: HashMap<String, String> = HashMap::new();
+    // ARG values (default or build-arg override), available for `$VAR` expansion
+    // in RUN/COPY and provided as exec env unless shadowed by ENV.
+    let mut arg_values: HashMap<String, String> = HashMap::new();
     let mut workdir = "/".to_string();
     let mut user = String::new();
 
@@ -101,8 +108,18 @@ pub fn emit_target(
 
     for instr in &target.instructions {
         match instr {
-            Instruction::Arg(_) => {
-                // ARG affects program hash and build args, not the rootfs.
+            Instruction::Arg(a) => {
+                // ARG affects program hash and build args, not the rootfs. Its
+                // value (override, else default) is available for expansion.
+                let value = build_args
+                    .get(&a.name)
+                    .cloned()
+                    .or_else(|| a.default.clone());
+                if let Some(v) = value {
+                    arg_values.insert(a.name.clone(), v);
+                } else {
+                    arg_values.remove(&a.name);
+                }
             }
             Instruction::Env(e) => {
                 for (k, v) in &e.pairs {
@@ -155,12 +172,20 @@ pub fn emit_target(
             }
             Instruction::Run(r) => {
                 let (args, cmd_env) = command_to_meta(&r.command);
+                // Expand `$VAR`/`${VAR}` in the command against ARG values then env.
+                let resolve = |name: &str| env.get(name).cloned().or_else(|| arg_values.get(name).cloned());
+                let args: Vec<String> = args.iter().map(|a| expand_vars(a, &resolve)).collect();
                 let mut extra = Vec::new();
                 for m in &r.mounts {
                     extra.push(mount_to_extra(graph, m, session_id, platform.clone()));
                 }
-                // exec env = accumulated ENV + any command-specific env
+                // exec env = accumulated ENV + ARG values not shadowed + cmd env
                 let mut exec_env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                for (k, v) in &arg_values {
+                    if !env.contains_key(k) {
+                        exec_env.push(format!("{k}={v}"));
+                    }
+                }
                 exec_env.extend(cmd_env);
                 state = Some(llb::run(
                     graph,
@@ -219,6 +244,7 @@ pub fn emit_file(
     context_local_id: &str,
     session_id: &str,
     platform: Option<pb::Platform>,
+    build_args: &HashMap<String, String>,
 ) -> Result<EmitResult, String> {
     let mut graph = Graph::new();
     let mut stage_outputs: HashMap<String, Output> = HashMap::new();
@@ -227,7 +253,15 @@ pub fn emit_file(
     // Resolve in order — assume targets are already topologically ordered (the
     // identity layer validates stage order). Emit each stage.
     for t in targets {
-        let e = emit_target(&mut graph, t, &stage_outputs, context_local_id, session_id, platform.clone())?;
+        let e = emit_target(
+            &mut graph,
+            t,
+            &stage_outputs,
+            context_local_id,
+            session_id,
+            platform.clone(),
+            build_args,
+        )?;
         stage_outputs.insert(t.name.clone(), e.output);
         emitted.push(e);
     }
@@ -290,7 +324,7 @@ mod tests {
 
     fn emit(dsl: &str, id: &str) -> EmitResult {
         let file = parse(dsl).unwrap();
-        emit_file(&file.targets, id, "", None).unwrap()
+        emit_file(&file.targets, id, "", None, &HashMap::new()).unwrap()
     }
 
     #[test]
@@ -302,6 +336,30 @@ mod tests {
             assert!(s.identifier.starts_with("docker-image://docker.io/library/alpine:3.23"));
         } else {
             panic!("op 0 should be a source");
+        }
+    }
+
+    #[test]
+    fn version_build_arg_expands_run_args_and_env() {
+        let file = parse("FROM alpine\nARG VERSION\nRUN echo v$VERSION\n").unwrap();
+        let mut args = HashMap::new();
+        args.insert("VERSION".to_string(), "1.2.3".to_string());
+        let r = emit_file(&file.targets, "ctx", "", None, &args).unwrap();
+        let n = r.graph.op_count();
+        // Last op is the exec (RUN echo v$VERSION).
+        let exec = r.graph.op(n - 1).op.as_ref().unwrap();
+        if let pb::op::Op::Exec(e) = exec {
+            let args = e.meta.as_ref().unwrap().args.clone();
+            let env = e.meta.as_ref().unwrap().env.clone();
+            // The shell command has $VERSION expanded to 1.2.3, and VERSION is
+            // injected as exec env.
+            assert!(
+                args.iter().any(|a| a.contains("1.2.3")),
+                "RUN args should have $VERSION expanded: {args:?}"
+            );
+            assert!(env.iter().any(|kv| kv == "VERSION=1.2.3"));
+        } else {
+            panic!("last op should be an exec");
         }
     }
 
@@ -352,7 +410,7 @@ mod tests {
         )
         .unwrap();
         let mut graph = Graph::new();
-        let e = emit_target(&mut graph, &file.targets[0], &HashMap::new(), "ctx", "", None).unwrap();
+        let e = emit_target(&mut graph, &file.targets[0], &HashMap::new(), "ctx", "", None, &HashMap::new()).unwrap();
         assert!(e.config.env.iter().any(|v| v == "FOO=bar"));
         assert_eq!(e.config.working_dir, "/app");
         assert_eq!(e.config.user.as_deref(), Some("1000"));
@@ -364,7 +422,7 @@ mod tests {
     fn command_shell_form_maps_to_sh_c() {
         let file = parse("FROM alpine\nCMD echo hi\n").unwrap();
         let mut graph = Graph::new();
-        let e = emit_target(&mut graph, &file.targets[0], &HashMap::new(), "ctx", "", None).unwrap();
+        let e = emit_target(&mut graph, &file.targets[0], &HashMap::new(), "ctx", "", None, &HashMap::new()).unwrap();
         assert_eq!(
             e.config.cmd,
             Some(vec![

@@ -89,9 +89,14 @@ pub async fn run(
     }
 
     // Closures (for identity; the tagHash is the content tag we export under).
-    let overrides = HashMap::new();
+    // On a `tag` event, `VERSION` is a build-arg override: only targets that
+    // reference it re-close (fresh tagHash -> real build); others retag.
+    let mut build_args = HashMap::new();
+    if let Some((_, version)) = crate::solver::promote::extract_version(&event_ref) {
+        build_args.insert("VERSION".to_string(), version);
+    }
     let closures =
-        compute_closure(&parsed.targets, &parsed.default_platforms, inp.context, &overrides, &mut CliResolver)
+        compute_closure(&parsed.targets, &parsed.default_platforms, inp.context, &build_args, &mut CliResolver)
             .map_err(anyhow::Error::msg)?;
 
     // Level 1: if every deliverable's content tag already exists in its
@@ -164,7 +169,7 @@ pub async fn run(
     let mut exporters: Vec<Exporter> = Vec::new();
     let mut result_refs: HashMap<String, String> = HashMap::new();
 
-    let mut em = emitter::emit_file(&parsed.targets, "context", session_id, None).map_err(anyhow::Error::msg)?;
+    let mut em = emitter::emit_file(&parsed.targets, "context", session_id, None, &build_args).map_err(anyhow::Error::msg)?;
     // The graph is shared; solve once with N exporters (one per deliverable).
     let mut config_by_output = HashMap::new();
     for e in &em.targets {
@@ -309,6 +314,7 @@ pub async fn run_do_tasks(
             // effect, never a cached layer, and never an exported image.
             let mut graph = emitter::llb::Graph::new();
             let mut stage_outputs = HashMap::new();
+            let no_args = HashMap::new();
             for t in &parsed.targets {
                 let e = emitter::emit_target(
                     &mut graph,
@@ -317,6 +323,7 @@ pub async fn run_do_tasks(
                     "context",
                     session_id,
                     None,
+                    &no_args,
                 )
                 .map_err(anyhow::Error::msg)?;
                 stage_outputs.insert(t.name.clone(), e.output);
