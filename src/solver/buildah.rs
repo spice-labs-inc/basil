@@ -151,8 +151,8 @@ pub async fn build_deliverable(
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("running buildah build: {e}"))?;
+    std::fs::remove_file(&cf_path).ok();
     if !out.status.success() {
-        std::fs::remove_file(&cf_path).ok();
         anyhow::bail!(
             "buildah build failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
