@@ -548,3 +548,163 @@ fn uuid_like() -> String {
         .unwrap_or(0);
     format!("{:x}", n)
 }
+
+/// Build using the buildah backend (plain subprocess, no buildkitd). Reuses
+/// the identity/event/promotion flow but executes via `buildah build`.
+pub async fn run_buildah(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
+    let src = std::fs::read_to_string(inp.file)
+        .map_err(|e| anyhow::anyhow!("reading {}: {}", inp.file, e))?;
+    let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
+
+    let event_payload: Json = match inp.event_json {
+        Some(j) => serde_json::from_str(j).map_err(|e| anyhow::anyhow!("invalid event JSON: {e}"))?,
+        None => {
+            return Err(anyhow::anyhow!(
+                "build requires an event (stdin JSON) or a manual --target"
+            ));
+        }
+    };
+    let matched = event::matching_reactions(&parsed, &event_payload);
+    let event_ref = event_payload
+        .get("ref")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let mut deliverable_names: Vec<String> = Vec::new();
+    for r in &matched {
+        for b in &r.build {
+            if !deliverable_names.contains(b) {
+                deliverable_names.push(b.clone());
+            }
+        }
+    }
+    if matched.is_empty() {
+        return Err(anyhow::anyhow!("no matching reactions for the delivered event"));
+    }
+    // DO-only: run tasks via buildah run.
+    if deliverable_names.is_empty() {
+        for r in &matched {
+            for do_name in &r.do_list {
+                if let Some(t) = parsed.targets.iter().find(|t| &t.name == do_name) {
+                    if let Some(task) = &t.task {
+                        let image = resolved_image(&t.base);
+                        let env = vec![format!("BASIL_EVENT={}", event_ref)];
+                        let code = crate::solver::buildah::run_task(&image, &task.command, &env).await?;
+                        if code != 0 {
+                            anyhow::bail!("DO task `{do_name}` failed with exit {code}");
+                        }
+                        tracing::info!("DO task `{do_name}` completed (exit 0)");
+                    }
+                }
+            }
+        }
+        return Ok(vec![]);
+    }
+
+    let mut build_args = HashMap::new();
+    if let Some((_, version)) = crate::solver::promote::extract_version(&event_ref) {
+        build_args.insert("VERSION".to_string(), version);
+    }
+    let closures = compute_closure(
+        &parsed.targets,
+        &parsed.default_platforms,
+        inp.context,
+        &build_args,
+        &mut CliResolver,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    // Level 1: skip when every deliverable's content tag exists.
+    let l1_skip = level1_all_exist(&deliverable_names, &closures).await?;
+    if l1_skip {
+        promote_on_tag(&matched, &event_ref, &closures).await?;
+        return Ok(vec![
+            ("level".to_string(), "1-skip".to_string()),
+            (
+                "digest".to_string(),
+                deliverable_names
+                    .first()
+                    .map(|n| closures.get(n).map(|t| hex(t)).unwrap_or_default())
+                    .unwrap_or_default(),
+            ),
+        ]);
+    }
+
+    // Build each deliverable with buildah.
+    for name in &deliverable_names {
+        let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+        let insecure = is_local_registry(name);
+        crate::solver::buildah::build_deliverable(
+            &parsed.targets,
+            name,
+            &tag,
+            inp.context,
+            &build_args,
+            insecure,
+        )
+        .await?;
+        tracing::info!("buildah built {name}:{tag}");
+    }
+
+    promote_on_tag(&matched, &event_ref, &closures).await?;
+    Ok(vec![(
+        "digest".to_string(),
+        closures.get(&deliverable_names[0]).map(|t| hex(t)).unwrap_or_default(),
+    )])
+}
+
+/// Level-1: every deliverable's content tag already exists in its registry.
+async fn level1_all_exist(
+    names: &[String],
+    closures: &std::collections::HashMap<String, [u8; 32]>,
+) -> anyhow::Result<bool> {
+    let mut all = true;
+    for name in names {
+        let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+        let Some((host, rest)) = name.split_once('/') else {
+            anyhow::bail!("deliverable `{name}` is not a qualified image reference");
+        };
+        let repo = rest.rsplit_once(':').map(|(r, _)| r).unwrap_or(rest);
+        let client = crate::solver::registry::RegistryClient::new(&crate::solver::registry::ImageRef {
+            host: host.to_string(),
+            repo: repo.to_string(),
+            tag: tag.clone(),
+        }
+        .base_url());
+        match client.manifest_exists(repo, &tag).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!("Level-1: `{name}:{tag}` does not exist yet (will build)");
+                all = false;
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("Level-1 registry check for `{name}:{tag}` failed: {e}");
+                all = false;
+                break;
+            }
+        }
+    }
+    Ok(all)
+}
+
+fn is_local_registry(name: &str) -> bool {
+    let host = name.split('/').next().unwrap_or("");
+    host.starts_with("127.0.0.1")
+        || host == "localhost"
+        || (!host.contains('.') && !host.contains(':'))
+}
+
+fn resolved_image(base: &crate::dsl::ast::BaseImage) -> String {
+    let mut s = base.raw.clone();
+    if let Some(t) = &base.tag {
+        s.push(':');
+        s.push_str(t);
+    }
+    if let Some(d) = &base.digest {
+        s.push('@');
+        s.push_str(d);
+    }
+    s
+}

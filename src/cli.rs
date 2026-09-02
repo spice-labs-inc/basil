@@ -58,6 +58,9 @@ pub struct BuildArgs {
     /// Destination for --exporter tar (a .tar file).
     #[arg(long)]
     pub output: Option<String>,
+    /// Build backend: `buildah` (default) or `buildkit` (legacy).
+    #[arg(long, default_value = "buildah")]
+    pub backend: String,
     /// Manual trigger: run a specific target's reaction.
     #[arg(short = 't', long)]
     pub target: Option<String>,
