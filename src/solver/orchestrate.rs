@@ -360,21 +360,11 @@ pub async fn run_do_tasks(
         }
     }
 
-    // Close the task solve: Return an empty result so the outer solve completes.
-    use std::str::FromStr;
-    let mut close = crate::gateway_proto::moby::buildkit::v1::frontend::llb_bridge_client::LlbBridgeClient::new(
-        channel.clone(),
-    );
-    let ret = crate::gateway_proto::moby::buildkit::v1::frontend::ReturnRequest {
-        result: None,
-        error: None,
-    };
-    let mut req = tonic::Request::new(ret);
-    req.metadata_mut().insert(
-        "buildkit-controlapi-buildid",
-        tonic::metadata::MetadataValue::from_str(&buildid).expect("ascii buildid"),
-    );
-    let _ = close.r#return(req).await;
+    // Tear the task solve down by cancelling the outer solve (abort its task)
+    // rather than calling LLBBridge.Return(nil), which buildkit's
+    // llbBridgeForwarder.Return dereferences unconditionally and panics on
+    // (frontend/gateway/gateway.go ~1040) — killing the daemon.
+    outer_handle.abort();
     let _ = outer_handle.await;
     Ok(())
 }
