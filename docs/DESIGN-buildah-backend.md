@@ -1,16 +1,15 @@
 # Design: buildah backend (execute on buildah instead of buildkit)
 
-Status: **S1–S3 implemented, S4 in progress**. Commits `a791ba7`, `0d17df8`,
-`3fef88d`. buildah is the **default** backend (`--backend buildah`):
+Status: **complete (S1–S5)**. buildah is the only backend; the buildkitd
+execution layer is deleted.
 
-- single + multi-stage builds via `buildah build`/`push` (no daemon/tunnel),
-  correct OCI config attached natively, closure tagHash identity;
-- promotion + Level-1 verified on buildah-built tags;
-- DO/TASK via `buildah run` (env order fixed; exit codes correct).
-
-Remaining: **S4** (delete the buildkit execution layer + deps — currently kept
-behind `--backend buildkit`, both green) and **S5** (differential conformance
-against `buildah bud`).
+- S1 (`a791ba7`, `0d17df8`) single + multi-stage builds, OCI config native.
+- S2/S3 (`3fef88d`) promotion, Level-1, DO/TASK via `buildah run`.
+- S4 (`9dce6a9`) deleted emitter/llb, bridge, daemon, gateway_proto, proto/,
+  third_party fork; dropped buildkit-client/tonic/prost deps. build is
+  buildah-only; CLI shed the daemon/channel flags.
+- S5 (`138fe48`) buildah e2e conformance test (config + tagHash against a
+  live registry).
 
 _Original proposal retained below for review._
 Status: **proposal for review** — no code written. Follows the rule to finish the
