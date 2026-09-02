@@ -138,6 +138,10 @@ pub async fn build_deliverable(
         .map_err(|e| anyhow::anyhow!("writing containerfile: {e}"))?;
 
     let tag_ref = format!("{deliverable}:{tag}");
+
+    // Buildah's own output is streamed live to the terminal so the user sees
+    // STEP n/n progress; status lines give the phase context.
+    println!("basil: build {deliverable}:{tag}");
     let mut cmd = tokio::process::Command::new("buildah");
     cmd.arg("build")
         .arg("--layers")
@@ -145,40 +149,43 @@ pub async fn build_deliverable(
         .arg(&tag_ref)
         .arg("-f")
         .arg(&cf_path)
-        .arg(context);
+        .arg(context)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
     for (k, v) in build_args {
         cmd.arg("--build-arg").arg(format!("{k}={v}"));
     }
-    let out = cmd
-        .output()
+    let status = cmd
+        .status()
         .await
         .map_err(|e| anyhow::anyhow!("running buildah build: {e}"))?;
     std::fs::remove_file(&cf_path).ok();
-    if !out.status.success() {
-        anyhow::bail!(
-            "buildah build failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    if !status.success() {
+        anyhow::bail!("buildah build failed (exit {})", status);
     }
+    println!("basil: built {deliverable}:{tag}");
 
     // Push the tagged image to the deliverable's registry.
+    println!("basil: push {deliverable}:{tag}");
     let mut push = tokio::process::Command::new("buildah");
     push.arg("push");
     if insecure {
         push.arg("--tls-verify=false");
     }
     push.arg(&tag_ref)
-        .arg(format!("docker://{deliverable}:{tag}"));
-    let pout = push
-        .output()
+        .arg(format!("docker://{deliverable}:{tag}"))
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    let pstatus = push
+        .status()
         .await
         .map_err(|e| anyhow::anyhow!("running buildah push: {e}"))?;
-    if !pout.status.success() {
-        anyhow::bail!(
-            "buildah push failed:\n{}",
-            String::from_utf8_lossy(&pout.stderr)
-        );
+    if !pstatus.success() {
+        anyhow::bail!("buildah push failed (exit {pstatus})");
     }
+    println!("basil: pushed {deliverable}:{tag}");
     Ok(())
 }
 

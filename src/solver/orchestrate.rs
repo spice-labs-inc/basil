@@ -92,6 +92,7 @@ async fn promote_on_tag(
 pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
     let src = std::fs::read_to_string(inp.file)
         .map_err(|e| anyhow::anyhow!("reading {}: {}", inp.file, e))?;
+    println!("basil: parsed {}", inp.file);
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
 
     // Qualified deliverable targets are those named as image refs (host/repo).
@@ -119,6 +120,12 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         &mut CliResolver,
     )
     .map_err(anyhow::Error::msg)?;
+    for name in &names {
+        println!(
+            "basil: identity {name} -> {}",
+            closures.get(name).map(|t| hex(t)).unwrap_or_default()
+        );
+    }
 
     let mut out = Vec::new();
     for name in &names {
@@ -133,9 +140,13 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             insecure,
         )
         .await?;
-        tracing::info!("built {name}:{tag}");
         out.push((name.clone(), tag));
     }
+    println!(
+        "basil: done ({} deliverable{})",
+        out.len(),
+        if out.len() == 1 { "" } else { "s" }
+    );
     Ok(out)
 }
 
@@ -144,6 +155,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
 pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
     let src = std::fs::read_to_string(inp.file)
         .map_err(|e| anyhow::anyhow!("reading {}: {}", inp.file, e))?;
+    println!("basil: parsed {}", inp.file);
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
 
     let event_payload: Json = match inp.event_json {
@@ -208,7 +220,9 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     // Level 1: skip when every deliverable's content tag exists.
     let l1_skip = level1_all_exist(&deliverable_names, &closures).await?;
     if l1_skip {
+        println!("basil: content tags already published -- no build (Level 1 skip)");
         promote_on_tag(&matched, &event_ref, &closures).await?;
+        println!("basil: done ({})", deliverable_names.join(", "));
         return Ok(vec![
             ("level".to_string(), "1-skip".to_string()),
             (
@@ -234,10 +248,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             insecure,
         )
         .await?;
-        tracing::info!("buildah built {name}:{tag}");
     }
 
     promote_on_tag(&matched, &event_ref, &closures).await?;
+    println!("basil: done ({})", deliverable_names.join(", "));
     Ok(vec![(
         "digest".to_string(),
         closures.get(&deliverable_names[0]).map(|t| hex(t)).unwrap_or_default(),
