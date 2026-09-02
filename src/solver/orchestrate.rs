@@ -130,10 +130,11 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     let mut out: Vec<(String, String)> = Vec::new();
 
     // If the content tag already exists in the registry, the exact image is
-    // already published — don't rebuild (parity with handle_event's Level 1).
-    let l1_skip = level1_all_exist(&names, &closures).await?;
-    if l1_skip {
-        println!("basil: content tags already published -- no build (Level 1 skip)");
+    // already published — don't rebuild (parity with handle_event's idempotent
+    // check).
+    let idempotent_skip = idempotent_all_exist(&names, &closures).await?;
+    if idempotent_skip {
+        println!("basil: content tags already published -- no build (idempotent check)");
         for name in &names {
             // OUTPUT still runs: pull the published image and extract.
             let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
@@ -239,10 +240,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     )
     .map_err(anyhow::Error::msg)?;
 
-    // Level 1: skip when every deliverable's content tag exists.
-    let l1_skip = level1_all_exist(&deliverable_names, &closures).await?;
-    if l1_skip {
-        println!("basil: content tags already published -- no build (Level 1 skip)");
+    // Idempotent check: skip when every deliverable's content tag exists.
+    let idempotent_skip = idempotent_all_exist(&deliverable_names, &closures).await?;
+    if idempotent_skip {
+        println!("basil: content tags already published -- no build (idempotent check)");
         // OUTPUT still runs on a skip: pull the published image and extract.
         for name in &deliverable_names {
             let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
@@ -257,7 +258,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         promote_on_tag(&matched, &event_ref, &closures).await?;
         println!("basil: done ({})", deliverable_names.join(", "));
         return Ok(vec![
-            ("level".to_string(), "1-skip".to_string()),
+            ("result".to_string(), "idempotent-skip".to_string()),
             (
                 "digest".to_string(),
                 deliverable_names
@@ -291,8 +292,9 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     )])
 }
 
-/// Level-1: every deliverable's content tag already exists in its registry.
-async fn level1_all_exist(
+/// Idempotent check: every deliverable's content tag already exists in its
+/// registry.
+async fn idempotent_all_exist(
     names: &[String],
     closures: &std::collections::HashMap<String, [u8; 32]>,
 ) -> anyhow::Result<bool> {
@@ -312,12 +314,12 @@ async fn level1_all_exist(
         match client.manifest_exists(repo, &tag).await {
             Ok(true) => {}
             Ok(false) => {
-                tracing::info!("Level-1: `{name}:{tag}` does not exist yet (will build)");
+                tracing::info!("idempotent: `{name}:{tag}` does not exist yet (will build)");
                 all = false;
                 break;
             }
             Err(e) => {
-                tracing::warn!("Level-1 registry check for `{name}:{tag}` failed: {e}");
+                tracing::warn!("idempotent registry check for `{name}:{tag}` failed: {e}");
                 all = false;
                 break;
             }

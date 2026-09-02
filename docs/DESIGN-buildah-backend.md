@@ -4,7 +4,7 @@ Status: **complete (S1–S5)**. buildah is the only backend; the buildkitd
 execution layer is deleted.
 
 - S1 (`a791ba7`, `0d17df8`) single + multi-stage builds, OCI config native.
-- S2/S3 (`3fef88d`) promotion, Level-1, DO/TASK via `buildah run`.
+- S2/S3 (`3fef88d`) promotion, idempotent check, DO/TASK via `buildah run`.
 - S4 (`9dce6a9`) deleted emitter/llb, bridge, daemon, gateway_proto, proto/,
   third_party fork; dropped buildkit-client/tonic/prost deps. build is
   buildah-only; CLI shed the daemon/channel flags.
@@ -63,7 +63,7 @@ basil's promotion requirement.
 
 - `identity/` — closure, dockerignore, derived-data, program-hash (tagHash).
 - `event/`, `dsl/` parser/lexer/ast.
-- `solver/promote.rs`, `solver/registry.rs` (Level-1 skip, retag, gc).
+- `solver/promote.rs`, `solver/registry.rs` (idempotent check skip, retag, gc).
 - `solver/gc.rs`, `solver/orchestrate.rs`'s reaction/event/closure/promotion flow.
 - the CLI surface (`build`, `closure`, `gc`).
 
@@ -108,7 +108,7 @@ backend to materialize `repo:tagHash`, promotes, gc's.
 | `emit_file` → Definition → gateway Solve      | strip DSL → `buildah build --layers`   |
 | image attrib via gateway config              | buildah writes OCI config natively     |
 | image export/exporter                        | tag into storage, `buildah push`       |
-| Level 1 (tag exists → skip)                | unchanged (registry client)            |
+| idempotent check (tag exists → skip)                | unchanged (registry client)            |
 | cache refs (`cache-<tagHash>`, dates)        | buildah `--layers` + `--cache-from`    |
 | `DO`/`TASK` via throwaway solve              | `buildah run <ctr> [env] cmd`          |
 | `-daemon--ephemeral`                         | none (subprocess)                      |
@@ -135,7 +135,7 @@ backend to materialize `repo:tagHash`, promotes, gc's.
 - **S1**: add `execution` trait + `buildah::Builder`; run `buildah build` on a
   stripped Containerfile; keep buildkit path working side-by-side (flag `--backend`).
 - **S2**: wire `--layers`/`--cache-from` = current cache refs; `buildah push`
-  for export; confirm promotion + Level-1 + gc against buildah-built tags.
+  for export; confirm promotion + idempotent check + gc against buildah-built tags.
 - **S3**: `DO`/`TASK` via `buildah run`; drop the throwaway-solve task path.
 - **S4**: flip default to buildah; delete `llb.rs`, `bridge.rs`, `gateway_proto`,
   `proto/`, `third_party` buildkit dependency (keep the trait for legacy).

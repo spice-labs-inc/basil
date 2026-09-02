@@ -83,7 +83,7 @@ dependencies exist before it starts; every phase carries its own test strategy
 
 - Ephemeral `buildkitd` (rootless, unique per-invocation state dir, stop at
   exit); external via `BUILDKIT_HOST`.
-- Level 1 (content tag exists → zero solve), Level 2 (cache import),
+- X (content tag exists → zero solve), Level 2 (cache import),
   Level 3 (full solve + push content tag + `cache-*` exports).
 - **Tests**: integration against a throwaway local registry (`registry:2`) +
   ephemeral daemon — "exists → skip/pull" and "absent → build/push" paths.
@@ -134,7 +134,7 @@ src/
   solver/
     mod.rs         (SolveRequest assembly, N exporters, cache import/export)
     daemon.rs      (ephemeral/external buildkitd lifecycle)
-    levels.rs      (Level 1/2/3)
+    levels.rs      (X/2/3)
   task/
     mod.rs         (TASK execution)
   registry/

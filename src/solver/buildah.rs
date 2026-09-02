@@ -213,7 +213,8 @@ fn collect_outputs(targets: &[Target], deliverable: &str) -> Vec<(String, String
 }
 
 /// Extract a deliverable's OUTPUT files from an already-built image, pulling it
-/// from its registry ref if not present locally. Used on the Level-1 skip path
+/// from its registry ref if not present locally. Used on the idempotent-skip
+/// path
 /// so OUTPUT still runs when the image is not rebuilt.
 pub async fn extract_outputs_from_image(
     image_ref: &str,
