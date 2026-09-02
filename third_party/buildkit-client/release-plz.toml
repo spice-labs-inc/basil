@@ -1,4 +1,0 @@
-[workspace]
-# Only publish when the release PR is merged.
-release_always = false
-

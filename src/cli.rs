@@ -41,26 +41,6 @@ pub struct BuildArgs {
     /// Event JSON delivered on stdin (GitHub Actions payload).
     #[arg(long)]
     pub event: Option<String>,
-    /// buildkitd gRPC address (defaults to $BUILDKIT_HOST; must be set unless
-    /// --ephemeral spawns one).
-    #[arg(long, env = "BUILDKIT_HOST")]
-    pub addr: Option<String>,
-    /// Spawn an ephemeral rootless buildkitd for this build and tear it down.
-    #[arg(long)]
-    pub ephemeral: bool,
-    /// Path to a buildkitd binary for --ephemeral.
-    #[arg(long, env = "BASIL_BUILDKITD")]
-    pub buildkitd: Option<String>,
-    /// Export mode: `image` (registry, default) or `tar` (write the output
-    /// tar to --output).
-    #[arg(long, default_value = "image")]
-    pub exporter: String,
-    /// Destination for --exporter tar (a .tar file).
-    #[arg(long)]
-    pub output: Option<String>,
-    /// Build backend: `buildah` (default) or `buildkit` (legacy).
-    #[arg(long, default_value = "buildah")]
-    pub backend: String,
     /// Manual trigger: run a specific target's reaction.
     #[arg(short = 't', long)]
     pub target: Option<String>,

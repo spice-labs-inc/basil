@@ -190,7 +190,7 @@ impl Parser {
             "SHELL" | "STOPSIGNAL" | "HEALTHCHECK" | "ONBUILD" => {
                 return self.err(
                     line,
-                    format!("`{kw}` is not supported in basil v1 (out of emitter scope)"),
+                    format!("`{kw}` is not supported in basil v1"),
                 )
             }
             _ => {}

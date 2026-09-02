@@ -57,108 +57,24 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Build(args) => {
-            // buildah backend: plain subprocess, no daemon, no channel.
-            if args.backend == "buildah" {
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(async move {
-                    let event_json = match &args.event {
-                        Some(p) => Some(std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("{e}"))?),
-                        None => {
-                            let mut s = String::new();
-                            use std::io::Read;
-                            std::io::stdin().read_to_string(&mut s).map_err(|e| anyhow::anyhow!("{e}"))?;
-                            if s.trim().is_empty() { None } else { Some(s) }
-                        }
-                    };
-                    let inp = basil::solver::orchestrate::BuildInput {
-                        file: &args.file,
-                        context: std::path::Path::new(&args.context),
-                        event_json: event_json.as_deref(),
-                        target_filter: args.target.as_ref(),
-                        tar_output: None,
-                    };
-                    let results = basil::solver::orchestrate::run_buildah(inp).await?;
-                    for (k, v) in &results {
-                        println!("{k} = {v}");
-                    }
-                    Ok::<_, anyhow::Error>(())
-                })?;
-                return Ok(());
-            }
-
-            // Set up a tokio runtime and connect to buildkitd. External mode
-            // uses BUILDKIT_HOST/--addr; --ephemeral spawns a rootless daemon.
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
-                let ext = if args.ephemeral {
-                    None
-                } else {
-                    args.addr.clone()
-                };
-                let daemon =
-                    basil::solver::daemon::Daemon::resolve(ext.as_deref(), args.buildkitd.as_deref())
-                        .await?;
-                let addr = daemon.addr().to_string();
-                let mut client = buildkit_client::client::BuildKitClient::connect(&addr)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("connecting to {}: {}", addr, e))?;
-                client.health_check().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-
-                // A session is required for the solve + context filesync.
-                let mut session = buildkit_client::session::Session::new();
-                let ctx_path = std::path::PathBuf::from(&args.context);
-                session.add_file_sync(ctx_path).await;
-                // `tar` exporter streams its output back over the session;
-                // register a FileSend sink for the destination file.
-                let tar_output = if args.exporter == "tar" {
-                    let out = args.output.clone().ok_or_else(|| {
-                        anyhow::anyhow!("--exporter tar requires --output <file>")
-                    })?;
-                    session.add_file_send(std::path::PathBuf::from(&out)).await;
-                    Some(out)
-                } else {
-                    None
-                };
-                session
-                    .start(client.control().clone())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("starting session: {}", e))?;
-
-                // Read event from --event or stdin.
                 let event_json = match &args.event {
                     Some(p) => Some(std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("{e}"))?),
                     None => {
                         let mut s = String::new();
                         use std::io::Read;
                         std::io::stdin().read_to_string(&mut s).map_err(|e| anyhow::anyhow!("{e}"))?;
-                        if s.trim().is_empty() {
-                            None
-                        } else {
-                            Some(s)
-                        }
+                        if s.trim().is_empty() { None } else { Some(s) }
                     }
                 };
-
                 let inp = basil::solver::orchestrate::BuildInput {
                     file: &args.file,
                     context: std::path::Path::new(&args.context),
                     event_json: event_json.as_deref(),
                     target_filter: args.target.as_ref(),
-                    tar_output,
                 };
-                // A separate channel for the bridge/orchestrator (tonic Channel
-                // is Clone; build one from the same addr).
-                let channel = tonic::transport::Endpoint::from_shared(addr.clone())
-                    .map_err(|e| anyhow::anyhow!("bad addr: {e}"))?
-                    .connect()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("connecting bridge channel: {e}"))?;
-                let results = basil::solver::orchestrate::run(
-                    channel,
-                    &session.get_id(),
-                    inp,
-                )
-                .await?;
+                let results = basil::solver::orchestrate::run_buildah(inp).await?;
                 for (k, v) in &results {
                     println!("{k} = {v}");
                 }

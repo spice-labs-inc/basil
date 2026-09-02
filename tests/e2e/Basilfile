@@ -1,6 +1,0 @@
-FROM scratch AS 127.0.0.1:5001/e2e
-COPY greeting.txt /greeting.txt
-ENV APP=basil
-CMD ["/bin/echo", "hi"]
-
-ON push(main) BUILD 127.0.0.1:5001/e2e
