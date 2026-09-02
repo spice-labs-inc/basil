@@ -44,6 +44,43 @@ impl<'a> Bridge<'a> {
         Bridge { channel, buildid }
     }
 
+    /// Solve a definition and return the resulting ref id. Used to get a
+    /// task target's rootfs ref for `DO`/`TASK` execution.
+    pub async fn solve_ref(
+        &mut self,
+        definition: buildkit_client::proto::pb::Definition,
+    ) -> anyhow::Result<String> {
+        let mut bridge = LlbBridgeClient::new(self.channel.clone());
+        let solve_req = gw::SolveRequest {
+            definition: Some(convert_definition(definition)),
+            frontend: String::new(),
+            frontend_opt: HashMap::new(),
+            allow_result_return: true,
+            allow_result_array_ref: true,
+            r#final: false,
+            exporter_attr: Vec::new(),
+            cache_imports: vec![],
+            frontend_inputs: HashMap::new(),
+            evaluate: false,
+            source_policies: vec![],
+        };
+        let resp = bridge
+            .solve(with_buildid(tonic::Request::new(solve_req), &self.buildid))
+            .await
+            .map_err(|e| anyhow::anyhow!("LLBBridge.Solve (task) failed: {e}"))?;
+        let sr = resp.into_inner();
+        let result = sr
+            .result
+            .ok_or_else(|| anyhow::anyhow!("task solve returned no result"))?;
+        match result.result {
+            Some(gw::result::Result::Ref(rf)) => Ok(rf.id),
+            Some(gw::result::Result::Refs(rf)) => {
+                Ok(rf.refs.into_values().next().map(|r| r.id).unwrap_or_default())
+            }
+            _ => Err(anyhow::anyhow!("task solve result has no Ref")),
+        }
+    }
+
     /// Drive the outer frontend-less solve: register the bridge on buildkitd,
     /// solve basil's graph, attach the config, and return the outer result.
     pub async fn build(
@@ -53,6 +90,7 @@ impl<'a> Bridge<'a> {
         session_id: &str,
         build_ref: &str,
         exporters: Vec<Exporter>,
+        cache: Option<buildkit_client::proto::moby::buildkit::v1::CacheOptions>,
     ) -> anyhow::Result<BridgeBuildResult> {
         // Outer solve: frontend-less, no definition. Blocks until Return.
         let outer_channel = self.channel.clone();
@@ -64,6 +102,7 @@ impl<'a> Bridge<'a> {
             frontend: String::new(),
             frontend_attrs: HashMap::new(),
             exporters,
+            cache,
             ..Default::default()
         };
         let outer_handle = tokio::spawn(async move {
@@ -75,22 +114,7 @@ impl<'a> Bridge<'a> {
 
         // The bridge's SolveRequest uses the gateway proto's own Definition
         // (a distinct prost type, wire-identical to buildkit-client's). Convert.
-        let definition = crate::gateway_proto::pb::Definition {
-            def: definition.def,
-            metadata: definition
-                .metadata
-                .into_iter()
-                .map(|(k, v)| {
-                    let md = crate::gateway_proto::pb::OpMetadata {
-                        ignore_cache: v.ignore_cache,
-                        description: v.description,
-                        ..Default::default()
-                    };
-                    (k, md)
-                })
-                .collect(),
-            source: None,
-        };
+        let definition = convert_definition(definition);
 
         // Solve the actual graph via the bridge.
         let solve_req = gw::SolveRequest {
@@ -161,4 +185,27 @@ fn with_buildid<T>(mut req: tonic::Request<T>, id: &str) -> tonic::Request<T> {
     req.metadata_mut()
         .insert(BUILDID_KEY, tonic::metadata::MetadataValue::from_str(id).expect("ascii buildid"));
     req
+}
+
+/// Convert a buildkit-client Definition (the emitter's type) to the gateway
+/// proto's own Definition (a distinct prost type, wire-identical).
+fn convert_definition(
+    definition: buildkit_client::proto::pb::Definition,
+) -> crate::gateway_proto::pb::Definition {
+    crate::gateway_proto::pb::Definition {
+        def: definition.def,
+        metadata: definition
+            .metadata
+            .into_iter()
+            .map(|(k, v)| {
+                let md = crate::gateway_proto::pb::OpMetadata {
+                    ignore_cache: v.ignore_cache,
+                    description: v.description,
+                    ..Default::default()
+                };
+                (k, md)
+            })
+            .collect(),
+        source: None,
+    }
 }

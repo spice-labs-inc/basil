@@ -63,10 +63,22 @@ pub async fn run(
             }
         }
     }
-    if deliverable_names.is_empty() {
+    if matched.is_empty() {
         return Err(anyhow::anyhow!(
-            "no matching BUILD targets for the delivered event"
+            "no matching reactions for the delivered event"
         ));
+    }
+    // A DO-only reaction (no BUILD) runs its tasks without a solve.
+    if deliverable_names.is_empty() {
+        let _ = run_do_tasks(
+            &channel,
+            session_id,
+            &parsed,
+            &matched,
+            inp.event_json.unwrap_or(""),
+        )
+        .await?;
+        return Ok(vec![]);
     }
 
     // Closures (for identity; the tagHash is the content tag we export under).
@@ -74,6 +86,68 @@ pub async fn run(
     let closures =
         compute_closure(&parsed.targets, &parsed.default_platforms, inp.context, &overrides, &mut CliResolver)
             .map_err(anyhow::Error::msg)?;
+
+    // Level 1: if every deliverable's content tag already exists in its
+    // registry, the exact image is already published — zero solve. (The
+    // dependent pull-if-needed happens when a consumer resolves by tagHash.)
+    let l1_skip = {
+        let mut all_exist = true;
+        for name in &deliverable_names {
+            let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+            let (host, rest) = name.split_once('/').ok_or_else(|| {
+                anyhow::anyhow!("deliverable `{name}` is not a qualified image reference")
+            })?;
+            let repo = rest.rsplit_once(':').map(|(r, _)| r).unwrap_or(rest);
+            let client = crate::solver::registry::RegistryClient::new(
+                &crate::solver::registry::ImageRef {
+                    host: host.to_string(),
+                    repo: repo.to_string(),
+                    tag: tag.clone(),
+                }
+                .base_url(),
+            );
+            match client.manifest_exists(repo, &tag).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!("Level-1: `{name}:{tag}` does not exist yet (will build)");
+                    all_exist = false;
+                    break;
+                }
+                Err(e) => {
+                    // Registry check failures are non-fatal; fall through to a
+                    // full solve (the image exporter re-checks/pushes).
+                    tracing::warn!("Level-1 registry check for `{name}:{tag}` failed: {e}");
+                    all_exist = false;
+                    break;
+                }
+            }
+        }
+        all_exist
+    };
+    if l1_skip {
+        tracing::info!(
+            "all deliverable content tags already exist; skipping solve (Level 1)"
+        );
+        let do_results = run_do_tasks(
+            &channel,
+            session_id,
+            &parsed,
+            &matched,
+            inp.event_json.unwrap_or(""),
+        )
+        .await?;
+        let _ = do_results;
+        return Ok(vec![
+            ("level".to_string(), "1-skip".to_string()),
+            (
+                "digest".to_string(),
+                deliverable_names
+                    .first()
+                    .map(|n| closures.get(n).map(|t| hex(t)).unwrap_or_default())
+                    .unwrap_or_default(),
+            ),
+        ]);
+    }
 
     // Emit the graph for all targets (deps included), and produce per-deliverable
     // config + exporters. buildkit's `image` exporter pushes `<name>:<tagHash>`.
@@ -136,14 +210,248 @@ pub async fn run(
 
     let buildid = format!("basil-{}", uuid_like());
     let mut bridge = Bridge::new(&channel, buildid.clone());
+
+    // Cache refs (Level 2/3): export under the deliverable repo with the exact
+    // closure tag and the build-date tags; import the same plus the current
+    // period, so a rebuild reattaches cache and accumulates across changes.
+    let cache = build_cache_options(&deliverable_names, &closures);
+
     let result: BridgeBuildResult = bridge
-        .build(definition, metadata, session_id, &buildid, exporters)
+        .build(
+            definition,
+            metadata,
+            session_id,
+            &buildid,
+            exporters,
+            cache,
+        )
         .await?;
+
+    // DO/TASK side effects run because the event fired, after BUILD.
+    let _ = run_do_tasks(
+        &channel,
+        session_id,
+        &parsed,
+        &matched,
+        inp.event_json.unwrap_or(""),
+    )
+    .await?;
 
     Ok(result
         .digest
         .map(|d| vec![("digest".to_string(), d)])
         .unwrap_or_default())
+}
+
+/// Run the `DO` tasks for the matched reactions, after the build solve. Each
+/// task target is solved standalone to a ref, then its `TASK` command runs in a
+/// one-shot container on that rootfs.
+pub async fn run_do_tasks(
+    channel: &tonic::transport::Channel,
+    session_id: &str,
+    parsed: &crate::dsl::ast::File,
+    matched: &[&crate::dsl::ast::Reaction],
+    event_json: &str,
+) -> anyhow::Result<()> {
+    let buildid = format!("basil-do-{}", uuid_like());
+
+    // Open a frontend-less outer solve for the task forwarder: it registers a
+    // bridge for `buildid` and stays open while we solve task graphs and run
+    // their containers. No image exporters (tasks produce no image); we close
+    // it with a Return at the end.
+    let mut outer = buildkit_client::proto::moby::buildkit::v1::control_client::ControlClient::new(
+        channel.clone(),
+    );
+    let outer_req = buildkit_client::proto::moby::buildkit::v1::SolveRequest {
+        r#ref: buildid.clone(),
+        definition: None,
+        session: session_id.to_string(),
+        frontend: String::new(),
+        frontend_attrs: HashMap::new(),
+        exporters: vec![],
+        ..Default::default()
+    };
+    let outer_handle = tokio::spawn(async move {
+        outer.solve(tonic::Request::new(outer_req)).await
+    });
+    // Let the outer solve register its bridge for `buildid` before we solve tasks.
+    tokio::task::yield_now().await;
+
+    let mut bridge = Bridge::new(channel, buildid.clone());
+
+    for r in matched {
+        for do_name in &r.do_list {
+            let Some(target) = parsed.targets.iter().find(|t| &t.name == do_name) else {
+                tracing::warn!("DO target `{do_name}` not found");
+                continue;
+            };
+            let Some(task) = &target.task else {
+                tracing::warn!("DO target `{do_name}` has no TASK clause");
+                continue;
+            };
+
+            // Emit + solve just this task target (and any stages it depends on
+            // via its base/--from). A single-target graph whose root is the task
+            // target gives its rootfs ref.
+            let mut graph = emitter::llb::Graph::new();
+            let mut stage_outputs = HashMap::new();
+            for t in &parsed.targets {
+                // Only include targets up to and including this one (topo order).
+                let e = emitter::emit_target(
+                    &mut graph,
+                    t,
+                    &stage_outputs,
+                    "context",
+                    session_id,
+                    None,
+                )
+                .map_err(anyhow::Error::msg)?;
+                stage_outputs.insert(t.name.clone(), e.output);
+                if &t.name == do_name {
+                    break;
+                }
+            }
+            let root = stage_outputs
+                .get(do_name)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("task target `{do_name}` has no output"))?;
+            let def = graph.finish(root);
+            let ref_id = bridge.solve_ref(def).await?;
+
+            // Env: BASIL_EVENT raw JSON; BASIL_IMAGE placeholder (resolved base
+            // digest not yet tracked); BASIL_REF_<TARGET> not set for simple runs.
+            let env = vec![
+                ("BASIL_EVENT".to_string(), event_json.to_string()),
+            ];
+            let exit = crate::solver::task::run_task(
+                &mut bridge_client(channel, &buildid),
+                &buildid,
+                &format!("task-{do_name}"),
+                &ref_id,
+                &task.command,
+                env,
+            )
+            .await?;
+            if exit != 0 {
+                anyhow::bail!("DO task `{do_name}` failed with exit {exit}");
+            }
+            tracing::info!("DO task `{do_name}` completed");
+        }
+    }
+
+    // Close the task solve: Return an empty result so the outer solve completes.
+    use std::str::FromStr;
+    let mut close = crate::gateway_proto::moby::buildkit::v1::frontend::llb_bridge_client::LlbBridgeClient::new(
+        channel.clone(),
+    );
+    let ret = crate::gateway_proto::moby::buildkit::v1::frontend::ReturnRequest {
+        result: None,
+        error: None,
+    };
+    let mut req = tonic::Request::new(ret);
+    req.metadata_mut().insert(
+        "buildkit-controlapi-buildid",
+        tonic::metadata::MetadataValue::from_str(&buildid).expect("ascii buildid"),
+    );
+    let _ = close.r#return(req).await;
+    let _ = outer_handle.await;
+    Ok(())
+}
+
+fn bridge_client(channel: &tonic::transport::Channel, _buildid: &str) -> crate::gateway_proto::moby::buildkit::v1::frontend::llb_bridge_client::LlbBridgeClient<tonic::transport::Channel> {
+    crate::gateway_proto::moby::buildkit::v1::frontend::llb_bridge_client::LlbBridgeClient::new(channel.clone())
+}
+
+/// Build the cache export/import refs for the deliverable repos.
+fn build_cache_options(
+    deliverable_names: &[String],
+    closures: &HashMap<String, [u8; 32]>,
+) -> Option<buildkit_client::proto::moby::buildkit::v1::CacheOptions> {
+    use buildkit_client::proto::moby::buildkit::v1::{CacheOptions, CacheOptionsEntry};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let date = date_tags(now);
+
+    let mut exports = Vec::new();
+    let mut imports = Vec::new();
+    for name in deliverable_names {
+        let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+        let repo_only = name.rsplit_once(':').map(|(r, _)| r).unwrap_or(name);
+        // Local/plain registries are HTTP; the image exporter works there but
+        // buildkit's registry cache exporter to an explicit HTTP registry needs
+        // auth/scope that a dev registry may not grant. Keep cache refs only
+        // for HTTPS/qualified registries (the real cross-build reuse path).
+        let host = repo_only.split('/').next().unwrap_or("");
+        let insecure_local = host.starts_with("127.0.0.1")
+            || host == "localhost"
+            || (!host.contains('.') && !host.contains(':'));
+        if insecure_local {
+            continue;
+        }
+        // Multiple refs per repo: exact closure + date tags (each a separate
+        // registry cache exporter entry).
+        for t in [&tag, &date.0, &date.1, &date.2] {
+            if t.is_empty() {
+                continue;
+            }
+            exports.push(CacheOptionsEntry {
+                r#type: "registry".to_string(),
+                attrs: {
+                    let mut a = HashMap::new();
+                    a.insert("ref".to_string(), format!("{repo_only}:cache-{t}"));
+                    a.insert("mode".to_string(), "max".to_string());
+                    a
+                },
+            });
+        }
+        // Import the exact + current day/month/year tags (best-effort).
+        for t in [&tag, &date.0, &date.1, &date.2] {
+            imports.push(CacheOptionsEntry {
+                r#type: "registry".to_string(),
+                attrs: {
+                    let mut a = HashMap::new();
+                    a.insert("ref".to_string(), format!("{repo_only}:cache-{t}"));
+                    a
+                },
+            });
+        }
+    }
+    Some(CacheOptions {
+        exports,
+        imports,
+        ..Default::default()
+    })
+}
+
+/// Compute the `YYYYMMDD`, `YYYYMM`, `YYYY` date tags from a unix timestamp.
+fn date_tags(secs: u64) -> (String, String, String) {
+    format_date(secs)
+}
+
+/// UTC calendar decomposition (days since epoch) without chrono.
+fn format_date(secs: u64) -> (String, String, String) {
+    // Days since 1970-01-01.
+    let days = secs / 86400;
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (
+        format!("{year}{:02}{:02}", m, d),
+        format!("{year}{:02}", m),
+        format!("{year}"),
+    )
 }
 
 fn uuid_like() -> String {
