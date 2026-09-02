@@ -57,12 +57,22 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Build(args) => {
-            // Set up a tokio runtime and connect to buildkitd (external mode).
+            // Set up a tokio runtime and connect to buildkitd. External mode
+            // uses BUILDKIT_HOST/--addr; --ephemeral spawns a rootless daemon.
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
-                let mut client = buildkit_client::client::BuildKitClient::connect(&args.addr)
+                let ext = if args.ephemeral {
+                    None
+                } else {
+                    args.addr.clone()
+                };
+                let daemon =
+                    basil::solver::daemon::Daemon::resolve(ext.as_deref(), args.buildkitd.as_deref())
+                        .await?;
+                let addr = daemon.addr().to_string();
+                let mut client = buildkit_client::client::BuildKitClient::connect(&addr)
                     .await
-                    .map_err(|e| anyhow::anyhow!("connecting to {}: {}", args.addr, e))?;
+                    .map_err(|e| anyhow::anyhow!("connecting to {}: {}", addr, e))?;
                 client.health_check().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
                 // A session is required for the solve + context filesync.
@@ -97,7 +107,7 @@ fn main() -> anyhow::Result<()> {
                 };
                 // A separate channel for the bridge/orchestrator (tonic Channel
                 // is Clone; build one from the same addr).
-                let channel = tonic::transport::Endpoint::from_shared(args.addr.clone())
+                let channel = tonic::transport::Endpoint::from_shared(addr.clone())
                     .map_err(|e| anyhow::anyhow!("bad addr: {e}"))?
                     .connect()
                     .await

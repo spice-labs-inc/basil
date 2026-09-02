@@ -2,6 +2,7 @@
 
 pub mod bridge;
 pub mod config;
+pub mod daemon;
 pub mod gc;
 pub mod orchestrate;
 pub mod promote;
