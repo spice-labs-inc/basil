@@ -32,7 +32,7 @@ pub struct Target {
     /// Build steps in source order (no `FROM`; the base is separate).
     pub instructions: Vec<Instruction>,
     /// Optional `TASK` clause — side-effect commands run on the resolved base
-    /// image outside the solve.
+    /// image outside the build.
     pub task: Option<TaskCmd>,
     /// Per-target platform list (`PLATFORM` inside this stage), overriding the
     /// file-wide default.
@@ -171,7 +171,7 @@ pub struct TaskCmd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reaction {
     pub event: EventMatch,
-    /// `BUILD <target>...` — solve + tag + push (deliverables).
+    /// `BUILD <target>...` — build + tag + push (deliverables).
     pub build: Vec<String>,
     /// `DO <target>...` — run each target's `TASK` clause.
     pub do_list: Vec<String>,

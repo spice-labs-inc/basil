@@ -173,7 +173,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     Ok(out)
 }
 
-/// Build using the buildah backend (plain subprocess, no buildkitd), driven by
+/// Build using the buildah backend (plain subprocess, no daemon), driven by
 /// a delivered event: match reactions, build/promote the deliverables.
 pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
     let src = std::fs::read_to_string(inp.file)

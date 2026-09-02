@@ -1,6 +1,6 @@
 //! Minimal registry v2 HTTP client for tag existence + management.
 //!
-//! Used for the idempotent content-tag existence check (skip a solve when the
+//! Used for the idempotent content-tag existence check (skip a build when the
 //! deliverable's tag already exists) and for `basil gc` (list/prune basil's
 //! own tags). Auth uses the operator's Docker/Podman credentials in the real
 //! client (Phase 8); for now anonymous access is supported (sufficient for

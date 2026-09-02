@@ -1,4 +1,4 @@
-//! Solve: driving buildkitd to build basil's graph and attach image config.
+//! Solve: driving buildah to build basil's graph and attach image config.
 
 pub mod buildah;
 pub mod gc;

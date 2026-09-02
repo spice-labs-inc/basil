@@ -1,12 +1,12 @@
 # Basil — Design
 
-Basil is a plain-process, buildkit-graph-owning build tool. It parses a
-Dockerfile-like DSL, derives each target's input closure from its instruction
-graph, emits its own Low-Level Build graph (LLB), and drives a `buildkitd`
-daemon it owns. Top-level `ON` reactions map CI events to targets: `BUILD`
-targets are solved and pushed, `DO` targets run their attached `TASK` side
-effects. Basil owns the graph so it can express these reactions and compute an
-honest, derived content identity.
+Basil is a plain-process build tool. It parses a Dockerfile-like DSL, derives
+each target's input closure from its instruction graph, and drives `buildah`
+(as a subprocess over rootless containers/storage) to build and push images.
+Top-level `ON` reactions map CI events to targets: `BUILD` targets are built
+and pushed under a content tag, `DO` targets run their attached `TASK` side
+effects, and `OUTPUT` extracts files back to the host. Basil owns the *identity*:
+it computes an honest, derived content hash (tagHash) for every target.
 
 ## Targets and reactions (encoding intent)
 
@@ -44,18 +44,18 @@ ON pr-merged        BUILD ghcr.io/mycompany/app   DO migrate
 ON image-published  DO notify smoke
 ```
 
-- **`BUILD <target>…`** — solve + tag + push. Listing a target here is what makes
+- **`BUILD <target>…`** — build + tag + push. Listing a target here is what makes
   it a **deliverable**; a target never in any `BUILD` is a build-only
   intermediate (always built when a deliverable needs it, never tagged or
   pushed). `BUILD` cannot reference a task target. A deliverable's `AS` name is
   its fully-qualified image reference; basil pushes it as `<name>:<tagHash>`.
 - **`DO <target>…`** — run the `TASK` commands attached to that target. `DO`
   references **only task targets** (targets with a `TASK` clause). Side effects:
-  not graph `ExecOp`s, never layers, never part of the image; they run because
+  not build graph steps, never layers, never part of the image; they run because
   the event matched, whether or not the target built this run.
 - **`TASK <cmd>…`** — a target clause: commands to run **on the target's base
   image** (its `FROM` — an external image, or another target's output, including
-  a target that is `BUILD`'d), like `RUN` but outside the solve. A task target
+  a target that is `BUILD`'d), like `RUN` but outside the build. A task target
   may also carry build steps — they prepare the task's runtime image (e.g.
   `COPY` the executable in), built locally, never tagged or pushed.
 - **`PLATFORM <os>/<arch>…`** — the platform(s) a target builds for. On a target
@@ -73,7 +73,8 @@ ON image-published  DO notify smoke
   the OUTPUT from it. `OUTPUT` is not a container build step (never fed to the
   builder) but is folded into the target's `programHash`, so changing it changes
   the content tag.
-- Targets depend on each other, so the LLB is a DAG across targets (edges from
+- Targets depend on each other, so the build graph is a DAG across targets
+  (edges from
   `COPY --from=<target>` and `FROM <target>`). `FROM <x>` resolves like
   Dockerfile: a local `AS` alias shadows a registry reference, so a base that
   matches a target name is the stage, not an image pull.
@@ -89,7 +90,7 @@ ON image-published  DO notify smoke
   (`ref` == `refs/heads/main`); `ON push(main, develop)` matches either; a bare
   `ON push` matches any branch push. Exact match today; glob patterns are a
   later extension.
-- Within one reaction, `BUILD` targets solve first, then the `DO`'d tasks run.
+- Within one reaction, `BUILD` targets build first, then the `DO`'d tasks run.
   Both lists are optional (`BUILD`-only, `DO`-only, or both).
 
 ## Identity (derived, not declared)
@@ -139,8 +140,7 @@ checked-in golden inputs whose expected digest the test suite recomputes.
 1. `<name>:<tagHash>` — stable immutable content tag, where `<name>` is the
    deliverable's **fully-qualified `AS` name** (`ghcr.io/mycompany/app`).
    **Deliverable targets only.** One platform → a single image; several → an OCI
-   index. Checked first; on hit, return the ref with zero daemon work (Level 1
-   skip).
+    index. Checked first; on hit, the idempotent check skips the rebuild.
 2. **Cache refs** — exported under the deliverable's repo with four tags:
    `cache-<tagHash>` (exact closure), `cache-<YYYYMMDD>`, `cache-<YYYYMM>`,
    `cache-<YYYY>` (build date). The exact tag reattaches the identical closure;
@@ -211,80 +211,48 @@ require it:
       containers/storage  ──(runc/crun exec steps)──
 ```
 
-- The pipeline has three phases: **emit+solve** (build/push/cache), then
-  **run `DO`'d `TASK`s** — always-run side effects outside the graph, keyed by
-  the delivered event, not by build state.
+- The pipeline has two phases after parsing: **build/push/cache**, then **run
+  `DO`'d `TASK`s and extract `OUTPUT`s** — always-run side effects keyed by the
+  delivered event and the built image, not by build state.
 
-- **Client shell**: `buildkit-client` (arcbox/AprilNEA) — session, filesync,
-  auth, cache, tunnel, progress, CLI. MIT/Apache, maintained (fresh pushes,
-  releases, CI). The modern, operative base.
-- **LLB emitter**: `buildkit-client` has **no client-side graph builder** — it
-  hands everything to buildkit's built-in `dockerfile.v0` (`solve.rs`:
-  `frontend: "dockerfile.v0"`, `definition: None`). Basil needs to **own the
-  graph** so it can express reactions and `TASK`s and derive its own identity.
-  So basil **recreates** an LLB emitter on top of the maintained proto types
-  (`buildkit-rs` `ops.proto`), rather than resurrecting an abandoned crate.
-  Contribute the emitter back once stable.
+## Build backend (buildah)
 
-## Emitter instruction scope (v1)
-
-The recreated emitter translates a fixed instruction subset to LLB. Anything
-outside it is a parse-time error — surfaced, never silently mishandled.
-
-**In scope**
-
-- Build graph: `FROM` (stage alias or external image, pinned/unpinned), `COPY`
-  (context after `.dockerignore` + globs; `--from=<stage|image>`;
-  `--chown`/`--chmod`), `ADD` (local, incl. tar auto-extract; URL = non-hermetic),
-  `RUN` (shell + exec form; `--mount=type=bind|secret|ssh|cache`).
-- Image config: `ARG`, `ENV`, `CMD`, `ENTRYPOINT`, `USER`, `WORKDIR`, `LABEL`,
-  `EXPOSE`, `VOLUME`.
+- **Execution**: basil renders the target graph to a multi-stage Containerfile
+  and runs `buildah build --layers` (a plain subprocess over rootless
+  containers/storage + runc/crun), then `buildah push`. No daemon, no graph
+  protocol, no tunnel.
+- **Identity**: basil still computes each target's `tagHash` from `derivedData`
+  + `programHash` + bases + args (a derived content hash it owns), and pushes
+  under `<name>:<tagHash>`. Config (`ENV`/`CMD`/`ENTRYPOINT`/…) is written
+  natively by buildah.
+- **Idempotent check**: before building, if every deliverable's content tag
+  already exists in its registry, basil skips the rebuild (and still runs
+  `OUTPUT`/promotion by pulling the published image).
+- **Renderer scope**: the rendered Containerfile covers the in-scope
+  instructions; basil-only directives (`ON`, `TASK`, `PLATFORM`, `OUTPUT`) are
+  stripped from the Containerfile and handled by basil directly.
 
 **Deferred** (parse-time error)
 
-- Heredocs (`COPY`/`RUN` `<<EOF`), `COPY --link`, `RUN --network`/`--security`,
-  `SHELL`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`, per-instruction `--platform`
-  (the target `PLATFORM` clause covers multi-arch).
+- Heredocs, `COPY --link`, `SHELL`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`.
 
-**Correctness surface** (where emitter effort lives)
+**Correctness surface**
 
-- `RUN` cache key — attach env + mounts so buildkit's key is sound and stable.
-- `COPY`/`ADD` source resolution — globs, dir/file semantics, `--from` stage FS
-  vs context, symlinks.
-- `ARG`/`ENV` scoping + `${VAR}` expansion; `ENV` persisted to config and to
-  subsequent `RUN` env.
-- Image config — `CMD`/`ENTRYPOINT` shell-vs-exec normalization; `USER`/
-  `WORKDIR`/`LABEL`/`EXPOSE`/`VOLUME` change tracking.
+- Renderer fidelity: multi-stage `COPY --from`, `ARG`/`ENV` expansion, shell-vs-
+  exec command normalization, and that basil-only instructions never leak into
+  the Containerfile.
 
 **Test strategy**
 
-- Differential conformance: for each in-scope instruction, build identical
-  inputs via buildkit's `dockerfile.v0` frontend and via basil's emitter; assert
-  equal image config + layer digests. This pins real behavior, not an
-  interpretation of it. Plus the existing closure-digest conformance fixture.
-
-## Daemon mode
-
-- **Ephemeral (default)** — each `basil` invocation spawns its own rootless
-  `buildkitd` in a unique per-invocation state dir, solves, and stops it at exit.
-  Concurrent invocations never collide (unique state dir); no discovery, no
-  locking. Cross-build reuse comes from the registry `cache-*` refs, not local
-  daemon state.
-- **External (opt-in)** — when `BUILDKIT_HOST` is set (a unix socket path or
-  `tcp://` address), basil connects to that daemon and never manages its
-  lifecycle. This is the warm-local-cache path for iterative development: run a
-  persistent `buildkitd` yourself (e.g. a systemd user unit) and point basil at
-  it.
-- **Not provided** — a basil-managed persistent socket with lock/lease and
-  stale-socket recovery. Registry cache makes it unnecessary for CI, and external
-  mode covers development; revisit only if ephemeral startup cost proves real.
+- buildah e2e conformance against a live registry (config + `tagHash`), the
+  closure-digest conformance fixture, and the `COPY --from` stage-fold unit test.
 
 ## Event input (`ON`) — reactions
 
-- Event delivered on **stdin** as JSON; read by `basil build` (with `--event`
-  flag). One event per invocation. **For now the JSON is the GitHub Actions
-  event payload** (`$GITHUB_EVENT_PATH`), consumed verbatim — basil defines no
-  event schema of its own yet.
+- Event delivered on **stdin** as JSON; read by `basil handle` (with `--event`
+  flag for a file). One event per invocation. **For now the JSON is the GitHub
+  Actions event payload** (`$GITHUB_EVENT_PATH`), consumed verbatim — basil
+  defines no event schema of its own yet.
 - Each reaction's `ON` is compared against the delivered event at parse time;
   non-matching reactions are ignored. A matching `BUILD` target whose image
   already exists **pulls it** rather than rebuilding; matching `DO` targets
@@ -302,7 +270,8 @@ outside it is a parse-time error — surfaced, never silently mishandled.
   Other events (e.g. `image-published`) are **deferred** — a native carrier
   exists (`registry_package`), but the mapping is not pinned yet.
 
-- Manual trigger = an event supplied from stdin without a CI workflow.
+- Manual trigger = `basil build [-t target]` builds a deliverable directly,
+  with no event (default: every qualified deliverable in the file).
 
 ## Promotion (version tags)
 
@@ -344,8 +313,8 @@ produced. Until that form exists, no guard is needed.
 
 - **`TASK <cmd>…` is the command itself, like `RUN`** — not a file reference.
   It executes in the target's base image (`FROM`), as a one-shot container from
-  the resolved base image, outside the LLB solve: not a buildkit `ExecOp`, no
-  cache key, never a layer, never part of any image. Anything the command
+  the resolved base image, outside the build: not part of any image, no cache
+  key, never a layer. Anything the command
   invokes must already be present in that image — `COPY`ed in by the target's
   build steps; basil injects nothing.
 - **Trigger** — a task runs because its reaction's event fired, unconditionally
@@ -378,19 +347,15 @@ produced. Until that form exists, no guard is needed.
 - **`BASIL_CACHE_REF`** — overrides the cache repo (default: the deliverable's
   fully-qualified name); basil appends the `cache-…` tags and uses the same
   operator credentials, never a separate set.
-- Exporters (buildkit-native, via `exportCache`): `type=registry` (separate
-  cache blobs, keeps the content tag clean — **recommended**) or `type=inline`
-  (cache inside the image, simpler/self-contained).
-- **Export**: one cache export per tag — `cache-<tagHash>`, `cache-<YYYYMMDD>`,
-  `cache-<YYYYMM>`, `cache-<YYYY>`. buildkit's `CacheExports` is a repeated
-  field, so this needs no extra solve.
-- **Import**: `cache-<tagHash>` plus the current day/month/year tags, each
-  `[ type=registry, ref=... ]`, for Level 2 reattach.
-- **Multiple deliverables** = **one solve with N exporters**, one per
-  deliverable target. The stock `buildkit-client` only exposes a single-solve
-  exporter (comma-joined tags for one image); basil **must extend/recreate it
-  to emit N exporters** in one `SolveRequest`. That support is a required
-  deliverable of the recreated emitter.
+- **Build layer cache**: `buildah build --layers` reuses the operator's local
+  `containers/storage` layer cache; `--cache-from` can point at published cache
+  refs. The idempotent check (content tag exists) already skips the entire build,
+  so layer reattach is a secondary optimization.
+- **Cache refs**: basil names exported intermediate cache under
+  `cache-<tagHash>`, `cache-<YYYYMMDD>`, `cache-<YYYYMM>`, `cache-<YYYY>` for
+  cross-run reuse.
+- **Multiple deliverables** = one rendered multi-stage Containerfile; each
+  deliverable is built and pushed under its content tag.
 
 ## `basil gc` — tag pruning
 
@@ -411,13 +376,10 @@ produced. Until that form exists, no guard is needed.
   Pruning removes the tag reference; blobs are reclaimed by the registry's own
   GC. Deletion is irreversible.
 
-## Dependency & contribution strategy
+## Dependency strategy
 
-- **Base**: `buildkit-client` (maintained). No vendoring needed for the shell.
-- **LLB emitter**: recreated by basil on top of the maintained proto types
-  (`buildkit-rs` `ops.proto`). Avoids resurrecting the abandoned `buildkit-llb`.
-- **Contribute back**: once stable, contribute the recreated LLB emitter
-  upstream; keep basil-specific DSL→LLB separate.
+- **Base**: `buildah` (via subprocess), `reqwest` (registry client), `tokio`,
+  `clap`. Plain crates, no buildkit/daemon dependency.
 
 ## Decided defaults
 

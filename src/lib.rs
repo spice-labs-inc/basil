@@ -1,6 +1,4 @@
-//! Basil — a plain-process, buildkit-graph-owning build tool.
-//!
-//! BOOM
+//! Basil — a plain-process build tool driven by declarative build files.
 //!
 //! See `docs/DESIGN.md` for the architecture and `docs/PLAN.md` for the phased
 //! implementation plan.

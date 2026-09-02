@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-/// Basil — a plain-process, buildkit-graph-owning build tool.
+/// Basil — a plain-process build tool driven by declarative build files.
 #[derive(Parser)]
 #[command(name = "basil", version, about)]
 pub struct Cli {

@@ -100,7 +100,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Gc(args) => {
-            // gc is registry-only; it doesn't need a buildkitd connection.
+            // gc is registry-only; it needs no builder connection.
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 let age_secs = basil::solver::gc::parse_age(&args.age).map_err(anyhow::Error::msg)?;
