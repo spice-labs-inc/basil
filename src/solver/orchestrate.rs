@@ -127,7 +127,23 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         );
     }
 
-    let mut out = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    // If the content tag already exists in the registry, the exact image is
+    // already published — don't rebuild (parity with handle_event's Level 1).
+    let l1_skip = level1_all_exist(&names, &closures).await?;
+    if l1_skip {
+        println!("basil: content tags already published -- no build (Level 1 skip)");
+        for name in &names {
+            out.push((
+                name.clone(),
+                closures.get(name).map(|t| hex(t)).unwrap_or_default(),
+            ));
+        }
+        println!("basil: done ({})", names.join(", "));
+        return Ok(out);
+    }
+
     for name in &names {
         let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
         let insecure = is_local_registry(name);
