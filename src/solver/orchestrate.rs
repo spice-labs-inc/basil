@@ -91,8 +91,18 @@ pub async fn run(
                 r#type: "image".to_string(),
                 attrs: {
                     let mut a = HashMap::new();
-                    a.insert("name".to_string(), format!("{}:{}", e.target, tag_str));
+                    let name = format!("{}:{}", e.target, tag_str);
+                    a.insert("name".to_string(), name.clone());
                     a.insert("push".to_string(), "true".to_string());
+                    // Local/plain registries are HTTP; flag them insecure.
+                    let host = e.target.split('/').next().unwrap_or("");
+                    if host.starts_with("127.0.0.1")
+                        || host == "localhost"
+                        || (!host.contains('.') && !host.contains(':'))
+                    {
+                        a.insert("registry.insecure".to_string(), "true".to_string());
+                    }
+                    let _ = name;
                     a
                 },
             });
