@@ -191,7 +191,16 @@ pub async fn build_deliverable(
     println!("basil: pushed {deliverable}:{tag}");
 
     // Reverse COPY: extract any OUTPUT files from the built image to the host.
-    let outputs: Vec<(String, String)> = targets
+    let outputs: Vec<(String, String)> = collect_outputs(targets, deliverable);
+    if !outputs.is_empty() {
+        extract_outputs(&tag_ref, context, &outputs).await?;
+    }
+    Ok(())
+}
+
+/// Collect a deliverable target's `OUTPUT` (container-src, host-dest) pairs.
+fn collect_outputs(targets: &[Target], deliverable: &str) -> Vec<(String, String)> {
+    targets
         .iter()
         .filter(|t| &t.name == deliverable)
         .flat_map(|t| {
@@ -200,11 +209,24 @@ pub async fn build_deliverable(
                 _ => None,
             })
         })
-        .collect();
-    if !outputs.is_empty() {
-        extract_outputs(&tag_ref, context, &outputs).await?;
+        .collect()
+}
+
+/// Extract a deliverable's OUTPUT files from an already-built image, pulling it
+/// from its registry ref if not present locally. Used on the Level-1 skip path
+/// so OUTPUT still runs when the image is not rebuilt.
+pub async fn extract_outputs_from_image(
+    image_ref: &str,
+    context: &std::path::Path,
+    targets: &[Target],
+    deliverable: &str,
+) -> anyhow::Result<()> {
+    let outputs = collect_outputs(targets, deliverable);
+    if outputs.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    println!("basil: pull {image_ref} for OUTPUT extraction");
+    extract_outputs(image_ref, context, &outputs).await
 }
 
 /// Reverse COPY: extract `(container-src, host-dest)` files out of the built

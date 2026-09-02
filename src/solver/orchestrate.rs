@@ -135,10 +135,16 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     if l1_skip {
         println!("basil: content tags already published -- no build (Level 1 skip)");
         for name in &names {
-            out.push((
-                name.clone(),
-                closures.get(name).map(|t| hex(t)).unwrap_or_default(),
-            ));
+            // OUTPUT still runs: pull the published image and extract.
+            let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+            crate::solver::buildah::extract_outputs_from_image(
+                &format!("{name}:{tag}"),
+                inp.context,
+                &parsed.targets,
+                name,
+            )
+            .await?;
+            out.push((name.clone(), tag.clone()));
         }
         println!("basil: done ({})", names.join(", "));
         return Ok(out);
@@ -237,6 +243,17 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     let l1_skip = level1_all_exist(&deliverable_names, &closures).await?;
     if l1_skip {
         println!("basil: content tags already published -- no build (Level 1 skip)");
+        // OUTPUT still runs on a skip: pull the published image and extract.
+        for name in &deliverable_names {
+            let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+            crate::solver::buildah::extract_outputs_from_image(
+                &format!("{name}:{tag}"),
+                inp.context,
+                &parsed.targets,
+                name,
+            )
+            .await?;
+        }
         promote_on_tag(&matched, &event_ref, &closures).await?;
         println!("basil: done ({})", deliverable_names.join(", "));
         return Ok(vec![

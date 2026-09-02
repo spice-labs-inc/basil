@@ -14,6 +14,8 @@ COPY . .
 RUN apk add --no-cache musl-dev gcc binutils
 RUN cargo build --release --bin basil
 
+OUTPUT /src/target/release/basil target/basil
+
 # --- deliverable: the static binary on scratch ---
 FROM scratch AS 127.0.0.1:5001/basil
 COPY --from=builder /src/target/release/basil /basil
