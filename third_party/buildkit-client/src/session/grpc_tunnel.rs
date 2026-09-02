@@ -53,8 +53,26 @@ impl GrpcTunnel {
         // Create a wrapper that implements AsyncRead + AsyncWrite
         let stream = MessageStream::new(inbound_rx, outbound_tx);
 
-        // Start HTTP/2 server
-        let mut h2_conn = server::handshake(stream)
+        // Start HTTP/2 server. h2's default DOS guards are far too tight for a
+        // single session tunnel carrying a large build's exec output: the
+        // 1024-local-reset limit and 20-pending-accept-reset limit trip
+        // ENHANCE_YOUR_CALM under normal heavy bidirectional traffic. This
+        // tunnel is only reachable from the buildkitd we dialed, so those
+        // abuse protections don't apply here and must not cap throughput.
+        let mut builder = server::Builder::new();
+        builder
+            // Disable the local-error-reset DOS limit entirely.
+            .max_local_error_reset_streams(None)
+            // Effectively unbounded pending-accept resets.
+            .max_pending_accept_reset_streams(usize::MAX)
+            // Large flow-control windows so a chatty step isn't throttled to
+            // a trickle (16 MB connection, 8 MB per stream).
+            .initial_connection_window_size(16 * 1024 * 1024)
+            .initial_window_size(8 * 1024 * 1024)
+            // Generous send buffer so bursts of exec output aren't dropped.
+            .max_send_buffer_size(128 * 1024 * 1024);
+        let mut h2_conn = builder
+            .handshake::<_, Bytes>(stream)
             .await
             .map_err(|e| Error::Http2Handshake { source: e })?;
 
