@@ -61,7 +61,9 @@ impl<'a> Bridge<'a> {
             exporter_attr: Vec::new(),
             cache_imports: vec![],
             frontend_inputs: HashMap::new(),
-            evaluate: false,
+            // Force materialization so a non-zero task exec surfaces as a solve
+            // error (lazy results would otherwise mask the exit).
+            evaluate: true,
             source_policies: vec![],
         };
         let resp = bridge

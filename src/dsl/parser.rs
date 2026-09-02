@@ -560,14 +560,17 @@ fn parse_verb_lists(tail: &str) -> Result<(Vec<String>, Vec<String>), String> {
     let mut do_list = Vec::new();
     let mut verb: Option<&str> = None;
     for w in tokens {
-        match w.as_str() {
-            "BUILD" => verb = Some("build"),
-            "DO" => verb = Some("do"),
-            _ => match verb {
+        let w = w.trim_end_matches(',').to_string();
+        if w.eq_ignore_ascii_case("BUILD") {
+            verb = Some("build");
+        } else if w.eq_ignore_ascii_case("DO") {
+            verb = Some("do");
+        } else {
+            match verb {
                 Some("build") => build.push(w),
                 Some("do") => do_list.push(w),
                 _ => return Err(format!("unexpected token `{w}` before BUILD/DO")),
-            },
+            }
         }
     }
     Ok((build, do_list))

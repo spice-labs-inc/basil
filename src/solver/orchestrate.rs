@@ -290,13 +290,13 @@ pub async fn run_do_tasks(
                 continue;
             };
 
-            // Emit + solve just this task target (and any stages it depends on
-            // via its base/--from). A single-target graph whose root is the task
-            // target gives its rootfs ref.
+            // Emit the task target's rootfs (its base image / steps), then append
+            // a one-shot exec running the TASK command. We solve it with the task
+            // exec ignore-cached so it re-runs each event — the task is a side
+            // effect, never a cached layer, and never an exported image.
             let mut graph = emitter::llb::Graph::new();
             let mut stage_outputs = HashMap::new();
             for t in &parsed.targets {
-                // Only include targets up to and including this one (topo order).
                 let e = emitter::emit_target(
                     &mut graph,
                     t,
@@ -315,27 +315,35 @@ pub async fn run_do_tasks(
                 .get(do_name)
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("task target `{do_name}` has no output"))?;
-            let def = graph.finish(root);
-            let ref_id = bridge.solve_ref(def).await?;
 
-            // Env: BASIL_EVENT raw JSON; BASIL_IMAGE placeholder (resolved base
-            // digest not yet tracked); BASIL_REF_<TARGET> not set for simple runs.
-            let env = vec![
-                ("BASIL_EVENT".to_string(), event_json.to_string()),
-            ];
-            let exit = crate::solver::task::run_task(
-                &mut bridge_client(channel, &buildid),
-                &buildid,
-                &format!("task-{do_name}"),
-                &ref_id,
-                &task.command,
-                env,
-            )
-            .await?;
-            if exit != 0 {
-                anyhow::bail!("DO task `{do_name}` failed with exit {exit}");
-            }
-            tracing::info!("DO task `{do_name}` completed");
+            // Run the task command on the task rootfs as a cache-ignored exec.
+            let args = match &task.command {
+                crate::dsl::ast::Command::Shell(s) => vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    s.clone(),
+                ],
+                crate::dsl::ast::Command::Exec(a) => a.clone(),
+            };
+            let env_arr = vec![format!("BASIL_EVENT={}", event_json)];
+            let exec_out = emitter::llb::run(
+                &mut graph,
+                Some(root),
+                args,
+                env_arr,
+                "/".to_string(),
+                String::new(),
+                None,
+                vec![],
+            );
+            graph.mark_ignore_cache(exec_out.vertex);
+            let def = graph.finish(exec_out);
+            // Solve the task exec. A non-zero exit fails the solve -> the task
+            // failed; success (ref returned) means exit 0.
+            let _ref_id = bridge.solve_ref(def).await.map_err(|e| {
+                anyhow::anyhow!("DO task `{do_name}` failed (non-zero exit or solve error): {e}")
+            })?;
+            tracing::info!("DO task `{do_name}` completed (exit 0)");
         }
     }
 
@@ -356,10 +364,6 @@ pub async fn run_do_tasks(
     let _ = close.r#return(req).await;
     let _ = outer_handle.await;
     Ok(())
-}
-
-fn bridge_client(channel: &tonic::transport::Channel, _buildid: &str) -> crate::gateway_proto::moby::buildkit::v1::frontend::llb_bridge_client::LlbBridgeClient<tonic::transport::Channel> {
-    crate::gateway_proto::moby::buildkit::v1::frontend::llb_bridge_client::LlbBridgeClient::new(channel.clone())
 }
 
 /// Build the cache export/import refs for the deliverable repos.

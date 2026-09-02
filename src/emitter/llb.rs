@@ -26,6 +26,7 @@ pub struct Graph {
     ops: Vec<pb::Op>,
     digest_of: Vec<String>,
     by_digest: HashMap<String, usize>,
+    ignore_cache: std::collections::HashSet<usize>,
 }
 
 impl Graph {
@@ -34,7 +35,15 @@ impl Graph {
             ops: Vec::new(),
             digest_of: Vec::new(),
             by_digest: HashMap::new(),
+            ignore_cache: std::collections::HashSet::new(),
         }
+    }
+
+    /// Mark a vertex so its cache is bypassed on every solve. Used for
+    /// one-shot task execs that must re-run each event (task = side effect,
+    /// never a cached layer).
+    pub fn mark_ignore_cache(&mut self, vertex: usize) {
+        self.ignore_cache.insert(vertex);
     }
 
     fn digest(&self, op: &pb::Op) -> String {
@@ -89,6 +98,9 @@ impl Graph {
             def.def.push(op.encode_to_vec());
             let mut md = pb::OpMetadata::default();
             md.description = HashMap::new();
+            if self.ignore_cache.contains(&i) {
+                md.ignore_cache = true;
+            }
             def.metadata.insert(self.digest_of[i].clone(), md);
         }
         // Root marker vertex: no op type, single input = the deliverable output.
