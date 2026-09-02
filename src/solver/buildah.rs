@@ -247,4 +247,24 @@ ON push(main) BUILD 127.0.0.1:5001/app\n";
         assert!(cf.contains("CMD [\"/app\"]"));
         assert!(!cf.contains("ON push"));
     }
+
+    #[test]
+    fn task_clause_never_renders_into_containerfile() {
+        // A `TASK` is an event-triggered side-effect, not part of the image.
+        // The renderer (which `build_deliverable`/`build` uses) must never bake
+        // the task command into the Containerfile.
+        let src = "FROM alpine AS 127.0.0.1:5001/app\n\
+RUN echo built > /m.txt\n\
+TASK echo task-ran\n\
+ON push(main) BUILD 127.0.0.1:5001/app\n";
+        let f = parse(src).unwrap();
+        let app = f.targets.iter().find(|t| t.name == "127.0.0.1:5001/app").unwrap();
+        assert!(app.task.is_some(), "task should parse onto the target");
+
+        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        assert!(
+            !cf.contains("task-ran"),
+            "TASK command leaked into the Containerfile:\n{cf}"
+        );
+    }
 }
