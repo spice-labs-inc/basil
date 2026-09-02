@@ -12,8 +12,11 @@ pub struct Cli {
 pub enum Command {
     /// Parse the DSL and report each target's input closure.
     Closure(ClosureArgs),
-    /// Build deliverable targets for a delivered event (stdin JSON).
+    /// Build a deliverable target directly (no event). With -t, build that
+    /// target; otherwise build every qualified deliverable target.
     Build(BuildArgs),
+    /// Read an event from stdin (or --event) and run the matching reactions.
+    Handle(HandleArgs),
     /// Prune basil-owned registry tags older than a given age.
     Gc(GcArgs),
 }
@@ -38,12 +41,22 @@ pub struct BuildArgs {
     /// Build context root (where COPY/ADD and `.dockerignore` resolve).
     #[arg(long, default_value = ".")]
     pub context: String,
-    /// Event JSON delivered on stdin (GitHub Actions payload).
-    #[arg(long)]
-    pub event: Option<String>,
-    /// Manual trigger: run a specific target's reaction.
+    /// Target to build; default is every qualified deliverable target.
     #[arg(short = 't', long)]
     pub target: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct HandleArgs {
+    /// The DSL file to parse.
+    #[arg(default_value = "Basilfile")]
+    pub file: String,
+    /// Build context root (where COPY/ADD and `.dockerignore` resolve).
+    #[arg(long, default_value = ".")]
+    pub context: String,
+    /// Path to an event JSON file; read stdin if absent.
+    #[arg(long)]
+    pub event: Option<String>,
 }
 
 #[derive(clap::Args)]

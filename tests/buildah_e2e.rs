@@ -3,7 +3,7 @@
 //! digest match basil's closure tagHash. Skipped when `buildah` is unavailable
 //! or the local registry is not reachable.
 
-use basil::solver::orchestrate::{BuildInput, run_buildah};
+use basil::solver::orchestrate::{BuildInput, handle_event};
 use serde_json::Value;
 
 fn buildah_present() -> bool {
@@ -45,7 +45,7 @@ async fn buildah_e2e_build_and_config() {
         event_json: Some(event),
         target_filter: None,
     };
-    let results = run_buildah(inp).await.unwrap();
+    let results = handle_event(inp).await.unwrap();
     let digest = results
         .iter()
         .find(|(k, _)| k == "digest")

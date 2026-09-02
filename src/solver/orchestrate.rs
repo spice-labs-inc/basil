@@ -82,7 +82,63 @@ async fn promote_on_tag(
     }
     Ok(())
 }
-pub async fn run_buildah(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
+
+/// Build one or more deliverable targets directly (no event): the `-t`
+/// target, or every qualified deliverable target when none is given. Computes
+/// the closure tagHash, builds via buildah, and exports under that tag.
+pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
+    let src = std::fs::read_to_string(inp.file)
+        .map_err(|e| anyhow::anyhow!("reading {}: {}", inp.file, e))?;
+    let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
+
+    // Qualified deliverable targets are those named as image refs (host/repo).
+    let qualified: Vec<&str> = parsed
+        .targets
+        .iter()
+        .filter(|t| t.name.split('/').count() >= 2)
+        .map(|t| t.name.as_str())
+        .collect();
+    let names: Vec<String> = match inp.target_filter {
+        Some(t) => vec![t.clone()],
+        None => qualified.into_iter().map(|s| s.to_string()).collect(),
+    };
+    if names.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no deliverable target to build: pass -t <target> or name a deliverable as a qualified image reference"
+        ));
+    }
+
+    let closures = compute_closure(
+        &parsed.targets,
+        &parsed.default_platforms,
+        inp.context,
+        &HashMap::new(),
+        &mut CliResolver,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    let mut out = Vec::new();
+    for name in &names {
+        let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+        let insecure = is_local_registry(name);
+        crate::solver::buildah::build_deliverable(
+            &parsed.targets,
+            name,
+            &tag,
+            inp.context,
+            &HashMap::new(),
+            insecure,
+        )
+        .await?;
+        tracing::info!("built {name}:{tag}");
+        out.push((name.clone(), tag));
+    }
+    Ok(out)
+}
+
+/// Build using the buildah backend (plain subprocess, no buildkitd), driven by
+/// a delivered event: match reactions, build/promote the deliverables.
+pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
     let src = std::fs::read_to_string(inp.file)
         .map_err(|e| anyhow::anyhow!("reading {}: {}", inp.file, e))?;
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;

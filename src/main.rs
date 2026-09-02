@@ -59,22 +59,39 @@ fn main() -> anyhow::Result<()> {
         Command::Build(args) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
-                let event_json = match &args.event {
-                    Some(p) => Some(std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("{e}"))?),
+                let inp = basil::solver::orchestrate::BuildInput {
+                    file: &args.file,
+                    context: std::path::Path::new(&args.context),
+                    event_json: None,
+                    target_filter: args.target.as_ref(),
+                };
+                let results = basil::solver::orchestrate::build_targets(inp).await?;
+                for (k, v) in &results {
+                    println!("{k} = {v}");
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        }
+        Command::Handle(args) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                let event_json: String = match &args.event {
+                    Some(p) => std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("{e}"))?,
                     None => {
                         let mut s = String::new();
                         use std::io::Read;
                         std::io::stdin().read_to_string(&mut s).map_err(|e| anyhow::anyhow!("{e}"))?;
-                        if s.trim().is_empty() { None } else { Some(s) }
+                        s
                     }
                 };
                 let inp = basil::solver::orchestrate::BuildInput {
                     file: &args.file,
                     context: std::path::Path::new(&args.context),
-                    event_json: event_json.as_deref(),
-                    target_filter: args.target.as_ref(),
+                    event_json: Some(&event_json),
+                    target_filter: None,
                 };
-                let results = basil::solver::orchestrate::run_buildah(inp).await?;
+                let results = basil::solver::orchestrate::handle_event(inp).await?;
                 for (k, v) in &results {
                     println!("{k} = {v}");
                 }
