@@ -3,4 +3,5 @@
 pub mod bridge;
 pub mod config;
 pub mod orchestrate;
+pub mod promote;
 pub mod registry;

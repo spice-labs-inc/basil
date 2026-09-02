@@ -148,6 +148,70 @@ impl RegistryClient {
         }
         Ok(())
     }
+
+    /// Get the manifest bytes for `repo:tag`, parsing its digest from the
+    /// `Docker-Content-Digest` response header (needed to retag).
+    pub async fn get_manifest(
+        &self,
+        repo: &str,
+        tag: &str,
+    ) -> Result<(String, Vec<u8>), String> {
+        let url = format!("{}/v2/{repo}/manifests/{tag}", self.base);
+        let mut req = self.client.get(&url);
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        req = req.header(
+            reqwest::header::ACCEPT,
+            "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json",
+        );
+        let resp = req.send().await.map_err(|e| format!("registry GET {url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("registry GET {url}: status {}", resp.status()));
+        }
+        let digest = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.bytes().await.map_err(|e| format!("read manifest: {e}"))?;
+        Ok((digest, body.to_vec()))
+    }
+
+    /// Re-tag: copy the manifest under `src` to `tag`, checking immutability.
+    /// Returns the source digest it was anchored to.
+pub async fn retag(&self, repo: &str, src: &str, tag: &str) -> Result<String, String> {
+        // Immutability: an existing `<repo>:<tag>` pointing at a different
+        // manifest is refused rather than overwritten.
+        if self.manifest_exists(repo, tag).await? {
+            let (exist_digest, _) = self.get_manifest(repo, tag).await?;
+            let (src_digest, _) = self.get_manifest(repo, src).await?;
+            if !exist_digest.is_empty() && !src_digest.is_empty() && exist_digest != src_digest {
+                return Err(format!(
+                    "refusing to overwrite immutable version tag `{repo}:{tag}` (points at {exist_digest}, not {src_digest})"
+                ));
+            }
+            if exist_digest == src_digest {
+                return Ok(src_digest); // already there
+            }
+        }
+        let (digest, body) = self.get_manifest(repo, src).await?;
+        let url = format!("{}/v2/{repo}/manifests/{tag}", self.base);
+        let mut req = self
+            .client
+            .put(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+            .body(body);
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(|e| format!("registry PUT {url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("registry retag PUT {url}: status {}", resp.status()));
+        }
+        Ok(digest)
+    }
 }
 
 #[cfg(test)]

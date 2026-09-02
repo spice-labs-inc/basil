@@ -102,3 +102,43 @@ ON push(main) DO ok, bad\n";
     let msg = res.unwrap_err().to_string();
     assert!(msg.contains("bad") || msg.contains("exit"), "error should mention the task/exit: {msg}");
 }
+
+/// Promotion on a `tag` event: a bare `vX.Y.Z` tag retags each BUILD deliverable
+/// to `<name>:v<version>` (immutably) after building it.
+#[tokio::test]
+async fn tag_event_promotes_deliverable() {
+    if !buildkitd_ok() {
+        eprintln!("skipping: buildkitd not reachable at 127.0.0.1:8818");
+        return;
+    }
+    let channel = tonic::transport::Endpoint::from_shared("tcp://127.0.0.1:8818")
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = buildkit_client::client::BuildKitClient::connect("tcp://127.0.0.1:8818")
+        .await
+        .unwrap();
+    let mut session = buildkit_client::session::Session::new();
+    session
+        .add_file_sync(std::path::PathBuf::from("testdata"))
+        .await;
+    session.start(client.control().clone()).await.unwrap();
+    let sid = session.get_id();
+
+    let inp = basil::solver::orchestrate::BuildInput {
+        file: "testdata/promo.Basilfile",
+        context: std::path::Path::new("testdata"),
+        event_json: Some(r#"{"ref":"refs/tags/v9.9.9"}"#),
+        target_filter: None,
+    };
+    let results = basil::solver::orchestrate::run(channel, &sid, inp).await.unwrap();
+    assert!(!results.is_empty());
+
+    // The v9.9.9 tag must now exist in the registry.
+    let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
+    assert!(
+        c.manifest_exists("promo", "v9.9.9").await.unwrap_or(false),
+        "promotion should have created promo:v9.9.9"
+    );
+}

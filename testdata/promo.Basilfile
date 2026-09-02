@@ -1,0 +1,6 @@
+FROM scratch AS 127.0.0.1:5001/promo
+COPY greeting.txt /greeting.txt
+ENV APP=promo
+CMD ["/bin/echo", "hi"]
+
+ON tag BUILD 127.0.0.1:5001/promo

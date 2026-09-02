@@ -54,6 +54,13 @@ pub async fn run(
     };
     let matched = event::matching_reactions(&parsed, &event_payload);
 
+    // The event ref (branch or tag) — needed for `tag`-triggered promotion.
+    let event_ref = event_payload
+        .get("ref")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
     // Collect deliverable targets to BUILD.
     let mut deliverable_names: Vec<String> = Vec::new();
     for r in &matched {
@@ -137,6 +144,9 @@ pub async fn run(
         )
         .await?;
         let _ = do_results;
+        // Promotion runs on a tag event even when the solve was skipped (the
+        // version tag is a retag of the already-existing content tag).
+        promote_on_tag(&matched, &event_ref, &closures).await?;
         return Ok(vec![
             ("level".to_string(), "1-skip".to_string()),
             (
@@ -236,6 +246,9 @@ pub async fn run(
         inp.event_json.unwrap_or(""),
     )
     .await?;
+
+    // Promotion: a `tag` event adds `<name>:v<version>` (immutable retag).
+    promote_on_tag(&matched, &event_ref, &closures).await?;
 
     Ok(result
         .digest
@@ -429,6 +442,64 @@ fn build_cache_options(
         imports,
         ..Default::default()
     })
+}
+
+/// Promote deliverables on a `tag` event: after the build, tag each BUILD
+/// target as `<name>:v<version>` (registry retag, immutable).
+async fn promote_on_tag(
+    matched: &[&crate::dsl::ast::Reaction],
+    event_ref: &str,
+    closures: &HashMap<String, [u8; 32]>,
+) -> anyhow::Result<()> {
+    let Some((qual_target, version)) = crate::solver::promote::extract_version(event_ref) else {
+        return Ok(()); // not a version tag event
+    };
+    tracing::info!("promotion: tag `{event_ref}` -> version v{version}");
+
+    // Deliverable names to promote: the BUILD list of the matching reactions,
+    // restricted to the qualified target when the tag names one.
+    let mut promoted: Vec<String> = Vec::new();
+    for r in matched.iter().copied() {
+        if r.event.token != crate::dsl::ast::EventToken::Tag {
+            continue;
+        }
+        for b in &r.build {
+            if let Some(qt) = &qual_target {
+                // `target-vX.Y.Z` promotes only target `q`.
+                if b.as_str() == qt.as_str() || b.split('/').last() == Some(qt.as_str()) {
+                    promoted.push(b.clone());
+                }
+            } else {
+                promoted.push(b.clone());
+            }
+        }
+    }
+    promoted.sort();
+    promoted.dedup();
+
+    for name in promoted {
+        let tag_hash = closures.get(&name).map(|t| crate::identity::closure::hex(t)).unwrap_or_default();
+        let Some((host, rest)) = name.split_once('/') else {
+            tracing::warn!("promote: `{name}` not a qualified reference");
+            continue;
+        };
+        let repo = rest.rsplit_once(':').map(|(r, _)| r).unwrap_or(rest);
+        let base = crate::solver::registry::ImageRef {
+            host: host.to_string(),
+            repo: repo.to_string(),
+            tag: String::new(),
+        }
+        .base_url();
+        let client = crate::solver::registry::RegistryClient::new(&base);
+        let src = format!("{repo}:{tag_hash}");
+        match client.retag(repo, &tag_hash, &format!("v{version}")).await {
+            Ok(d) => tracing::info!("promote `{name}:{src}` -> v{version} (digest {})", &d[..d.len().min(24)]),
+            Err(e) => {
+                anyhow::bail!("promotion immutability/retag failure for `{name}:v{version}`: {e}")
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compute the `YYYYMMDD`, `YYYYMM`, `YYYY` date tags from a unix timestamp.
