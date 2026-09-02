@@ -215,12 +215,58 @@ require it:
   (`buildkit-rs` `ops.proto`), rather than resurrecting an abandoned crate.
   Contribute the emitter back once stable.
 
-## Daemon mode (F)
+## Emitter instruction scope (v1)
 
-- **Default**: basil manages `buildkitd` as a **spawned sidecar** on demand;
-  reuse it across builds when warm (persistent socket).
-- **Nice-to-have**: connect to an externally already-running `buildkitd`
-  (a well-known socket/endpoint), for operator-managed setups.
+The recreated emitter translates a fixed instruction subset to LLB. Anything
+outside it is a parse-time error — surfaced, never silently mishandled.
+
+**In scope**
+
+- Build graph: `FROM` (stage alias or external image, pinned/unpinned), `COPY`
+  (context after `.dockerignore` + globs; `--from=<stage|image>`;
+  `--chown`/`--chmod`), `ADD` (local, incl. tar auto-extract; URL = non-hermetic),
+  `RUN` (shell + exec form; `--mount=type=bind|secret|ssh|cache`).
+- Image config: `ARG`, `ENV`, `CMD`, `ENTRYPOINT`, `USER`, `WORKDIR`, `LABEL`,
+  `EXPOSE`, `VOLUME`.
+
+**Deferred** (parse-time error)
+
+- Heredocs (`COPY`/`RUN` `<<EOF`), `COPY --link`, `RUN --network`/`--security`,
+  `SHELL`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`, per-instruction `--platform`
+  (the target `PLATFORM` clause covers multi-arch).
+
+**Correctness surface** (where emitter effort lives)
+
+- `RUN` cache key — attach env + mounts so buildkit's key is sound and stable.
+- `COPY`/`ADD` source resolution — globs, dir/file semantics, `--from` stage FS
+  vs context, symlinks.
+- `ARG`/`ENV` scoping + `${VAR}` expansion; `ENV` persisted to config and to
+  subsequent `RUN` env.
+- Image config — `CMD`/`ENTRYPOINT` shell-vs-exec normalization; `USER`/
+  `WORKDIR`/`LABEL`/`EXPOSE`/`VOLUME` change tracking.
+
+**Test strategy**
+
+- Differential conformance: for each in-scope instruction, build identical
+  inputs via buildkit's `dockerfile.v0` frontend and via basil's emitter; assert
+  equal image config + layer digests. This pins real behavior, not an
+  interpretation of it. Plus the existing closure-digest conformance fixture.
+
+## Daemon mode
+
+- **Ephemeral (default)** — each `basil` invocation spawns its own rootless
+  `buildkitd` in a unique per-invocation state dir, solves, and stops it at exit.
+  Concurrent invocations never collide (unique state dir); no discovery, no
+  locking. Cross-build reuse comes from the registry `cache-*` refs, not local
+  daemon state.
+- **External (opt-in)** — when `BUILDKIT_HOST` is set (a unix socket path or
+  `tcp://` address), basil connects to that daemon and never manages its
+  lifecycle. This is the warm-local-cache path for iterative development: run a
+  persistent `buildkitd` yourself (e.g. a systemd user unit) and point basil at
+  it.
+- **Not provided** — a basil-managed persistent socket with lock/lease and
+  stale-socket recovery. Registry cache makes it unnecessary for CI, and external
+  mode covers development; revisit only if ephemeral startup cost proves real.
 
 ## Event input (`ON`) — reactions
 
@@ -334,6 +380,25 @@ produced. Until that form exists, no guard is needed.
   exporter (comma-joined tags for one image); basil **must extend/recreate it
   to emit N exporters** in one `SolveRequest`. That support is a required
   deliverable of the recreated emitter.
+
+## `basil gc` — tag pruning
+
+`basil gc <age>` deletes basil-owned registry tags older than `<age>`.
+
+- **Age syntax** — an integer with a unit: `h`, `d`, `w`, `y` (`basil gc 30d`).
+- **Scope** — the deliverable repos named by the file's fully-qualified `AS`
+  names, or one repo via `--repo <fq>`. Credentials are the operator's
+  Docker/Podman config, as everywhere else.
+- **What it prunes** — only basil's own ephemeral tags:
+  - `cache-*` refs: the date-encoded ones (`cache-<YYYYMMDD>`, `-<YYYYMM>`,
+    `-<YYYY>`) are pruned directly from the tag name; `cache-<tagHash>` by the
+    image's `created` time.
+  - content tags (`<name>:<tagHash>`), by the image's `created` time.
+  - version tags (`<name>:vX.Y.Z`) are **never pruned** — they are
+    user-created releases, not basil's to reclaim (no `--include-versions`).
+- **Safety** — `--dry-run` lists what would be deleted without deleting.
+  Pruning removes the tag reference; blobs are reclaimed by the registry's own
+  GC. Deletion is irreversible.
 
 ## Dependency & contribution strategy
 
