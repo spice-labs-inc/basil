@@ -246,8 +246,7 @@ pub async fn build_deliverable(
 ) -> anyhow::Result<()> {
     let containerfile = render_containerfile(targets, deliverable);
     let cf_path = context.join(format!(".Basilfile.buildah.{}", std::process::id()));
-    std::fs::write(&cf_path, containerfile)
-        .map_err(|e| anyhow::anyhow!("writing containerfile: {e}"))?;
+    crate::fsctx::fs_err(std::fs::write(&cf_path, containerfile), &cf_path, "write")?;
 
     let tag_ref = format!("{deliverable}:{tag}");
 
@@ -377,14 +376,13 @@ async fn extract_outputs(
 ) -> anyhow::Result<()> {
     let working = buildah_from(tag_ref).await?;
     let tmp = std::env::temp_dir().join(format!("basil-output-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).map_err(|e| anyhow::anyhow!("creating output tmp: {e}"))?;
+    crate::fsctx::fs_err(std::fs::create_dir_all(&tmp), &tmp, "create_dir")?;
 
     let result = async {
         for (src, dest) in outputs {
             let host_dest = context.join(dest);
             if let Some(parent) = host_dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| anyhow::anyhow!("creating host destination dir: {e}"))?;
+                crate::fsctx::fs_err(std::fs::create_dir_all(parent), parent, "create_dir")?;
             }
             let fname = src.rsplit('/').next().unwrap_or(src);
             let mut cmd = tokio::process::Command::new("buildah");
@@ -405,9 +403,7 @@ async fn extract_outputs(
             }
             // Move the extracted file from tmp into its final host location.
             let moved = tmp.join(fname);
-            std::fs::rename(&moved, &host_dest).map_err(|e| {
-                anyhow::anyhow!("copying OUTPUT `{src}` -> `{dest}`: {e}")
-            })?;
+            crate::fsctx::fs_err(std::fs::rename(&moved, &host_dest), &host_dest, "rename")?;
             println!("basil: output {src} -> {dest}");
         }
         Ok::<(), anyhow::Error>(())

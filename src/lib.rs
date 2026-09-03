@@ -4,6 +4,7 @@
 
 pub mod dsl;
 pub mod event;
+pub mod fsctx;
 pub mod identity;
 pub mod solver;
 

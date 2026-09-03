@@ -24,16 +24,19 @@ fn expand_source(
     context: &Path,
     ignore: &Dockerignore,
     out: &mut BTreeSet<String>,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let full = context.join(src);
     let pattern = full.to_string_lossy().to_string();
     // If src contains glob metachars, match; else treat as exact path.
     let has_meta = src.contains('*') || src.contains('?') || (src.contains('[') && src.contains(']'));
     if has_meta {
-        let matches = glob::glob(&pattern).map_err(|e| format!("bad glob `{src}`: {e}"))?;
+        let matches = glob::glob(&pattern)
+            .map_err(|e| crate::fsctx::with_filename(anyhow::anyhow!("bad glob: {e}"), &full, "glob"))?;
         let mut any = false;
         for entry in matches {
-            let entry = entry.map_err(|e| format!("glob error for `{src}`: {e}"))?;
+            let entry = entry.map_err(|e| {
+                crate::fsctx::with_filename(anyhow::anyhow!("glob error: {e}"), &full, "glob")
+            })?;
             any = true;
             collect_path(&entry, context, ignore, out)?;
         }
@@ -57,13 +60,12 @@ fn collect_path(
     context: &Path,
     ignore: &Dockerignore,
     out: &mut BTreeSet<String>,
-) -> Result<(), String> {
-    let rel = pathdiff(p, context, "").map_err(|e| format!("path `{p:?}` outside context: {e}"))?;
+) -> anyhow::Result<()> {
+    let rel = pathdiff(p, context, "").map_err(|e| anyhow::anyhow!("path `{p:?}` outside context: {e}"))?;
     // A source equal to the context root (`.`, `./`, `/`) means the whole tree.
     // pathdiff returns "" for the root; walk its children instead.
     if rel.is_empty() {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(p)
-            .map_err(|e| format!("reading context root: {e}"))?
+        let mut entries: Vec<PathBuf> = crate::fsctx::fs_err(std::fs::read_dir(p), p, "read_dir")?
             .filter_map(|r| r.ok().map(|d| d.path()))
             .collect();
         entries.sort();
@@ -84,8 +86,7 @@ fn collect_path(
     if p.is_dir() {
         // A directory source: include the dir and everything under it.
         out.insert(rel_str.clone());
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(p)
-            .map_err(|e| format!("reading dir `{p:?}`: {e}"))?
+        let mut entries: Vec<PathBuf> = crate::fsctx::fs_err(std::fs::read_dir(p), p, "read_dir")?
             .filter_map(|r| r.ok().map(|d| d.path()))
             .collect();
         entries.sort();
@@ -194,18 +195,7 @@ fn snapshot_digest(files: &BTreeSet<String>, context: &Path) -> anyhow::Result<[
                 continue; // synthetic markers are not real files
             }
             let full = context.join(rel);
-            let meta = match std::fs::metadata(&full) {
-                Ok(m) => m,
-                Err(e) => {
-                    // A file that was walked into the set but can't be read now
-                    // (e.g. permission denied on open). Surface the path so the
-                    // operator knows what to fix/dockertignore.
-                    return Err(anyhow::anyhow!(
-                        "reading context file `{rel}` ({}): {e}",
-                        full.display()
-                    ));
-                }
-            };
+            let meta = crate::fsctx::fs_err(std::fs::metadata(&full), &full, "stat")?;
             let mut header = tar::Header::new_ustar();
             header.set_uid(0);
             header.set_gid(0);
@@ -226,8 +216,7 @@ fn snapshot_digest(files: &BTreeSet<String>, context: &Path) -> anyhow::Result<[
                 header.set_path(rel).map_err(|e| anyhow::anyhow!("{rel}: {e}"))?;
                 header.set_size(meta.len());
                 header.set_mode(0o644);
-                let mut f = std::fs::File::open(&full)
-                    .map_err(|e| anyhow::anyhow!("reading context file `{rel}` ({}): {e}", full.display()))?;
+                let mut f = crate::fsctx::fs_err(std::fs::File::open(&full), &full, "open")?;
                 builder
                     .append_data(&mut header, rel, &mut f)
                     .map_err(|e| anyhow::anyhow!("{rel}: {e}"))?;

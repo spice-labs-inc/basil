@@ -34,8 +34,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Closure(args) => {
-            let src = std::fs::read_to_string(&args.file)
-                .map_err(|e| anyhow::anyhow!("reading {}: {}", args.file, e))?;
+            let src = basil::fsctx::fs_err(std::fs::read_to_string(&args.file), &args.file, "read")?;
             let file = basil::dsl::parser::parse(&src).map_err(anyhow::Error::msg)?;
             let ctx = std::path::Path::new(&args.context);
             let tags = basil::identity::closure::compute_closure(
@@ -77,7 +76,7 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 let event_json: String = match &args.event {
-                    Some(p) => std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("{e}"))?,
+                    Some(p) => basil::fsctx::fs_err(std::fs::read_to_string(p), p, "read")?,
                     None => {
                         let mut s = String::new();
                         use std::io::Read;
@@ -102,14 +101,12 @@ fn main() -> anyhow::Result<()> {
         Command::Pin(args) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
-                let src = std::fs::read_to_string(&args.file)
-                    .map_err(|e| anyhow::anyhow!("reading {}: {}", args.file, e))?;
+                let src = basil::fsctx::fs_err(std::fs::read_to_string(&args.file), &args.file, "read")?;
                 let pinned = basil::solver::pin::pin_file(&src).await.map_err(anyhow::Error::msg)?;
                 if pinned == src {
                     println!("basil: no unpinned bases in {}", args.file);
                 } else {
-                    std::fs::write(&args.file, pinned)
-                        .map_err(|e| anyhow::anyhow!("writing {}: {}", args.file, e))?;
+                    basil::fsctx::fs_err(std::fs::write(&args.file, pinned), &args.file, "write")?;
                     println!("basil: pinned bases in {}", args.file);
                 }
                 Ok::<_, anyhow::Error>(())
@@ -134,8 +131,7 @@ fn main() -> anyhow::Result<()> {
                         .map_err(anyhow::Error::msg)?;
                     repos.push((r.host, r.repo));
                 } else {
-                    let src = std::fs::read_to_string(&args.file)
-                        .map_err(|e| anyhow::anyhow!("reading {}: {}", args.file, e))?;
+                    let src = basil::fsctx::fs_err(std::fs::read_to_string(&args.file), &args.file, "read")?;
                     let parsed = basil::dsl::parser::parse(&src).map_err(anyhow::Error::msg)?;
                     for t in &parsed.targets {
                         if t.name.contains('/') {

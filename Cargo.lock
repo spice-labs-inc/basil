@@ -74,6 +74,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "anyhow-tracing"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05f750af8cfdc20fce3c393bd2e29cefb10d364b35438f21892725423fe655b0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -113,6 +122,7 @@ name = "basil"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "anyhow-tracing",
  "clap",
  "flate2",
  "glob",

@@ -178,8 +178,7 @@ async fn promote_on_tag(
 /// `handle_event`), so a plain build of an image has no side-effects. Here we
 /// only compute the closure and run `build_deliverable`.
 pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
-    let src = std::fs::read_to_string(inp.file)
-        .map_err(|e| anyhow::anyhow!("reading {}: {}", inp.file, e))?;
+    let src = crate::fsctx::fs_err(std::fs::read_to_string(inp.file), inp.file, "read")?;
     println!("basil: parsed {}", inp.file);
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
 
@@ -275,8 +274,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
 /// Build using the buildah backend (plain subprocess, no daemon), driven by
 /// a delivered event: match reactions, build/promote the deliverables.
 pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
-    let src = std::fs::read_to_string(inp.file)
-        .map_err(|e| anyhow::anyhow!("reading {}: {}", inp.file, e))?;
+    let src = crate::fsctx::fs_err(std::fs::read_to_string(inp.file), inp.file, "read")?;
     println!("basil: parsed {}", inp.file);
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
 
