@@ -236,11 +236,15 @@ require it:
   `OUTPUT`/promotion by pulling the published image).
 - **Renderer scope**: the rendered Containerfile covers the in-scope
   instructions; basil-only directives (`ON`, `TASK`, `PLATFORM`, `OUTPUT`) are
-  stripped from the Containerfile and handled by basil directly.
+  stripped from the Containerfile and handled by basil directly. `RUN`
+  `--mount=type=bind|cache|secret|ssh` and `--network=none|host|default` are
+  rendered to buildah (secrets supplied via `BASIL_SECRET_<ID>`, ssh via
+  `--ssh`).
 
 **Deferred** (parse-time error)
 
-- Heredocs, `COPY --link`, `SHELL`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`.
+- Heredocs, `COPY --link`, `SHELL`, `STOPSIGNAL`, `HEALTHCHECK`, `ONBUILD`,
+  `RUN --security`.
 
 **Correctness surface**
 

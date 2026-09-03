@@ -156,7 +156,7 @@ VOLUME <path>…
 
 ### Deferred (parse-time error)
 Heredocs (`<<EOF`), `COPY --link`, `SHELL`, `STOPSIGNAL`, `HEALTHCHECK`,
-`ONBUILD`, exec-form `RUN` with unrecognized flags.
+`ONBUILD`, `RUN --security`, exec-form `RUN` with unrecognized flags.
 
 ## `TASK` clause
 
