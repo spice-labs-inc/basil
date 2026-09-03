@@ -1,5 +1,3 @@
 # TODO
 
-- Fail fast on `basil build -t nonexistent` (validation now exists; verify + add a test)
 - Support args in AS clauses, like "FROM x AS ${registry}/image"
-- Fix OUTPUT AGAIN, since it still doesn't work ("invalid cross-device rename"), plus there's mention of basil-output-NNNNN tags which the user did not request.

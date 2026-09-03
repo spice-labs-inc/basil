@@ -1,2 +1,5 @@
 /target
 .Basilfile.buildah.*
+# basil temp containerfiles (stale)
+.Basilfile.out.*
+.Basilfile.buildah.*

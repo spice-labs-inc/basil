@@ -428,6 +428,11 @@ async fn extract_outputs(
 }
 
 /// Extract one stage's `(src, dest)` OUTPUTs from `image` into `context`.
+///
+/// The container binds the *destination's parent directory* (on the same
+/// device as the host destination) at `/hostout` and `cp`s the source straight
+/// into it — so the file lands at `host_dest` directly. No temp staging dir is
+/// used, so it can never hit a cross-device `rename` (EXDEV).
 async fn extract_into(
     image: &str,
     stage: &str,
@@ -435,20 +440,25 @@ async fn extract_into(
     context: &std::path::Path,
 ) -> anyhow::Result<()> {
     let working = buildah_from(image).await?;
-    let tmp = std::env::temp_dir().join(format!("basil-output-{}", std::process::id()));
-    crate::fsctx::fs_err(std::fs::create_dir_all(&tmp), &tmp, "create_dir")?;
 
     let result = async {
         for (src, dest) in outputs {
             let host_dest = context.join(dest);
-            if let Some(parent) = host_dest.parent() {
-                crate::fsctx::fs_err(std::fs::create_dir_all(parent), parent, "create_dir")?;
-            }
-            let fname = src.rsplit('/').next().unwrap_or(src);
+            let parent = host_dest
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("OUTPUT dest `{dest}` has no parent"))?;
+            crate::fsctx::fs_err(std::fs::create_dir_all(parent), parent, "create_dir")?;
+            // buildah requires an absolute host path for --volume.
+            let abs_parent = std::path::absolute(parent)
+                .map_err(|e| anyhow::anyhow!("resolving OUTPUT dir `{}`: {e}", parent.display()))?;
+            let fname = host_dest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| anyhow::anyhow!("OUTPUT dest `{dest}` has no filename"))?;
             let mut cmd = tokio::process::Command::new("buildah");
             cmd.arg("run")
                 .arg("--volume")
-                .arg(format!("{}:/hostout", tmp.display()))
+                .arg(format!("{}:/hostout", abs_parent.display()))
                 .arg(&working)
                 .args(["cp", src, &format!("/hostout/{fname}")])
                 .stdin(std::process::Stdio::inherit())
@@ -461,16 +471,12 @@ async fn extract_into(
             if !status.success() {
                 anyhow::bail!("OUTPUT failed to extract `{src}` (exit {status})");
             }
-            // Move the extracted file from tmp into its final host location.
-            let moved = tmp.join(fname);
-            crate::fsctx::fs_err(std::fs::rename(&moved, &host_dest), &host_dest, "rename")?;
             println!("basil: output {src} -> {dest}");
         }
         Ok::<(), anyhow::Error>(())
     }
     .await;
 
-    let _ = std::fs::remove_dir_all(&tmp);
     let _ = tokio::process::Command::new("buildah")
         .args(["rm", &working])
         .output()
