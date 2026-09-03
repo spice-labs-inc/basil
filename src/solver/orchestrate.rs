@@ -200,9 +200,15 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         ));
     }
 
+    // Resolve unpinned external bases (network: auth token + manifest GETs).
+    println!("basil: resolving {} base(s) from registries...", parsed.targets.len());
+    let t0 = std::time::Instant::now();
     let resolved = resolve_unpinned_bases(&parsed.targets)
         .await
         .map_err(anyhow::Error::msg)?;
+    println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
+    let t0 = std::time::Instant::now();
+    println!("basil: computing identity ({} targets)...", parsed.targets.len());
     let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
         &parsed.targets,
@@ -212,6 +218,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         &mut resolver,
     )
     .map_err(anyhow::Error::msg)?;
+    println!("basil: identity computed in {:.1}s", t0.elapsed().as_secs_f64());
     for name in &names {
         println!(
             "basil: identity {name} -> {}",
@@ -335,9 +342,14 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     if let Some(version) = version_arg {
         build_args.insert("VERSION".to_string(), version);
     }
+    println!("basil: resolving {} base(s) from registries...", parsed.targets.len());
+    let t0 = std::time::Instant::now();
     let resolved = resolve_unpinned_bases(&parsed.targets)
         .await
         .map_err(anyhow::Error::msg)?;
+    println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
+    let t1 = std::time::Instant::now();
+    println!("basil: computing identity ({} targets)...", parsed.targets.len());
     let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
         &parsed.targets,
@@ -347,6 +359,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         &mut resolver,
     )
     .map_err(anyhow::Error::msg)?;
+    println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
     // Idempotent check: skip when every deliverable's content tag exists.
     let idempotent_skip = idempotent_all_exist(&deliverable_names, &closures).await?;
