@@ -193,24 +193,47 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         Some(t) => vec![t.clone()],
         None => qualified.into_iter().map(|s| s.to_string()).collect(),
     };
+    // With -t <name>, the target must actually exist in the file (by its AS
+    // name). A typo ('-t fennel' when the deliverable is 'localhost:5001/fennel')
+    // errors clearly instead of silently computing nothing.
+    if let Some(t) = &inp.target_filter {
+        if !parsed.targets.iter().any(|x| x.name.as_str() == t.as_str()) {
+            return Err(anyhow::anyhow!(
+                "target `{t}` not found in {} (known: {})",
+                inp.file,
+                parsed
+                    .targets
+                    .iter()
+                    .map(|x| x.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     if names.is_empty() {
         return Err(anyhow::anyhow!(
             "no deliverable target to build: pass -t <target> or name a deliverable as a qualified image reference"
         ));
     }
 
+    // Only compute identity for the stages the build actually needs. With
+    // -t <target>, that's the target + its transitive FROM / COPY --from stage
+    // deps — unrelated deliverables aren't built or hashed.
+    let subset = dependency_subset(&parsed.targets, &names);
+    println!("basil: {} target(s) in scope (of {} total)", subset.len(), parsed.targets.len());
+
     // Resolve unpinned external bases (network: auth token + manifest GETs).
-    println!("basil: resolving {} base(s) from registries...", parsed.targets.len());
+    println!("basil: resolving base(s) from registries...");
     let t0 = std::time::Instant::now();
-    let resolved = resolve_unpinned_bases(&parsed.targets)
+    let resolved = resolve_unpinned_bases(&subset)
         .await
         .map_err(anyhow::Error::msg)?;
     println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
     let t0 = std::time::Instant::now();
-    println!("basil: computing identity ({} targets)...", parsed.targets.len());
+    println!("basil: computing identity ({} target(s))...", subset.len());
     let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
-        &parsed.targets,
+        &subset,
         &parsed.default_platforms,
         inp.context,
         &HashMap::new(),
@@ -239,7 +262,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             crate::solver::buildah::extract_outputs_from_image(
                 &format!("{name}:{tag}"),
                 inp.context,
-                &parsed.targets,
+                &subset,
                 name,
             )
             .await?;
@@ -253,7 +276,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
         let insecure = is_local_registry(name);
         crate::solver::buildah::build_deliverable(
-            &parsed.targets,
+            &subset,
             name,
             &tag,
             inp.context,
@@ -269,6 +292,80 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         if out.len() == 1 { "" } else { "s" }
     );
     Ok(out)
+}
+
+/// The subset of targets reachable from `roots`: each root plus every stage it
+/// depends on via `FROM <stage>` or `COPY --from=<stage>`, transitively. This
+/// lets a targeted build avoid computing identity/render for unrelated stages.
+pub fn dependency_subset(all: &[crate::dsl::ast::Target], roots: &[String]) -> Vec<crate::dsl::ast::Target> {    let by_name: std::collections::HashMap<&str, &crate::dsl::ast::Target> =
+        all.iter().map(|t| (t.name.as_str(), t)).collect();
+    let mut keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut stack: Vec<String> = roots.to_vec();
+    while let Some(name) = stack.pop() {
+        if !keep.insert(name.clone()) {
+            continue;
+        }
+        let Some(t) = by_name.get(name.as_str()) else {
+            continue; // external ref, not a local stage
+        };
+        let crate::dsl::ast::BaseImage { raw, .. } = &t.base;
+        if let Some(b) = by_name.get(raw.as_str()) {
+            if b.name != name {
+                stack.push(b.name.clone());
+            }
+        }
+        for instr in &t.instructions {
+            if let crate::dsl::ast::Instruction::Copy(c) = instr {
+                if let Some(from) = &c.from {
+                    if by_name.contains_key(from.as_str()) {
+                        stack.push(from.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Preserve source order for determinism.
+    all.iter()
+        .filter(|t| keep.contains(t.name.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::parser::parse;
+
+    #[test]
+    fn dependency_subset_reaches_transitive_stages() {
+        let src = "\
+FROM golang AS build
+COPY . /src
+RUN go build -o /src/app
+
+FROM scratch AS a/platform/app
+COPY --from=build /src/app /app
+
+FROM alpine AS unrelated
+RUN echo other
+";
+        let f = parse(src).unwrap();
+        let sub = dependency_subset(&f.targets, &["a/platform/app".to_string()]);
+        let names: Vec<&str> = sub.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"a/platform/app"), "{names:?}");
+        assert!(names.contains(&"build"), "{names:?}");
+        // The FROM build is a stage dep; the unrelated alpine target is excluded.
+        assert!(!names.contains(&"unrelated"), "{names:?}");
+    }
+
+    #[test]
+    fn dependency_subset_includes_scratch_root() {
+        let src = "FROM scratch AS app\nENTRYPOINT [\"/app\"]\n";
+        let f = parse(src).unwrap();
+        let sub = dependency_subset(&f.targets, &["app".to_string()]);
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0].name, "app");
+    }
 }
 
 /// Build using the buildah backend (plain subprocess, no daemon), driven by

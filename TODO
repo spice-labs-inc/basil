@@ -1,3 +1,6 @@
 # TODO
 
-(none)
+- Verify OUTPUT works (it does NOT in this repo currently; target/basil is not created)
+- Fail fast on `basil build -t nonexistent`
+- Support args in AS clauses, like "FROM x AS ${registry}/image"
+
