@@ -45,9 +45,19 @@ async fn resolve_unpinned_bases(
     // Resolve each distinct base ref once per run; many stages reuse the same
     // base (e.g. ghcr.io/.../build-base), so dedupe by host/repo:tag.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A base naming a *different* local target is an internal stage, not an
+    // image — resolve it as the stage's closure, never as an external pull. The
+    // self-name rule (`FROM alpine` naming a stage `alpine`) stays external.
+    let by_name: std::collections::HashSet<&str> =
+        targets.iter().map(|t| t.name.as_str()).collect();
     for t in targets {
         let b = &t.base;
         if b.raw == "scratch" || b.digest.is_some() {
+            continue;
+        }
+        if by_name.contains(b.raw.as_str()) && b.raw != t.name {
+            // Internal stage dependency — its identity is folded as C(stage),
+            // not resolved from a registry.
             continue;
         }
         // Normalize the base ref via parse_ref: bare names (`rust`, `alpine`)
