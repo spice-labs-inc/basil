@@ -67,3 +67,29 @@ fn tag_matches_only_tag_reaction() {
     assert_eq!(matched.len(), 1);
     assert!(matches!(matched[0].event.token, basil::dsl::ast::EventToken::Tag));
 }
+
+/// The checked-in docs/events/ payloads must match the token they're meant to
+/// demonstrate, so the samples stay correct against the real matcher.
+#[test]
+fn docs_event_fixtures_match_their_tokens() {
+    use basil::dsl::ast::EventToken;
+    use basil::event::reaction_matches;
+    let cases: &[(&str, EventToken, &[&str], &str)] = &[
+        ("push", EventToken::Push, &["master"], "docs/events/push.json"),
+        ("push-bare", EventToken::Push, &[], "docs/events/push.json"),
+        ("tag", EventToken::Tag, &[], "docs/events/tag-push.json"),
+        ("pr-opened", EventToken::PrOpened, &[], "docs/events/pull_request-opened.json"),
+        ("pr-synchronized", EventToken::PrSynchronized, &[], "docs/events/pull_request-synchronize.json"),
+        ("pr-merged", EventToken::PrMerged, &[], "docs/events/pull_request-merged.json"),
+    ];
+    for (name, tok, selectors, path) in cases {
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let selectors: Vec<String> = selectors.iter().map(|s| s.to_string()).collect();
+        assert!(
+            reaction_matches(tok, &selectors, &payload),
+            "docs/events fixture `{name}` ({path}) did not match its token"
+        );
+    }
+}
