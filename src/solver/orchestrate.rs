@@ -2,7 +2,7 @@
 
 use crate::dsl::parser;
 use crate::event;
-use crate::identity::closure::{BaseResolver, compute_closure, hex};
+use crate::identity::closure::{BaseResolver, compute_closure};
 use serde_json::Value as Json;
 use std::collections::HashMap;
 
@@ -68,21 +68,12 @@ async fn resolve_unpinned_bases(
             Ok(ir) => ir,
             Err(e) => return Err(format!("unpinned base `{raw}`: {e}", raw = b.raw)),
         };
-        let host = ir.host.clone();
-        let repo = ir.repo.clone();
-        let dedup_key = format!("{host}/{repo}:{tag}");
-        if !seen.insert(dedup_key) {
+        // Dedupe distinct refs so a shared base (e.g. build-base) resolves once.
+        if !seen.insert(ir.dedup_key(&tag)) {
             continue;
         }
-        let client =
-            crate::solver::registry::RegistryClient::new(&crate::solver::registry::ImageRef {
-                host: host.clone(),
-                repo: repo.clone(),
-                tag: tag.clone(),
-            }
-            .base_url());
         let raw = &b.raw;
-        match client.resolve_digest(&repo, &tag).await {
+        match ir.resolve_digest().await {
             Ok(digest) => {
                 tracing::info!("resolved base `{raw}` -> {digest}");
                 // compute_closure passes tag=None when the DSL base has no
@@ -95,7 +86,8 @@ async fn resolve_unpinned_bases(
                 // Fail hard: an unpinned base we couldn't resolve means we can't
                 // compute an honest identity for it.
                 return Err(format!(
-                    "could not resolve unpinned base `{raw}` ({host}/{repo}:{tag}): {e}"
+                    "could not resolve unpinned base `{raw}` ({}): {e}",
+                    ir.dedup_key(&tag)
                 ));
             }
         }
@@ -147,21 +139,12 @@ async fn promote_on_tag(
     promoted.dedup();
 
     for (name, version) in &promoted {
-        let tag_hash = closures.get(name).map(|t| crate::identity::closure::hex(t)).unwrap_or_default();
-        let Some((host, rest)) = name.split_once('/') else {
-            tracing::warn!("promote: `{name}` not a qualified reference");
-            continue;
-        };
-        let repo = rest.rsplit_once(':').map(|(r, _)| r).unwrap_or(rest);
-        let base = crate::solver::registry::ImageRef {
-            host: host.to_string(),
-            repo: repo.to_string(),
-            tag: String::new(),
-        }
-        .base_url();
-        let client = crate::solver::registry::RegistryClient::new(&base);
-        let src = format!("{repo}:{tag_hash}");
-        match client.retag(repo, &tag_hash, &format!("v{version}")).await {
+        let tag_hash = digest_of(name, closures)?;
+        let ir = crate::solver::registry::parse_ref(name, "")
+            .map_err(|e| anyhow::anyhow!("promote `{name}`: {e}"))?;
+        let client = ir.client();
+        let src = format!("{}:{tag_hash}", ir.repo);
+        match client.retag(&ir.repo, &tag_hash, &format!("v{version}")).await {
             Ok(d) => tracing::info!("promote `{name}:{src}` -> v{version} (digest {})", &d[..d.len().min(24)]),
             Err(e) => {
                 anyhow::bail!("promotion immutability/retag failure for `{name}:v{version}`: {e}")
@@ -244,7 +227,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     for name in &names {
         println!(
             "basil: identity {name} -> {}",
-            closures.get(name).map(|t| hex(t)).unwrap_or_default()
+            digest_of(name, &closures)?
         );
     }
 
@@ -258,7 +241,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         println!("basil: content tags already published -- no build (idempotent check)");
         for name in &names {
             // OUTPUT still runs: pull the published image and extract.
-            let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+            let tag = digest_of(name, &closures)?;
             crate::solver::buildah::extract_outputs_from_image(
                 &format!("{name}:{tag}"),
                 inp.context,
@@ -273,8 +256,10 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     }
 
     for name in &names {
-        let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
-        let insecure = is_local_registry(name);
+        let tag = digest_of(name, &closures)?;
+        let insecure = crate::solver::registry::parse_ref(name, &tag)
+            .map(|ir| ir.is_local())
+            .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
             &subset,
             name,
@@ -462,7 +447,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         println!("basil: content tags already published -- no build (idempotent check)");
         // OUTPUT still runs on a skip: pull the published image and extract.
         for name in &deliverable_names {
-            let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
+            let tag = digest_of(name, &closures)?;
             crate::solver::buildah::extract_outputs_from_image(
                 &format!("{name}:{tag}"),
                 inp.context,
@@ -475,20 +460,16 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         println!("basil: done ({})", deliverable_names.join(", "));
         return Ok(vec![
             ("result".to_string(), "idempotent-skip".to_string()),
-            (
-                "digest".to_string(),
-                deliverable_names
-                    .first()
-                    .map(|n| closures.get(n).map(|t| hex(t)).unwrap_or_default())
-                    .unwrap_or_default(),
-            ),
+            ("digest".to_string(), digest_of(&deliverable_names[0], &closures)?),
         ]);
     }
 
     // Build each deliverable with buildah.
     for name in &deliverable_names {
-        let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
-        let insecure = is_local_registry(name);
+        let tag = digest_of(name, &closures)?;
+        let insecure = crate::solver::registry::parse_ref(name, &tag)
+            .map(|ir| ir.is_local())
+            .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
             &parsed.targets,
             name,
@@ -504,7 +485,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     println!("basil: done ({})", deliverable_names.join(", "));
     Ok(vec![(
         "digest".to_string(),
-        closures.get(&deliverable_names[0]).map(|t| hex(t)).unwrap_or_default(),
+        digest_of(&deliverable_names[0], &closures)?,
     )])
 }
 
@@ -516,18 +497,11 @@ async fn idempotent_all_exist(
 ) -> anyhow::Result<bool> {
     let mut all = true;
     for name in names {
-        let tag = closures.get(name).map(|t| hex(t)).unwrap_or_default();
-        let Some((host, rest)) = name.split_once('/') else {
-            anyhow::bail!("deliverable `{name}` is not a qualified image reference");
-        };
-        let repo = rest.rsplit_once(':').map(|(r, _)| r).unwrap_or(rest);
-        let client = crate::solver::registry::RegistryClient::new(&crate::solver::registry::ImageRef {
-            host: host.to_string(),
-            repo: repo.to_string(),
-            tag: tag.clone(),
-        }
-        .base_url());
-        match client.manifest_exists(repo, &tag).await {
+        let tag = digest_of(name, closures)?;
+        let ir = crate::solver::registry::parse_ref(name, &tag)
+            .map_err(|e| anyhow::anyhow!("deliverable `{name}`: {e}"))?;
+        let client = ir.client();
+        match client.manifest_exists(&ir.repo, &tag).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::info!("idempotent: `{name}:{tag}` does not exist yet (will build)");
@@ -544,12 +518,20 @@ async fn idempotent_all_exist(
     Ok(all)
 }
 
-fn is_local_registry(name: &str) -> bool {
-    let host = name.split('/').next().unwrap_or("");
-    host.starts_with("127.0.0.1")
-        || host == "localhost"
-        || (!host.contains('.') && !host.contains(':'))
+/// The `tagHash` for a built deliverable, or an error if its closure wasn't
+/// computed (a target that was never in scope — e.g. a `-t` typo — must not
+/// silently produce an empty digest and skip the build).
+fn digest_of(
+    name: &str,
+    closures: &std::collections::HashMap<String, [u8; 32]>,
+) -> anyhow::Result<String> {
+    closures
+        .get(name)
+        .map(|t| crate::identity::closure::hex(t))
+        .ok_or_else(|| anyhow::anyhow!("no identity computed for `{name}`"))
 }
+
+
 
 fn resolved_image(base: &crate::dsl::ast::BaseImage) -> String {
     let mut s = base.raw.clone();

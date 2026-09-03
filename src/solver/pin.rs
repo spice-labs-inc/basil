@@ -56,18 +56,11 @@ pub async fn pin_file(src: &str) -> Result<String, String> {
         }
         let tag = b.tag.clone().unwrap_or_else(|| "latest".to_string());
         let ir = crate::solver::registry::parse_ref(&b.raw, &tag).map_err(|e| e.to_string())?;
-        let dedup_key = format!("{}/{}/{}", ir.host, ir.repo, tag);
-        if !seen.insert(dedup_key) {
+        if !seen.insert(ir.dedup_key(&tag)) {
             continue;
         }
-        let client = crate::solver::registry::RegistryClient::new(&crate::solver::registry::ImageRef {
-            host: ir.host.clone(),
-            repo: ir.repo.clone(),
-            tag: tag.clone(),
-        }
-        .base_url());
-        let digest = client
-            .resolve_digest(&ir.repo, &tag)
+        let digest = ir
+            .resolve_digest()
             .await
             .map_err(|e| format!("could not resolve unpinned base `{old}`: {e}"))?;
         // Pin: preserve the tag (if any) and append @digest. Drop the mutable

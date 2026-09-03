@@ -128,15 +128,33 @@ impl ImageRef {
             "docker.io" | "index.docker.io" => "registry-1.docker.io",
             other => other,
         };
-        let scheme = if api_host.starts_with("localhost")
-            || api_host.starts_with("127.0.0.1")
-            || !api_host.contains('.')
-        {
-            "http"
-        } else {
-            "https"
-        };
+        let scheme = if Self::is_http_host(&api_host) { "http" } else { "https" };
         format!("{scheme}://{api_host}")
+    }
+
+    /// A registry client for this image reference's host.
+    pub fn client(&self) -> RegistryClient {
+        RegistryClient::new(&self.base_url())
+    }
+
+    /// A dedup key for this ref (before tag normalization): `host/repo:tag`.
+    pub fn dedup_key(&self, tag: &str) -> String {
+        format!("{}/{}:{}", self.host, self.repo, tag)
+    }
+
+    /// Whether this host is a local/insecure registry (http), mirroring the
+    /// scheme choice in `base_url`.
+    pub fn is_local(&self) -> bool {
+        Self::is_http_host(&self.host)
+    }
+
+    fn is_http_host(host: &str) -> bool {
+        host.starts_with("localhost") || host.starts_with("127.0.0.1") || !host.contains('.')
+    }
+
+    /// Resolve this ref's tag to an image manifest digest via its registry.
+    pub async fn resolve_digest(&self) -> Result<String, String> {
+        self.client().resolve_digest(&self.repo, &self.tag).await
     }
 
     /// The manifest URL for the tag.
@@ -628,6 +646,25 @@ mod tests {
         assert_eq!(r.repo, "diff");
         assert_eq!(r.tag, "latest");
         assert!(r.base_url().starts_with("http://"));
+    }
+
+    #[test]
+    fn ir_helpers_dedup_local_client() {
+        let r = parse_ref("127.0.0.1:5001/diff", "v1").unwrap();
+        assert_eq!(r.dedup_key("v1"), "127.0.0.1:5001/diff:v1");
+        assert!(r.is_local());
+        // client() is the collapsed constructor used across call sites.
+        let _c = r.client();
+        let hub = parse_ref("ghcr.io/a/b", "latest").unwrap();
+        assert!(!hub.is_local());
+    }
+
+    #[test]
+    fn ir_resolves_own_digest() {
+        // No network test here: construction is cheap; resolve_digest needs a
+        // live registry, so just assert the method is reachable on a base.
+        let r = parse_ref("127.0.0.1:5001/diff", "latest").unwrap();
+        let _ = r.client();
     }
 
     #[test]

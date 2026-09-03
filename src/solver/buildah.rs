@@ -261,7 +261,7 @@ pub async fn build_deliverable(
     insecure: bool,
 ) -> anyhow::Result<()> {
     let containerfile = render_containerfile(targets, deliverable);
-    let cf_path = context.join(format!(".Basilfile.buildah.{}", std::process::id()));
+    let cf_path = std::env::temp_dir().join(format!("basil-cf-{}", std::process::id()));
     crate::fsctx::fs_err(std::fs::write(&cf_path, containerfile), &cf_path, "write")?;
 
     let tag_ref = format!("{deliverable}:{tag}");
@@ -395,7 +395,7 @@ async fn extract_outputs(
             image_ref.to_string()
         } else {
             // Intermediate stage: build it as its own image via --target.
-            let cf_path = context.join(format!(".Basilfile.out.{}", std::process::id()));
+            let cf_path = std::env::temp_dir().join(format!("basil-out-{}", std::process::id()));
             let containerfile = render_containerfile_all(targets);
             crate::fsctx::fs_err(std::fs::write(&cf_path, containerfile), &cf_path, "write")?;
             let local_img = format!("basil-output-{}", std::process::id());
