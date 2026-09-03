@@ -44,6 +44,9 @@ pub fn render_containerfile(targets: &[Target], deliverable: &str) -> String {
 /// simplicity every non-deliverable stage gets `AS <name>` so `--from` works.
 fn render_base(base: &BaseImage) -> String {
     let mut s = String::new();
+    if let Some(p) = &base.platform {
+        s.push_str(&format!("--platform={p} "));
+    }
     if base.raw == "scratch" {
         s.push_str("scratch");
     } else {
@@ -355,6 +358,18 @@ ON push(main) BUILD 127.0.0.1:5001/app\n";
         assert!(cf.contains("COPY --from=build /bin/app /app"));
         assert!(cf.contains("CMD [\"/app\"]"));
         assert!(!cf.contains("ON push"));
+    }
+
+    #[test]
+    fn renders_from_platform_buildplatform() {
+        let src = "FROM --platform=$BUILDPLATFORM alpine AS 127.0.0.1:5001/app\n\
+RUN echo hi\n";
+        let f = parse(src).unwrap();
+        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        assert!(
+            cf.starts_with("FROM --platform=$BUILDPLATFORM alpine\n"),
+            "expected platform selector in FROM:\n{cf}"
+        );
     }
 
     #[test]

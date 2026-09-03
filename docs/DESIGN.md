@@ -63,6 +63,12 @@ ON image-published  DO notify smoke
   default** (targets without their own inherit it). No `PLATFORM` = the builder's
   native platform. Multiple platforms make the content tag an OCI index (manifest
   list).
+- **`FROM --platform=<sel>`** — per-stage base platform selection. `$BUILDPLATFORM`
+  (build host's native platform) or `$TARGETPLATFORM` (target platform) are
+  build-staged variables buildah expands at build time; a literal `linux/arm64`
+  selects directly. A build stage that must run natively (e.g. a compiler) uses
+  `FROM --platform=$BUILDPLATFORM …` while the deliverable targets
+  `$TARGETPLATFORM`. The selector is folded into the stage's identity.
 - **`OUTPUT <container-src> <host-dest>`** — a **reverse `COPY`**: after the
   deliverable is built/pushed, copy a file out of the built image's root
   filesystem onto the host. `host-dest` is **relative to the build context only**

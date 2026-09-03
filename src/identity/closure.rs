@@ -169,8 +169,9 @@ pub fn compute_closure(
             }
 
             // Resolve the base reference.
+            let _base_platform = target.base.platform.clone();
             let base_ref = match &target.base {
-                crate::dsl::ast::BaseImage { raw, tag, digest } => {
+                crate::dsl::ast::BaseImage { raw, tag, digest, .. } => {
                     if let Some(bs_name) = by_name.get(raw.as_str()).map(|t| t.name.as_str()) {
                         if bs_name != name {
                             Some(BaseRef::Stage(hex(&result[bs_name])))
@@ -224,6 +225,9 @@ pub fn compute_closure(
             }
             if let Some(BaseRef::Stage(hash)) = &base_ref {
                 push(&mut record, &format!("base.stage.{}", stage_clean(name)), hash);
+            }
+            if let Some(p) = &_base_platform {
+                push(&mut record, "base.platform", p);
             }
             // Fold every stage dependency's closure hash (incl. COPY --from
             // sources): changes to a depended stage must change the deliverable.

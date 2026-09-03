@@ -74,9 +74,14 @@ yet).
 
 ### `FROM`
 ```
-FROM <base> [AS <name>]
+FROM [--platform=<sel>] <base> [AS <name>]
 ```
-The target's base image and optional stage name. See [Targets](#targets).
+The target's base image and optional stage name. `--platform=<sel>` picks the
+base's platform: `$BUILDPLATFORM` (build host's native platform) or
+`$TARGETPLATFORM` (the target platform), both build-staged vars buildah expands
+at build time; a literal `linux/arm64` selects that platform directly. A
+build stage that must run natively uses `FROM --platform=$BUILDPLATFORM …`.
+See [Targets](#targets).
 
 ### `ARG`
 ```

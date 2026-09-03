@@ -56,6 +56,10 @@ pub struct BaseImage {
     pub tag: Option<String>,
     /// Pinned digest (`@sha256:...`), if any. Present = hermetic.
     pub digest: Option<String>,
+    /// `FROM --platform=<sel>` platform selector, if any. `$BUILDPLATFORM` /
+    /// `$TARGETPLATFORM` are build-staged vars buildah expands at build time;
+    /// a literal `linux/amd64` selects that platform.
+    pub platform: Option<String>,
 }
 
 /// A build instruction inside a target.

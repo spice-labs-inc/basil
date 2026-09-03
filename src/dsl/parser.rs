@@ -150,6 +150,14 @@ impl Parser {
         if parts.is_empty() {
             return self.err(line, "FROM requires a base image");
         }
+        // Optional leading platform selector: `FROM --platform=<sel> <base>`.
+        let mut platform = None;
+        if parts[0].starts_with("--platform=") {
+            platform = Some(parts.remove(0).trim_start_matches("--platform=").to_string());
+            if parts.is_empty() {
+                return self.err(line, "FROM --platform=... requires a base image");
+            }
+        }
         let base_tok = parts.remove(0);
         let mut name: Option<String> = None;
         if !parts.is_empty() {
@@ -171,7 +179,7 @@ impl Parser {
 
         Ok(Target {
             name: name.unwrap_or_else(|| raw.clone()),
-            base: BaseImage { raw, tag, digest },
+            base: BaseImage { raw, tag, digest, platform },
             instructions: Vec::new(),
             task: None,
             platforms: None,
@@ -823,6 +831,25 @@ mod tests {
         let f = parse("FROM golang AS build\n").unwrap();
         assert_eq!(f.targets[0].name, "build");
         assert_eq!(f.targets[0].base.raw, "golang");
+    }
+
+    #[test]
+    fn parses_from_platform_buildplatform() {
+        let f = parse("FROM --platform=$BUILDPLATFORM alpine AS build\n").unwrap();
+        assert_eq!(f.targets[0].base.platform.as_deref(), Some("$BUILDPLATFORM"));
+        assert_eq!(f.targets[0].base.raw, "alpine");
+    }
+
+    #[test]
+    fn parses_from_platform_literal() {
+        let f = parse("FROM --platform=linux/arm64 alpine\n").unwrap();
+        assert_eq!(f.targets[0].base.platform.as_deref(), Some("linux/arm64"));
+    }
+
+    #[test]
+    fn from_platform_without_base_is_error() {
+        let e = parse("FROM --platform=$BUILDPLATFORM\n").unwrap_err();
+        assert!(e.message.contains("requires a base image"), "{}", e.message);
     }
 
     #[test]
