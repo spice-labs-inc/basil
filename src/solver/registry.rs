@@ -120,13 +120,23 @@ pub fn parse_ref(name: &str, default_tag: &str) -> Result<ImageRef, String> {
 
 impl ImageRef {
     /// The registry base URL. Localhost/127.0.0.1 use http; others https.
+    /// Docker Hub's canonical hosts (`docker.io`, `index.docker.io`) map to
+    /// the registry API host `registry-1.docker.io` — querying `docker.io`
+    /// returns a 302 to www.docker.com (an HTML page, no digest).
     pub fn base_url(&self) -> String {
-        let scheme = if self.host.starts_with("localhost") || self.host.starts_with("127.0.0.1") || !self.host.contains('.') {
+        let api_host = match self.host.as_str() {
+            "docker.io" | "index.docker.io" => "registry-1.docker.io",
+            other => other,
+        };
+        let scheme = if api_host.starts_with("localhost")
+            || api_host.starts_with("127.0.0.1")
+            || !api_host.contains('.')
+        {
             "http"
         } else {
             "https"
         };
-        format!("{scheme}://{}", self.host)
+        format!("{scheme}://{api_host}")
     }
 
     /// The manifest URL for the tag.
@@ -156,6 +166,11 @@ impl RegistryClient {
         if insecure {
             builder = builder.danger_accept_invalid_certs(true);
         }
+        // Follow redirects (GET/HEAD) deliberately with a bounded limit. The
+        // preemptive host normalization avoids the docker.io case; if a base
+        // URL still redirects, the caller surfaces the final URL/content-type
+        // so a wrong-host redirect is visible rather than silently believed.
+        builder = builder.redirect(reqwest::redirect::Policy::limited(10));
         RegistryClient {
             base: base_url.trim_end_matches('/').to_string(),
             headers: HashMap::new(),
@@ -263,7 +278,18 @@ impl RegistryClient {
         );
         let resp = req.send().await.map_err(|e| format!("registry GET {url}: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("registry GET {url}: status {}", resp.status()));
+            // Expose the failure clearly: final URL (after any redirects) and
+            // content-type, so a redirect to a wrong host is visible.
+            let final_url = resp.url().to_string();
+            let ct = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            return Err(format!(
+                "registry GET {url}: status {} (final {final_url}, content-type `{ct}`)",
+                resp.status()
+            ));
         }
         let digest = resp
             .headers()
@@ -271,6 +297,17 @@ impl RegistryClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        if digest.is_empty() {
+            let final_url = resp.url().to_string();
+            let ct = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            return Err(format!(
+                "registry GET {url}: no Docker-Content-Digest (final {final_url}, content-type `{ct}`)"
+            ));
+        }
         let body = resp.bytes().await.map_err(|e| format!("read manifest: {e}"))?;
         Ok((digest, body.to_vec()))
     }
@@ -397,70 +434,65 @@ pub async fn retag(&self, repo: &str, src: &str, tag: &str) -> Result<String, St
         None
     }
 
-    /// An `Authorization: Bearer` token for `repo`, or `""` if anonymous/unauth.
-    /// Uses the operator's credentials to exchange a token (cached).
+    /// An `Authorization: Bearer` token for `repo`, or `""` if the registry
+    /// does not challenge with Bearer. Always attempts the exchange — Docker
+    /// Hub issues an *anonymous* token for public pulls, so no creds is fine
+    /// for public repos; private repos still need the operator's creds.
     pub async fn token(&self, repo: &str) -> Result<String, String> {
         let mut guard = self.token.lock().await;
         if let Some(t) = &*guard {
             return Ok(t.clone());
         }
         let creds = self.load_creds();
-        let token = match creds {
-            None => String::new(),
-            Some((user, pass)) => {
-                // OCI auth flow: send an unauthenticated repo-scoped request to
-                // read the Bearer challenge (realm/service) — ghcr only emits
-                // it on a repo-scoped path, not a bare /v2/ — then exchange the
-                // credentials for a bearer token. Falls back to /v2/.
-                let challenge_url =
-                    format!("{}/v2/{repo}/manifests/latest", self.base);
-                let realm = match self.client.get(&challenge_url).send().await {
-                    Ok(resp) => {
-                        let ww = resp.headers().get("www-authenticate")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
-                        if parse_bearer_realm(ww).is_some() {
-                            parse_bearer_realm(ww)
-                        } else {
-                            // Some registries challenge on the bare /v2/.
-                            self.client.get(format!("{}/v2/", self.base)).send().await.ok()
-                                .and_then(|r| r.headers().get("www-authenticate")
-                                    .and_then(|v| v.to_str().ok()).map(String::from))
-                                .and_then(|ww| parse_bearer_realm(&ww))
-                        }
-                    }
-                    Err(_) => None,
-                };
-                match realm {
-                    Some((realm_url, service)) => {
-                        let basic = base64_encode(&format!("{user}:{pass}"));
-                        // URL-encode the scope (contains '/' and ':') — ghcr's
-                        // token endpoint rejects a raw scope.
-                        let scope_enc = urlencode(&format!("repository:{repo}:pull"));
-                        let service_enc = urlencode(&service);
-                        let token_url =
-                            format!("{realm_url}?service={service_enc}&scope={scope_enc}");
-                        let resp = self
-                            .client
-                            .get(&token_url)
-                            .header(reqwest::header::AUTHORIZATION, format!("Basic {basic}"))
-                            .send()
-                            .await
-                            .map_err(|e| format!("registry token `{repo}`: {e}"))?;
-                        if !resp.status().is_success() {
-                            return Err(format!(
-                                "registry token exchange for `{repo}`: status {}",
-                                resp.status()
-                            ));
-                        }
-                        let body: serde_json::Value = resp.json().await.map_err(|e| {
-                            format!("parse token response `{repo}`: {e}")
-                        })?;
-                        body.get("token").and_then(|t| t.as_str()).map(String::from).unwrap_or_default()
-                    }
-                    None => String::new(),
+        // Send an unauthenticated repo-scoped request to read the Bearer
+        // challenge (realm/service). ghcr/Docker Hub only emit it on a
+        // repo-scoped path, not a bare /v2/; fall back to /v2/.
+        let challenge_url = format!("{}/v2/{repo}/manifests/latest", self.base);
+        let realm = match self.client.get(&challenge_url).send().await {
+            Ok(resp) => {
+                let ww = resp.headers().get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if parse_bearer_realm(ww).is_some() {
+                    parse_bearer_realm(ww)
+                } else {
+                    // Some registries challenge on the bare /v2/.
+                    self.client.get(format!("{}/v2/", self.base)).send().await.ok()
+                        .and_then(|r| r.headers().get("www-authenticate")
+                            .and_then(|v| v.to_str().ok()).map(String::from))
+                        .and_then(|ww| parse_bearer_realm(&ww))
                 }
             }
+            Err(_) => None,
+        };
+        let token = match realm {
+            Some((realm_url, service)) => {
+                // URL-encode the scope (contains '/' and ':') — the token
+                // endpoint rejects a raw scope.
+                let scope_enc = urlencode(&format!("repository:{repo}:pull"));
+                let service_enc = urlencode(&service);
+                let token_url = format!("{realm_url}?service={service_enc}&scope={scope_enc}");
+                let mut req = self.client.get(&token_url);
+                if let Some((user, pass)) = &creds {
+                    let basic = base64_encode(&format!("{user}:{pass}"));
+                    req = req.header(reqwest::header::AUTHORIZATION, format!("Basic {basic}"));
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| format!("registry token `{repo}`: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!(
+                        "registry token exchange for `{repo}`: status {}",
+                        resp.status()
+                    ));
+                }
+                let body: serde_json::Value = resp.json().await.map_err(|e| {
+                    format!("parse token response `{repo}`: {e}")
+                })?;
+                body.get("token").and_then(|t| t.as_str()).map(String::from).unwrap_or_default()
+            }
+            None => String::new(),
         };
         *guard = Some(token.clone());
         Ok(token)

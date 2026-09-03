@@ -35,8 +35,12 @@ impl BaseResolver for RegistryResolver {
 /// Build a resolver by resolving every unpinned external base found in
 /// `targets` against its registry. This turns `<host>/<repo>:<tag>` into its
 /// pinned manifest digest so identity is computed over a real, current digest.
-/// `scratch` and already-pinned bases are left untouched.
-async fn resolve_unpinned_bases(targets: &[crate::dsl::ast::Target]) -> HashMap<String, String> {
+/// `scratch` and already-pinned bases are left untouched. A base that cannot
+/// be resolved is a hard error — identity must not proceed on an unresolved
+/// base (it would hash the wrong input).
+async fn resolve_unpinned_bases(
+    targets: &[crate::dsl::ast::Target],
+) -> Result<HashMap<String, String>, String> {
     let mut resolved = HashMap::new();
     for t in targets {
         let b = &t.base;
@@ -69,11 +73,15 @@ async fn resolve_unpinned_bases(targets: &[crate::dsl::ast::Target]) -> HashMap<
                 resolved.insert(format!("{raw}:{tag}"), digest);
             }
             Err(e) => {
-                tracing::warn!("could not resolve unpinned base `{raw}`: {e}");
+                // Fail hard: an unpinned base we couldn't resolve means we can't
+                // compute an honest identity for it.
+                return Err(format!(
+                    "could not resolve unpinned base `{raw}` ({host}/{repo}:{tag}): {e}"
+                ));
             }
         }
     }
-    resolved
+    Ok(resolved)
 }
 
 /// Inputs to a build.
@@ -173,7 +181,9 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         ));
     }
 
-    let resolved = resolve_unpinned_bases(&parsed.targets).await;
+    let resolved = resolve_unpinned_bases(&parsed.targets)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
         &parsed.targets,
@@ -306,7 +316,9 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     if let Some(version) = version_arg {
         build_args.insert("VERSION".to_string(), version);
     }
-    let resolved = resolve_unpinned_bases(&parsed.targets).await;
+    let resolved = resolve_unpinned_bases(&parsed.targets)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
         &parsed.targets,
