@@ -142,6 +142,32 @@ fn render_command(c: &Command) -> String {
     }
 }
 
+/// The auth file to give `buildah push --authfile`: an explicit
+/// `REGISTRY_AUTH_FILE`, else Podman's auth.json, else Docker's config.json
+/// (buildah/containers-image read the same `auths` map). `None` =
+/// anonymous push.
+fn push_authfile() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("REGISTRY_AUTH_FILE") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let home = std::env::var("HOME").ok()?;
+    let podman = std::path::PathBuf::from(&home).join(".config").join("containers").join("auth.json");
+    let docker = std::path::PathBuf::from(&home).join(".docker").join("config.json");
+    if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
+        let rt = std::path::PathBuf::from(&d).join("containers").join("auth.json");
+        if rt.exists() {
+            return Some(rt);
+        }
+    }
+    if podman.exists() {
+        Some(podman)
+    } else if docker.exists() {
+        Some(docker)
+    } else {
+        None
+    }
+}
+
 fn render_mount(m: &Mount) -> String {
     match m {
         Mount::Bind { source, target, read_only } => {
@@ -278,6 +304,12 @@ pub async fn build_deliverable(
     push.arg("push");
     if insecure {
         push.arg("--tls-verify=false");
+    }
+    // Auth for the push: buildah defaults to the Podman auth file. If that
+    // isn't present but the operator has Docker creds, fall back to them so a
+    // `docker login`-only registry still pushes.
+    if let Some(authfile) = push_authfile() {
+        push.arg("--authfile").arg(&authfile);
     }
     push.arg(&tag_ref)
         .arg(format!("docker://{deliverable}:{tag}"))
@@ -463,6 +495,13 @@ RUN --mount=type=cache,target=/cache --network=none echo hi\n";
         let f = parse(src).unwrap();
         let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
         assert!(cf.contains("RUN --mount=type=cache,target=/cache --network=none echo hi"), "{cf}");
+    }
+
+    #[test]
+    fn push_authfile_prefers_registry_env() {
+        std::env::set_var("REGISTRY_AUTH_FILE", "/tmp/fa.json");
+        assert_eq!(push_authfile(), Some(std::path::PathBuf::from("/tmp/fa.json")));
+        std::env::remove_var("REGISTRY_AUTH_FILE");
     }
 
     #[test]
