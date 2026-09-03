@@ -1,6 +1,4 @@
 # TODO
 
-- Verify OUTPUT works (it does NOT in this repo currently; target/basil is not created)
-- Fail fast on `basil build -t nonexistent`
+- Fail fast on `basil build -t nonexistent` (validation now exists; verify + add a test)
 - Support args in AS clauses, like "FROM x AS ${registry}/image"
-

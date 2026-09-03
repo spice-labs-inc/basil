@@ -11,6 +11,22 @@ use crate::dsl::ast::{BaseImage, Command, Instruction, Mount, Target};
 /// Render the deliverable's stage graph as a multi-stage Containerfile.
 /// `targets` is the topologically-ordered set; `deliverable` must be one of
 /// them (the final stage). Returns the Containerfile text.
+/// Render every stage with its `AS <name>` alias preserved, for a `buildah
+/// build --target <stage>` (an intermediate stage must keep its alias so
+/// `--target` can find it, unlike the deliverable which is the tagged image).
+pub fn render_containerfile_all(targets: &[Target]) -> String {
+    let mut out = String::new();
+    for t in targets {
+        // Preserve the AS alias on every stage so --target / --from resolve.
+        out.push_str(&format!("FROM {} AS {}\n", render_base(&t.base), t.name));
+        for instr in &t.instructions {
+            out.push_str(&render_instruction(instr));
+            out.push('\n');
+        }
+    }
+    out
+}
+
 pub fn render_containerfile(targets: &[Target], deliverable: &str) -> String {
     // Emit every stage (multi-stage deps like COPY --from must resolve), with
     // the deliverable forced to be the last stage (that's what buildah tags).
@@ -324,57 +340,101 @@ pub async fn build_deliverable(
     }
     println!("basil: pushed {deliverable}:{tag}");
 
-    // Reverse COPY: extract any OUTPUT files from the built image to the host.
-    let outputs: Vec<(String, String)> = collect_outputs(targets, deliverable);
-    if !outputs.is_empty() {
-        extract_outputs(&tag_ref, context, &outputs).await?;
-    }
+    // Reverse COPY: extract any OUTPUT files (from the stage that declares
+    // them) to the host. No-op if there are none.
+    extract_outputs(targets, deliverable, &tag_ref, context).await?;
     Ok(())
 }
 
-/// Collect a deliverable target's `OUTPUT` (container-src, host-dest) pairs.
-fn collect_outputs(targets: &[Target], deliverable: &str) -> Vec<(String, String)> {
-    targets
-        .iter()
-        .filter(|t| &t.name == deliverable)
-        .flat_map(|t| {
-            t.instructions.iter().filter_map(|i| match i {
-                Instruction::Output(o) => Some((o.source.clone(), o.dest.clone())),
-                _ => None,
-            })
-        })
-        .collect()
-}
-
-/// Extract a deliverable's OUTPUT files from an already-built image, pulling it
-/// from its registry ref if not present locally. Used on the idempotent-skip
-/// path
-/// so OUTPUT still runs when the image is not rebuilt.
+/// Collect a stage's `OUTPUT` (container-src, host-dest) pairs. `stage` is the
+/// Extract OUTPUT files from an already-built (or pulled) image. Used on the
+/// idempotent-skip path, and by the build path for the deliverable stage.
+/// OUTPUT may be declared on any stage: the deliverable uses `image_ref`; an
+/// intermediate stage is rebuilt via `buildah build --target <stage>` to get an
+/// image to extract from.
 pub async fn extract_outputs_from_image(
     image_ref: &str,
     context: &std::path::Path,
     targets: &[Target],
     deliverable: &str,
 ) -> anyhow::Result<()> {
-    let outputs = collect_outputs(targets, deliverable);
-    if outputs.is_empty() {
-        return Ok(());
-    }
-    println!("basil: pull {image_ref} for OUTPUT extraction");
-    extract_outputs(image_ref, context, &outputs).await
+    extract_outputs(targets, deliverable, image_ref, context).await
 }
 
-/// Reverse COPY: extract `(container-src, host-dest)` files out of the built
-/// image onto the host. Uses `buildah run --volume <hostdir>:/hostout` to bind
-/// the host destination dir into the working container and `cp` the file out
-/// (no rootless `buildah mount`/`unshare` needed). Host dests are relative to
-/// the context and already validated relative at parse time.
+/// Reverse COPY: extract every `OUTPUT` (container-src, host-dest) out of the
+/// image of the stage that declares it, onto the host. Uses
+/// `buildah run --volume <hostdir>:/hostout` to bind the host destination dir
+/// into the working container and `cp` the file out (no rootless `buildah
+/// mount`/`unshare` needed). Host dests are relative to the context and already
+/// validated relative at parse time.
 async fn extract_outputs(
-    tag_ref: &str,
+    targets: &[Target],
+    deliverable: &str,
+    image_ref: &str,
     context: &std::path::Path,
-    outputs: &[(String, String)],
 ) -> anyhow::Result<()> {
-    let working = buildah_from(tag_ref).await?;
+    // Group OUTPUTs by the stage that declares them.
+    let mut by_stage: std::collections::BTreeMap<&str, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for t in targets {
+        let outs: Vec<(String, String)> = t
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Output(o) => Some((o.source.clone(), o.dest.clone())),
+                _ => None,
+            })
+            .collect();
+        if !outs.is_empty() {
+            by_stage.insert(t.name.as_str(), outs);
+        }
+    }
+    for (stage, outs) in by_stage {
+        // Get an image for the OUTPUT-declaring stage.
+        let image = if stage == deliverable {
+            image_ref.to_string()
+        } else {
+            // Intermediate stage: build it as its own image via --target.
+            let cf_path = context.join(format!(".Basilfile.out.{}", std::process::id()));
+            let containerfile = render_containerfile_all(targets);
+            crate::fsctx::fs_err(std::fs::write(&cf_path, containerfile), &cf_path, "write")?;
+            let local_img = format!("basil-output-{}", std::process::id());
+            let mut build = tokio::process::Command::new("buildah");
+            build.arg("build")
+                .arg("--layers")
+                .arg("--target")
+                .arg(stage)
+                .arg("-t")
+                .arg(&local_img)
+                .arg("-f")
+                .arg(&cf_path)
+                .arg(context)
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit());
+            let status = build
+                .status()
+                .await
+                .map_err(|e| anyhow::anyhow!("buildah build (OUTPUT stage {stage}): {e}"))?;
+            std::fs::remove_file(&cf_path).ok();
+            if !status.success() {
+                anyhow::bail!("buildah build for OUTPUT stage `{stage}` failed (exit {status})");
+            }
+            local_img
+        };
+        extract_into(&image, stage, &outs, context).await?;
+    }
+    Ok(())
+}
+
+/// Extract one stage's `(src, dest)` OUTPUTs from `image` into `context`.
+async fn extract_into(
+    image: &str,
+    stage: &str,
+    outputs: &[(String, String)],
+    context: &std::path::Path,
+) -> anyhow::Result<()> {
+    let working = buildah_from(image).await?;
     let tmp = std::env::temp_dir().join(format!("basil-output-{}", std::process::id()));
     crate::fsctx::fs_err(std::fs::create_dir_all(&tmp), &tmp, "create_dir")?;
 
@@ -397,7 +457,7 @@ async fn extract_outputs(
             let status = cmd
                 .status()
                 .await
-                .map_err(|e| anyhow::anyhow!("buildah run (OUTPUT): {e}"))?;
+                .map_err(|e| anyhow::anyhow!("buildah run (OUTPUT {stage}): {e}"))?;
             if !status.success() {
                 anyhow::bail!("OUTPUT failed to extract `{src}` (exit {status})");
             }
@@ -482,6 +542,21 @@ ON push(main) BUILD 127.0.0.1:5001/app\n";
         assert!(cf.contains("COPY --from=build /bin/app /app"));
         assert!(cf.contains("CMD [\"/app\"]"));
         assert!(!cf.contains("ON push"));
+    }
+
+    #[test]
+    fn renders_containerfile_all_preserves_aliases() {
+        // For a `buildah build --target <stage>` build of an intermediate stage,
+        // every stage must keep its AS alias so --target can find it.
+        let src = "FROM golang AS build\n\
+RUN go build -o /bin/app\n\
+FROM scratch AS app\n\
+COPY --from=build /bin/app /app\n";
+        let f = parse(src).unwrap();
+        let cf = render_containerfile_all(&f.targets);
+        assert!(cf.contains("FROM golang AS build\n"), "{cf}");
+        assert!(cf.contains("FROM scratch AS app\n"), "{cf}");
+        assert!(cf.contains("COPY --from=build /bin/app /app"), "{cf}");
     }
 
     #[test]
