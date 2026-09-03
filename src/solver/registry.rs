@@ -140,6 +140,8 @@ pub struct RegistryClient {
     base: String,
     headers: HashMap<String, String>,
     client: reqwest::Client,
+    /// Cached bearer token for this host, fetched lazily on first 401.
+    token: tokio::sync::Mutex<Option<String>>,
 }
 
 impl RegistryClient {
@@ -158,6 +160,7 @@ impl RegistryClient {
             base: base_url.trim_end_matches('/').to_string(),
             headers: HashMap::new(),
             client: builder.build().expect("reqwest client"),
+            token: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -165,6 +168,7 @@ impl RegistryClient {
     pub async fn manifest_exists(&self, repo: &str, tag: &str) -> Result<bool, String> {
         let url = format!("{}/v2/{repo}/manifests/{tag}", self.base);
         let mut req = self.client.head(&url);
+        req = self.authed(repo, req).await?;
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -187,6 +191,7 @@ impl RegistryClient {
     pub async fn list_tags(&self, repo: &str) -> Result<Vec<String>, String> {
         let url = format!("{}/v2/{repo}/tags/list", self.base);
         let mut req = self.client.get(&url);
+        req = self.authed(repo, req).await?;
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -206,6 +211,7 @@ impl RegistryClient {
     pub async fn delete_tag(&self, repo: &str, tag: &str) -> Result<(), String> {
         let url = format!("{}/v2/{repo}/manifests/{tag}", self.base);
         let mut req = self.client.delete(&url);
+        req = self.authed(repo, req).await?;
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -227,6 +233,7 @@ impl RegistryClient {
     pub async fn delete_digest(&self, repo: &str, digest: &str) -> Result<(), String> {
         let url = format!("{}/v2/{repo}/manifests/{digest}", self.base);
         let mut req = self.client.delete(&url);
+        req = self.authed(repo, req).await?;
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -246,6 +253,7 @@ impl RegistryClient {
     ) -> Result<(String, Vec<u8>), String> {
         let url = format!("{}/v2/{repo}/manifests/{tag}", self.base);
         let mut req = self.client.get(&url);
+        req = self.authed(repo, req).await?;
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -291,6 +299,7 @@ impl RegistryClient {
         };
         let url = format!("{}/v2/{repo}/blobs/{cfg_digest}", self.base);
         let mut req = self.client.get(&url);
+        req = self.authed(repo, req).await?;
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -331,6 +340,7 @@ pub async fn retag(&self, repo: &str, src: &str, tag: &str) -> Result<String, St
             .put(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
             .body(body);
+        req = self.authed(repo, req).await?;
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -340,6 +350,223 @@ pub async fn retag(&self, repo: &str, src: &str, tag: &str) -> Result<String, St
         }
         Ok(digest)
     }
+
+    /// Load the operator's basic-auth credentials for this registry host from
+    /// `$DOCKER_CONFIG/config.json` or a Podman auth.json. `(user, pass)`.
+    pub fn load_creds(&self) -> Option<(String, String)> {
+        let host = self
+            .base
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+        let home = std::env::var("HOME").ok();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(d) = std::env::var("DOCKER_CONFIG") {
+            paths.push(std::path::PathBuf::from(&d).join("config.json"));
+        }
+        if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
+            paths.push(std::path::PathBuf::from(&d).join("containers").join("auth.json"));
+        }
+        if let Some(h) = &home {
+            paths.push(std::path::PathBuf::from(h).join(".docker").join("config.json"));
+            paths.push(std::path::PathBuf::from(h).join(".config").join("containers").join("auth.json"));
+        }
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let Some(auths) = value.get("auths").and_then(|a| a.as_object()) else {
+                continue;
+            };
+            let key = auths.keys().find(|k| {
+                let kk = k.trim_start_matches("https://").trim_start_matches("http://");
+                kk == host || kk == format!("{host}/v1/") || kk == format!("{host}/v2/")
+            });
+            if let Some(k) = key {
+                if let Some(b64) = auths[k].get("auth").and_then(|a| a.as_str()) {
+                    if let Some(decoded) = base64_decode(b64) {
+                        if let Some(col) = decoded.find(':') {
+                            return Some((decoded[..col].to_string(), decoded[col + 1..].to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// An `Authorization: Bearer` token for `repo`, or `""` if anonymous/unauth.
+    /// Uses the operator's credentials to exchange a token (cached).
+    pub async fn token(&self, repo: &str) -> Result<String, String> {
+        let mut guard = self.token.lock().await;
+        if let Some(t) = &*guard {
+            return Ok(t.clone());
+        }
+        let creds = self.load_creds();
+        let token = match creds {
+            None => String::new(),
+            Some((user, pass)) => {
+                // OCI auth flow: send an unauthenticated repo-scoped request to
+                // read the Bearer challenge (realm/service) — ghcr only emits
+                // it on a repo-scoped path, not a bare /v2/ — then exchange the
+                // credentials for a bearer token. Falls back to /v2/.
+                let challenge_url =
+                    format!("{}/v2/{repo}/manifests/latest", self.base);
+                let realm = match self.client.get(&challenge_url).send().await {
+                    Ok(resp) => {
+                        let ww = resp.headers().get("www-authenticate")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        if parse_bearer_realm(ww).is_some() {
+                            parse_bearer_realm(ww)
+                        } else {
+                            // Some registries challenge on the bare /v2/.
+                            self.client.get(format!("{}/v2/", self.base)).send().await.ok()
+                                .and_then(|r| r.headers().get("www-authenticate")
+                                    .and_then(|v| v.to_str().ok()).map(String::from))
+                                .and_then(|ww| parse_bearer_realm(&ww))
+                        }
+                    }
+                    Err(_) => None,
+                };
+                match realm {
+                    Some((realm_url, service)) => {
+                        let basic = base64_encode(&format!("{user}:{pass}"));
+                        // URL-encode the scope (contains '/' and ':') — ghcr's
+                        // token endpoint rejects a raw scope.
+                        let scope_enc = urlencode(&format!("repository:{repo}:pull"));
+                        let service_enc = urlencode(&service);
+                        let token_url =
+                            format!("{realm_url}?service={service_enc}&scope={scope_enc}");
+                        let resp = self
+                            .client
+                            .get(&token_url)
+                            .header(reqwest::header::AUTHORIZATION, format!("Basic {basic}"))
+                            .send()
+                            .await
+                            .map_err(|e| format!("registry token `{repo}`: {e}"))?;
+                        if !resp.status().is_success() {
+                            return Err(format!(
+                                "registry token exchange for `{repo}`: status {}",
+                                resp.status()
+                            ));
+                        }
+                        let body: serde_json::Value = resp.json().await.map_err(|e| {
+                            format!("parse token response `{repo}`: {e}")
+                        })?;
+                        body.get("token").and_then(|t| t.as_str()).map(String::from).unwrap_or_default()
+                    }
+                    None => String::new(),
+                }
+            }
+        };
+        *guard = Some(token.clone());
+        Ok(token)
+    }
+
+    /// Attach a bearer token (if any) for `repo` onto `req`.
+    async fn authed(&self, repo: &str, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, String> {
+        let t = self.token(repo).await?;
+        let req = if t.is_empty() {
+            req
+        } else {
+            req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"))
+        };
+        Ok(req)
+    }
+}
+
+/// Parse `WWW-Authenticate: Bearer realm="...",service="..."` into (realm, service).
+fn parse_bearer_realm(s: &str) -> Option<(String, String)> {
+    // `Bearer realm="...",service="...",scope="..."` — drop the scheme.
+    let s = s.trim_start();
+    let s = s.strip_prefix("Bearer").or_else(|| s.strip_prefix("bearer")).unwrap_or(s);
+    let mut realm = None;
+    let mut service = None;
+    for part in s.split(',') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("realm=") {
+            realm = Some(v.trim_matches('"').to_string());
+        } else if let Some(v) = part.strip_prefix("service=") {
+            service = Some(v.trim_matches('"').to_string());
+        }
+    }
+    realm.map(|r| (r, service.unwrap_or_default()))
+}
+
+/// Percent-encode a query value (keeps only unreserved chars).
+fn urlencode(s: &str) -> String {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<String> {
+    base64_decode_bytes(s).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+fn base64_decode_bytes(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn base64_encode(s: &str) -> String {    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ ";
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(A[(n >> 6) as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(A[n as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -375,6 +602,24 @@ mod tests {
     fn defaults_tag() {
         let r = parse_ref("ghcr.io/a/b", "latest").unwrap();
         assert_eq!(r.tag, "latest");
+    }
+
+    #[test]
+    fn parses_bearer_realm_with_scheme_prefix() {
+        let ww = "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\",scope=\"repository:spice-labs-inc/build-base:pull\"";
+        let (realm, service) = parse_bearer_realm(ww).expect("challenge should parse");
+        assert_eq!(realm, "https://ghcr.io/token");
+        assert_eq!(service, "ghcr.io");
+    }
+
+    #[test]
+    fn bearer_no_realm_is_none() {
+        assert_eq!(parse_bearer_realm("Basic realm=x"), None);
+    }
+
+    #[test]
+    fn urlencode_scope() {
+        assert_eq!(urlencode("repository:a/b:c"), "repository%3Aa%2Fb%3Ac");
     }
 }
 #[cfg(test)]
