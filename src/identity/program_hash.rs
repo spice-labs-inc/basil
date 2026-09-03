@@ -38,6 +38,9 @@ pub fn render_instruction(instr: &Instruction) -> String {
             if let Some(ch) = &a.chown {
                 parts.push(format!("--chown={ch}"));
             }
+            if let Some(cm) = &a.chmod {
+                parts.push(format!("--chmod={cm}"));
+            }
             parts.extend(a.sources.clone());
             parts.push(a.dest.clone());
             parts.join(" ")

@@ -332,7 +332,7 @@ impl Parser {
         let (flags, args) = parse_flags(rest).map_err(|m| self.err_at(line, m))?;
         for name in flags.keys() {
             match name.as_str() {
-                "chown" => {}
+                "chown" | "chmod" => {}
                 _ => return self.err(line, format!("unsupported ADD flag --{name}")),
             }
         }
@@ -343,6 +343,7 @@ impl Parser {
         let sources = args[..args.len() - 1].to_vec();
         Ok(Instruction::Add(Add {
             chown: flags.get("chown").cloned(),
+            chmod: flags.get("chmod").cloned(),
             sources,
             dest,
         }))
@@ -1054,6 +1055,16 @@ ON image-published  DO notify smoke
         };
         assert_eq!(o.source, "/app/result.txt");
         assert_eq!(o.dest, "out/result.txt");
+    }
+
+    #[test]
+    fn parses_add_chown_and_chmod() {
+        let f = parse("FROM alpine\nADD --chown=1000:1000 --chmod=0755 a.txt /x\n").unwrap();
+        let Instruction::Add(a) = &f.targets[0].instructions[0] else {
+            panic!("expected ADD");
+        };
+        assert_eq!(a.chown.as_deref(), Some("1000:1000"));
+        assert_eq!(a.chmod.as_deref(), Some("0755"));
     }
 
     #[test]

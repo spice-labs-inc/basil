@@ -108,7 +108,7 @@ from another stage's filesystem.
 
 ### `ADD`
 ```
-ADD [--chown=<u:g>] <src>… <dest>
+ADD [--chown=<u:g>] [--chmod=<mode>] <src>… <dest>
 ```
 Like `COPY`; a URL source marks the target non-hermetic.
 

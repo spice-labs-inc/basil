@@ -95,6 +95,9 @@ fn render_instruction(i: &Instruction) -> String {
             if let Some(o) = &a.chown {
                 s.push_str(&format!(" --chown={o}"));
             }
+            if let Some(m) = &a.chmod {
+                s.push_str(&format!(" --chmod={m}"));
+            }
             s.push(' ');
             s.push_str(&a.sources.join(" "));
             s.push(' ');
@@ -358,6 +361,15 @@ ON push(main) BUILD 127.0.0.1:5001/app\n";
         assert!(cf.contains("COPY --from=build /bin/app /app"));
         assert!(cf.contains("CMD [\"/app\"]"));
         assert!(!cf.contains("ON push"));
+    }
+
+    #[test]
+    fn renders_add_chmod_flag() {
+        let src = "FROM alpine AS 127.0.0.1:5001/app\n\
+ADD --chown=1000:1000 --chmod=0755 a.txt /x\n";
+        let f = parse(src).unwrap();
+        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        assert!(cf.contains("ADD --chown=1000:1000 --chmod=0755 a.txt /x"), "{cf}");
     }
 
     #[test]

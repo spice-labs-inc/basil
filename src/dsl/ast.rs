@@ -121,6 +121,7 @@ pub struct Output {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Add {
     pub chown: Option<String>,
+    pub chmod: Option<String>,
     pub sources: Vec<String>,
     pub dest: String,
 }
