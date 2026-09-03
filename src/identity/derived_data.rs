@@ -49,6 +49,20 @@ fn expand_source(
         }
     } else {
         let p = context.join(src);
+        // An explicit (non-glob) source that's excluded by .dockerignore is a
+        // hard error, matching buildah/Docker ("no items matching glob ...
+        // filtered out using .dockerignore"). Silently dropping it would hash an
+        // identity for an input the build will reject.
+        if let Ok(rel) = pathdiff(&p, context, "") {
+            let rel_str = rel.replace('\\', "/");
+            if !rel_str.is_empty() {
+                if let Match::Ignore = ignore.matches(&rel_str) {
+                    anyhow::bail!(
+                        "`{src}` is excluded by .dockerignore but explicitly listed as an ADD/COPY source"
+                    );
+                }
+            }
+        }
         collect_path(&p, context, ignore, out)?;
     }
     Ok(())
@@ -368,6 +382,28 @@ mod tests {
         let f = parse(dsl).unwrap();
         let files = derived_file_set(&f.targets[0], &dir).unwrap();
         assert!(files.contains("Makefile"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_source_excluded_by_dockerignore_errors() {
+        // An ADD/COPY source explicitly listed AND excluded by .dockerignore is
+        // a hard error (buildah: "no items matching glob ... filtered out using
+        // .dockerignore"), not a silent skip — identity must not hash an input
+        // the build will reject.
+        let dir = std::env::temp_dir().join(format!("basil-test-ignore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        ctx(&dir, ".dockerignore", "rustfmt.toml\n");
+        ctx(&dir, "rustfmt.toml", "# unused\n");
+        ctx(&dir, "other.txt", "o");
+        let dsl = "FROM alpine\nADD rustfmt.toml other.txt /x/\n";
+        let f = parse(dsl).unwrap();
+        let err = derived_file_set(&f.targets[0], &dir).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("rustfmt.toml") && text.contains(".dockerignore"),
+            "expected the explicit+ignored source to be named:\n{text}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
