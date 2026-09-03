@@ -267,6 +267,18 @@ impl RegistryClient {
         Ok((digest, body.to_vec()))
     }
 
+    /// Resolve `repo:tag` to its manifest digest (pins an unpinned external
+    /// base for identity). Returns the `Docker-Content-Digest`.
+    pub async fn resolve_digest(&self, repo: &str, tag: &str) -> Result<String, String> {
+        let (digest, _) = self.get_manifest(repo, tag).await?;
+        if digest.is_empty() {
+            return Err(format!(
+                "registry did not return a Docker-Content-Digest for {repo}:{tag}"
+            ));
+        }
+        Ok(digest)
+    }
+
     /// Resolve the image's `created` time (unix seconds) for `repo:tag`, if an
     /// OCI config `created` field is parseable.
     pub async fn get_config_created(&self, repo: &str, tag: &str) -> Result<Option<u64>, String> {

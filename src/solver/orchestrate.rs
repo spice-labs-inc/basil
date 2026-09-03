@@ -6,18 +6,74 @@ use crate::identity::closure::{BaseResolver, compute_closure, hex};
 use serde_json::Value as Json;
 use std::collections::HashMap;
 
-/// Resolver used by the CLI until the registry client lands (Phase 8): scratch
-/// and pinned bases resolve offline; unpinned external bases are an error.
-struct CliResolver;
-impl BaseResolver for CliResolver {
-    fn resolve(&mut self, raw: &str, _tag: Option<&str>, digest: Option<&str>) -> Result<String, String> {
+/// Resolver backed by a pre-resolved map of external base -> manifest digest.
+/// Unpinned external bases are resolved against their registry in an async
+/// pre-pass (see [`resolve_unpinned_bases`]), then looked up here. Pinned and
+/// `scratch` bases resolve textually.
+struct RegistryResolver {
+    resolved: HashMap<String, String>,
+}
+impl BaseResolver for RegistryResolver {
+    fn resolve(&mut self, raw: &str, tag: Option<&str>, digest: Option<&str>) -> Result<String, String> {
         if raw == "scratch" {
             return Ok("scratch-empty".to_string());
         }
-        digest.map(|d| d.to_string()).ok_or_else(|| {
-            format!("unpinned base `{raw}`: pin it with @sha256:... (registry resolution not wired yet)")
-        })
+        if let Some(d) = digest {
+            return Ok(d.to_string());
+        }
+        let key = match tag {
+            Some(t) => format!("{raw}:{t}"),
+            None => raw.to_string(),
+        };
+        self.resolved
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| format!("unpinned base `{raw}`: could not resolve via registry"))
     }
+}
+
+/// Build a resolver by resolving every unpinned external base found in
+/// `targets` against its registry. This turns `<host>/<repo>:<tag>` into its
+/// pinned manifest digest so identity is computed over a real, current digest.
+/// `scratch` and already-pinned bases are left untouched.
+async fn resolve_unpinned_bases(targets: &[crate::dsl::ast::Target]) -> HashMap<String, String> {
+    let mut resolved = HashMap::new();
+    for t in targets {
+        let b = &t.base;
+        if b.raw == "scratch" || b.digest.is_some() {
+            continue;
+        }
+        // Build the registry base_url for host/repo, default tag latest.
+        let Some((host, rest)) = b.raw.split_once('/') else {
+            // Single-word base like `alpine` — dockerd default registry. Skip
+            // for now (no Docker Hub metadata resolution); leave to error.
+            continue;
+        };
+        let repo = rest.rsplit_once(':').map(|(r, _)| r).unwrap_or(rest);
+        let tag = b.tag.clone().unwrap_or_else(|| "latest".to_string());
+        let base = crate::solver::registry::ImageRef {
+            host: host.to_string(),
+            repo: repo.to_string(),
+            tag: tag.clone(),
+        }
+        .base_url();
+        let client = crate::solver::registry::RegistryClient::new(&base);
+        let raw = &b.raw;
+        match client.resolve_digest(&repo, &tag).await {
+            Ok(digest) => {
+                tracing::info!("resolved base `{raw}` -> {digest}");
+                // compute_closure passes tag=None when the DSL base has no
+                // explicit tag, so it looks up by `raw` alone; store that key
+                // (and the raw:tag form for the explicit-tag path).
+                resolved.insert(raw.clone(), digest.clone());
+                resolved.insert(format!("{raw}:{tag}"), digest);
+            }
+            Err(e) => {
+                tracing::warn!("could not resolve unpinned base `{raw}`: {e}");
+            }
+        }
+    }
+    resolved
 }
 
 /// Inputs to a build.
@@ -117,12 +173,14 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         ));
     }
 
+    let resolved = resolve_unpinned_bases(&parsed.targets).await;
+    let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
         &parsed.targets,
         &parsed.default_platforms,
         inp.context,
         &HashMap::new(),
-        &mut CliResolver,
+        &mut resolver,
     )
     .map_err(anyhow::Error::msg)?;
     for name in &names {
@@ -248,12 +306,14 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     if let Some(version) = version_arg {
         build_args.insert("VERSION".to_string(), version);
     }
+    let resolved = resolve_unpinned_bases(&parsed.targets).await;
+    let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
         &parsed.targets,
         &parsed.default_platforms,
         inp.context,
         &build_args,
-        &mut CliResolver,
+        &mut resolver,
     )
     .map_err(anyhow::Error::msg)?;
 
