@@ -261,13 +261,13 @@ pub async fn build_deliverable(
     insecure: bool,
 ) -> anyhow::Result<()> {
     let containerfile = render_containerfile(targets, deliverable);
-    let cf_path = std::env::temp_dir().join(format!("basil-cf-{}", std::process::id()));
-    crate::fsctx::fs_err(std::fs::write(&cf_path, containerfile), &cf_path, "write")?;
 
     let tag_ref = format!("{deliverable}:{tag}");
 
     // Buildah's own output is streamed live to the terminal so the user sees
-    // STEP n/n progress; status lines give the phase context.
+    // STEP n/n progress; status lines give the phase context. The Containerfile
+    // is fed on stdin (`-f -`) — no temp file is written to or removed from the
+    // context/repo.
     println!("basil: build {deliverable}:{tag}");
     let mut cmd = tokio::process::Command::new("buildah");
     cmd.arg("build")
@@ -275,8 +275,8 @@ pub async fn build_deliverable(
         .arg("-t")
         .arg(&tag_ref)
         .arg("-f")
-        .arg(&cf_path)
-        .stdin(std::process::Stdio::inherit())
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
     // buildah's `build` parses `--build-arg` as a flag only before the trailing
@@ -303,11 +303,22 @@ pub async fn build_deliverable(
         cmd.arg("--ssh");
     }
     cmd.arg(context);
-    let status = cmd
-        .status()
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawning buildah build: {e}"))?;
+    // Feed the Containerfile on stdin and close it so buildah sees EOF.
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(containerfile.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("writing Containerfile to buildah stdin: {e}"))?;
+        drop(stdin);
+    }
+    let status = child
+        .wait()
         .await
         .map_err(|e| anyhow::anyhow!("running buildah build: {e}"))?;
-    std::fs::remove_file(&cf_path).ok();
     if !status.success() {
         anyhow::bail!("buildah build failed (exit {})", status);
     }
@@ -394,10 +405,9 @@ async fn extract_outputs(
         let image = if stage == deliverable {
             image_ref.to_string()
         } else {
-            // Intermediate stage: build it as its own image via --target.
-            let cf_path = std::env::temp_dir().join(format!("basil-out-{}", std::process::id()));
+            // Intermediate stage: build it as its own image via --target. The
+            // Containerfile is fed on stdin (`-f -`); no temp file is written.
             let containerfile = render_containerfile_all(targets);
-            crate::fsctx::fs_err(std::fs::write(&cf_path, containerfile), &cf_path, "write")?;
             let local_img = format!("basil-output-{}", std::process::id());
             let mut build = tokio::process::Command::new("buildah");
             build.arg("build")
@@ -407,16 +417,26 @@ async fn extract_outputs(
                 .arg("-t")
                 .arg(&local_img)
                 .arg("-f")
-                .arg(&cf_path)
+                .arg("-")
                 .arg(context)
-                .stdin(std::process::Stdio::inherit())
+                .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit());
-            let status = build
-                .status()
+            let mut child = build
+                .spawn()
+                .map_err(|e| anyhow::anyhow!("spawning buildah build (OUTPUT {stage}): {e}"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                stdin
+                    .write_all(containerfile.as_bytes())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("writing Containerfile to stdin (OUTPUT {stage}): {e}"))?;
+                drop(stdin);
+            }
+            let status = child
+                .wait()
                 .await
-                .map_err(|e| anyhow::anyhow!("buildah build (OUTPUT stage {stage}): {e}"))?;
-            std::fs::remove_file(&cf_path).ok();
+                .map_err(|e| anyhow::anyhow!("buildah build (OUTPUT {stage}): {e}"))?;
             if !status.success() {
                 anyhow::bail!("buildah build for OUTPUT stage `{stage}` failed (exit {status})");
             }
