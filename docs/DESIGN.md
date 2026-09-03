@@ -94,8 +94,7 @@ ON image-published  DO notify smoke
 - **Selector** — the event token may take an optional value that refines the
   match: `ON push(main)` matches a push to branch `main`
   (`ref` == `refs/heads/main`); `ON push(main, develop)` matches either; a bare
-  `ON push` matches any branch push. Exact match today; glob patterns are a
-  later extension.
+  `ON push` matches any branch push (exact match; no glob selectors).
 - Within one reaction, `BUILD` targets build first, then the `DO`'d tasks run.
   Both lists are optional (`BUILD`-only, `DO`-only, or both).
 
@@ -226,7 +225,9 @@ require it:
 - **Execution**: basil renders the target graph to a multi-stage Containerfile
   and runs `buildah build --layers` (a plain subprocess over rootless
   containers/storage + runc/crun), then `buildah push`. No daemon, no graph
-  protocol, no tunnel.
+  protocol, no tunnel. **buildah is the only execution backend** — basil no
+  longer depends on buildkit/buildkitd, an LLB emitter, a gateway bridge, or a
+  vendored proto/tonic stack.
 - **Identity**: basil still computes each target's `tagHash` from `derivedData`
   + `programHash` + bases + args (a derived content hash it owns), and pushes
   under `<name>:<tagHash>`. Config (`ENV`/`CMD`/`ENTRYPOINT`/…) is written
@@ -317,10 +318,8 @@ a target's image. Promotion is not a new verb: it is `ON tag BUILD <target>…`
 pushes images). But **`TASK`s produce no image, so they cannot re-trigger an
 `image-published` event — no loop is possible from a `TASK`.** An
 `image-published` reaction therefore never causes further image production; it
-only runs side-effect `TASK`s. If the DSL later supports a build reaction that
-yields/republishes an image, the guard that was previously required would
-reapply: abort if the event's image identity equals the target image being
-produced. Until that form exists, no guard is needed.
+only runs side-effect `TASK`s. (The token is not yet wired to a native carrier,
+so it never matches today.)
 
 ## `TASK` → semantics
 

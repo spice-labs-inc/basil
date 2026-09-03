@@ -1,7 +1,7 @@
-//! The basil DSL: a Dockerfile superset plus `TASK`, `PLATFORM`, and top-level
-//! `ON` reactions.
+//! The basil DSL: a Dockerfile superset plus `TASK`, `PLATFORM`, `OUTPUT`, and
+//! top-level `ON` reactions.
 //!
-//! Phase 1: lexer + parser + AST. See `docs/PLAN.md` Phase 1.
+//! Lexer + parser + AST.
 
 pub mod ast;
 pub mod lexer;

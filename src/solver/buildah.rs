@@ -2,9 +2,9 @@
 //! Containerfile to `buildah build` (plain subprocess, no daemon), then tag +
 //! push via `buildah push`.
 //!
-//! See docs/DESIGN-buildah-backend.md. The DSL is rendered back to a
-//! multi-stage Containerfile whose final stage is the deliverable; `ON`/`TASK`/
-//! `PLATFORM` are omitted (side-effects / matching live in basil, not the image).
+//! The DSL is rendered back to a multi-stage Containerfile whose final stage is
+//! the deliverable; `ON`/`TASK`/`PLATFORM`/`OUTPUT` are omitted (side-effects /
+//! matching / reverse-copy live in basil, not the image).
 
 use crate::dsl::ast::{BaseImage, Command, Instruction, Mount, Target};
 
