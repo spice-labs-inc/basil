@@ -204,6 +204,7 @@ Whether an image is rebuilt is decided by whether that tag already exists (the
 basil closure [FILE] [TARGET] [--context DIR]   # report each target's tagHash
 basil build [FILE] [--context DIR] [-t TARGET]  # build a deliverable directly (no event)
 basil handle [FILE] [--context DIR] [--event F] # read an event (stdin or -F) and react
+basil pin [FILE]                               # resolve unpinned bases to @sha256 in place
 basil gc <AGE> [FILE] [--repo FQ] [--dry-run]   # prune basil-owned tags older than <AGE>
 ```
 
@@ -211,6 +212,10 @@ basil gc <AGE> [FILE] [--repo FQ] [--dry-run]   # prune basil-owned tags older t
   deliverable.
 - **`handle`** reads the event JSON from stdin (or `--event`), matches `ON`
   reactions, builds/promotes, runs `DO` tasks and `OUTPUT`s.
+- **`pin`** resolves every unpinned **external** image base to `@sha256` and
+  rewrites the file in place. Internal stage refs (`FROM <stage>`), `scratch`,
+  and already-pinned bases are left untouched; each distinct base is resolved
+  once. Idempotent — re-running it reports "no unpinned bases".
 - **`gc`** prunes only basil's own ephemeral tags (`cache-*`, content tags);
   version tags (`vX.Y.Z`) are never pruned. `--dry-run` lists without deleting.
 - `AGE` uses an integer plus unit: `h`, `d`, `w`, `y` (`30d`, `4w`, `1y`).

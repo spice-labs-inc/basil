@@ -3,5 +3,6 @@
 pub mod buildah;
 pub mod gc;
 pub mod orchestrate;
+pub mod pin;
 pub mod promote;
 pub mod registry;

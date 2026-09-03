@@ -17,6 +17,8 @@ pub enum Command {
     Build(BuildArgs),
     /// Read an event from stdin (or --event) and run the matching reactions.
     Handle(HandleArgs),
+    /// Resolve unpinned image bases to @sha256 and rewrite the file to pin them.
+    Pin(PinArgs),
     /// Prune basil-owned registry tags older than a given age.
     Gc(GcArgs),
 }
@@ -57,6 +59,13 @@ pub struct HandleArgs {
     /// Path to an event JSON file; read stdin if absent.
     #[arg(long)]
     pub event: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct PinArgs {
+    /// The DSL file to pin (rewritten in place).
+    #[arg(default_value = "Basilfile")]
+    pub file: String,
 }
 
 #[derive(clap::Args)]

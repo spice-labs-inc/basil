@@ -99,6 +99,23 @@ fn main() -> anyhow::Result<()> {
             })?;
             Ok(())
         }
+        Command::Pin(args) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                let src = std::fs::read_to_string(&args.file)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {}", args.file, e))?;
+                let pinned = basil::solver::pin::pin_file(&src).await.map_err(anyhow::Error::msg)?;
+                if pinned == src {
+                    println!("basil: no unpinned bases in {}", args.file);
+                } else {
+                    std::fs::write(&args.file, pinned)
+                        .map_err(|e| anyhow::anyhow!("writing {}: {}", args.file, e))?;
+                    println!("basil: pinned bases in {}", args.file);
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        }
         Command::Gc(args) => {
             // gc is registry-only; it needs no builder connection.
             let rt = tokio::runtime::Runtime::new()?;
