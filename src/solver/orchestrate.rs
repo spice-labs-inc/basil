@@ -29,37 +29,42 @@ pub struct BuildInput<'a> {
 }
 async fn promote_on_tag(
     matched: &[&crate::dsl::ast::Reaction],
+    payload: &Json,
     event_ref: &str,
     closures: &HashMap<String, [u8; 32]>,
 ) -> anyhow::Result<()> {
-    let Some((qual_target, version)) = crate::solver::promote::extract_version(event_ref) else {
-        return Ok(()); // not a version tag event
-    };
-    tracing::info!("promotion: tag `{event_ref}` -> version v{version}");
+    use crate::dsl::ast::EventToken;
 
-    // Deliverable names to promote: the BUILD list of the matching reactions,
-    // restricted to the qualified target when the tag names one.
-    let mut promoted: Vec<String> = Vec::new();
+    // Promote each Tag/Release reaction that carries a version. A bare push/PR
+    // reaction has no version -> nothing to promote.
+    let mut promoted: Vec<(String, String)> = Vec::new(); // (name, version)
     for r in matched.iter().copied() {
-        if r.event.token != crate::dsl::ast::EventToken::Tag {
+        let token = &r.event.token;
+        if !matches!(token, EventToken::Tag | EventToken::Release) {
             continue;
         }
+        let Some((qual_target, version)) =
+            crate::solver::promote::event_version(token, payload, event_ref)
+        else {
+            continue;
+        };
+        tracing::info!("promotion: {token:?} -> version v{version}");
         for b in &r.build {
             if let Some(qt) = &qual_target {
                 // `target-vX.Y.Z` promotes only target `q`.
                 if b.as_str() == qt.as_str() || b.split('/').last() == Some(qt.as_str()) {
-                    promoted.push(b.clone());
+                    promoted.push((b.clone(), version.clone()));
                 }
             } else {
-                promoted.push(b.clone());
+                promoted.push((b.clone(), version.clone()));
             }
         }
     }
     promoted.sort();
     promoted.dedup();
 
-    for name in promoted {
-        let tag_hash = closures.get(&name).map(|t| crate::identity::closure::hex(t)).unwrap_or_default();
+    for (name, version) in &promoted {
+        let tag_hash = closures.get(name).map(|t| crate::identity::closure::hex(t)).unwrap_or_default();
         let Some((host, rest)) = name.split_once('/') else {
             tracing::warn!("promote: `{name}` not a qualified reference");
             continue;
@@ -228,7 +233,19 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     }
 
     let mut build_args = HashMap::new();
-    if let Some((_, version)) = crate::solver::promote::extract_version(&event_ref) {
+    // Thread a VERSION build-arg when a Tag/Release reaction carries one (from
+    // the git tag ref or the release tag_name). Only targets that reference it
+    // consume it in their identity.
+    use crate::dsl::ast::EventToken;
+    let version_arg = matched.iter().find_map(|r| {
+        if matches!(r.event.token, EventToken::Tag | EventToken::Release) {
+            crate::solver::promote::event_version(&r.event.token, &event_payload, &event_ref)
+                .map(|(_, v)| v)
+        } else {
+            None
+        }
+    });
+    if let Some(version) = version_arg {
         build_args.insert("VERSION".to_string(), version);
     }
     let closures = compute_closure(
@@ -255,7 +272,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             )
             .await?;
         }
-        promote_on_tag(&matched, &event_ref, &closures).await?;
+        promote_on_tag(&matched, &event_payload, &event_ref, &closures).await?;
         println!("basil: done ({})", deliverable_names.join(", "));
         return Ok(vec![
             ("result".to_string(), "idempotent-skip".to_string()),
@@ -284,7 +301,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         .await?;
     }
 
-    promote_on_tag(&matched, &event_ref, &closures).await?;
+    promote_on_tag(&matched, &event_payload, &event_ref, &closures).await?;
     println!("basil: done ({})", deliverable_names.join(", "));
     Ok(vec![(
         "digest".to_string(),

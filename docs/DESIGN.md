@@ -266,6 +266,7 @@ require it:
   | `pr-merged` | `pull_request` | `action == "closed"` && `pull_request.merged == true` |
   | `push` | `push` | `ref` == `refs/heads/<selector>` (bare: any branch) |
   | `tag` | `push` | `ref` starts with `refs/tags/` |
+  | `release[(selector…)]` | `release` | any release; selectors narrow by `prerelease`/`draft` or `action` |
 
   Other events (e.g. `image-published`) are **deferred** — a native carrier
   exists (`registry_package`), but the mapping is not pinned yet.
@@ -275,15 +276,17 @@ require it:
 
 ## Promotion (version tags)
 
-A version-tag event (`v1.5.8`, `target-v1.2.3`) assigns a human version tag to
+A version event (`v1.5.8`, `target-v1.2.3`) assigns a human version tag to
 a target's image. Promotion is not a new verb: it is `ON tag BUILD <target>…`
-plus one extra tag on the result.
+(or `ON release …`) plus one extra tag on the result.
 
-- **Version extraction** — the event's git tag is parsed: `target-v1.2.3` names
-  target `target` with version `1.2.3`; a bare `v1.5.8` applies to every target
-  in that reaction's `BUILD` list.
+- **Version extraction** — the version comes from the event: a `tag` event
+  parses its git tag ref; a `release` event uses the release's `tag_name`. The
+  parsing is identical: `target-v1.2.3` names target `target` with version
+  `1.2.3`; a bare `v1.5.8` applies to every target in that reaction's `BUILD`
+  list.
 - **Version as input** — basil reserves `ARG VERSION` and passes
-  `--build-arg VERSION=<version>` when a `tag` event matches. Because identity
+  `--build-arg VERSION=<version>` when a `tag` or `release` event matches. Because identity
   is derived, only a target that actually references `VERSION` consumes it:
   - **Referenced** (`RUN go build -ldflags "-X main.version=$VERSION"`) — the
     version joins `args(T)` -> a fresh `tagHash` -> a real build -> the built

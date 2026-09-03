@@ -152,13 +152,17 @@ pub async fn build_deliverable(
         .arg(&tag_ref)
         .arg("-f")
         .arg(&cf_path)
-        .arg(context)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
+    // buildah's `build` parses `--build-arg` as a flag only before the trailing
+    // positional context arg; placing it after `.arg(context)` makes buildah
+    // treat it (and its value) as extra positional args and error. So emit
+    // build args before the context path.
     for (k, v) in build_args {
         cmd.arg("--build-arg").arg(format!("{k}={v}"));
     }
+    cmd.arg(context);
     let status = cmd
         .status()
         .await

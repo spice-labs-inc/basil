@@ -565,6 +565,7 @@ fn classify_token(token: &str) -> EventToken {
         "pr-merged" => EventToken::PrMerged,
         "push" => EventToken::Push,
         "tag" => EventToken::Tag,
+        "release" => EventToken::Release,
         t => EventToken::Custom(t.to_string()),
     }
 }

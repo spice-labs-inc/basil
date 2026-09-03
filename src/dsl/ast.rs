@@ -195,6 +195,9 @@ pub enum EventToken {
     PrMerged,
     Push,
     Tag,
+    /// A GitHub `release` event. Bare `ON release` matches any release; a
+    /// selector narrows it (e.g. `release(published)`, `release(prerelease)`).
+    Release,
     /// An unrecognized token (e.g. `image-published`), resolved later or deferred.
     Custom(String),
 }

@@ -81,6 +81,8 @@ fn docs_event_fixtures_match_their_tokens() {
         ("pr-opened", EventToken::PrOpened, &[], "docs/events/pull_request-opened.json"),
         ("pr-synchronized", EventToken::PrSynchronized, &[], "docs/events/pull_request-synchronize.json"),
         ("pr-merged", EventToken::PrMerged, &[], "docs/events/pull_request-merged.json"),
+        ("release", EventToken::Release, &[], "docs/events/release.json"),
+        ("release-published", EventToken::Release, &["published"], "docs/events/release.json"),
     ];
     for (name, tok, selectors, path) in cases {
         let raw = std::fs::read_to_string(path)

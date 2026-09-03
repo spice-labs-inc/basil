@@ -65,6 +65,7 @@ ON image-published     DO notify smoke
 | `pr-merged` | `pull_request` with `action == "closed"` and `merged == true` |
 | `push[(branch…)]` | push ref; bare match any branch, `push(main, develop)` match those |
 | `tag` | push ref starting with `refs/tags/` |
+| `release[(selector…)]` | a `release` event; bare matches **any** release, selectors narrow it (e.g. `release(published)`, `release(prerelease)`, `release(draft)`). Selectors match the `prerelease`/`draft` booleans or any `action` value |
 
 Other tokens (e.g. `image-published`) parse but are deferred (no native carrier
 yet).

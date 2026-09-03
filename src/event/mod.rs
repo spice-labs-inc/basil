@@ -23,6 +23,7 @@ pub fn reaction_matches(event: &EventToken, selectors: &[String], payload: &Valu
         EventToken::Tag => push_ref(payload)
             .map(|r| r.starts_with("refs/tags/"))
             .unwrap_or(false),
+        EventToken::Release => release_matches(payload, selectors),
         EventToken::Custom(_) => false,
     }
 }
@@ -55,6 +56,34 @@ fn push_matches(payload: &Value, selectors: &[String]) -> bool {
         return selectors.iter().any(|s| s == branch);
     }
     false
+}
+
+/// Whether a `release` event matches, optional selectors narrow it.
+///
+/// A `release` payload carries `action` (published/unpublished/created/edited/
+/// deleted/prereleased/released) plus a `release` object with `prerelease` and
+/// `draft` booleans. Bare `ON release` matches any release; selectors narrow by
+/// `action` value or by the `prerelease`/`draft` booleans.
+fn release_matches(payload: &Value, selectors: &[String]) -> bool {
+    // Must be a release event (has a `release` object) to be in scope.
+    if payload.get("release").is_none() {
+        return false;
+    }
+    if selectors.is_empty() {
+        return true; // bare `ON release` matches any release.
+    }
+    let action = payload_get(payload, &["action"]).and_then(Value::as_str).unwrap_or("");
+    let prerelease = payload_get(payload, &["release", "prerelease"])
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let draft = payload_get(payload, &["release", "draft"])
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    selectors.iter().any(|s| match s.as_str() {
+        "prerelease" => prerelease,
+        "draft" => draft,
+        other => action == other, // e.g. published, unpublished, created, released, deleted
+    })
 }
 
 /// The `action` of a `pull_request` event.
@@ -93,6 +122,38 @@ mod tests {
 
     fn sel(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn release(action: &str, tag_name: &str, prerelease: bool, draft: bool) -> Value {
+        json!({
+            "action": action,
+            "release": { "tag_name": tag_name, "prerelease": prerelease, "draft": draft },
+        })
+    }
+
+    #[test]
+    fn release_bare_matches_any() {
+        assert!(reaction_matches(&EventToken::Release, &sel(&[]), &release("published", "v1.0.0", false, false)));
+        assert!(reaction_matches(&EventToken::Release, &sel(&[]), &release("prereleased", "v1.0.0-rc.1", true, false)));
+        assert!(reaction_matches(&EventToken::Release, &sel(&[]), &release("created", "v1.0.0", false, true)));
+    }
+
+    #[test]
+    fn release_selector_narrows_by_action() {
+        assert!(reaction_matches(&EventToken::Release, &sel(&["published"]), &release("published", "v1.0.0", false, false)));
+        assert!(!reaction_matches(&EventToken::Release, &sel(&["published"]), &release("deleted", "v1.0.0", false, false)));
+    }
+
+    #[test]
+    fn release_selector_narrows_by_prerelease_or_draft() {
+        assert!(reaction_matches(&EventToken::Release, &sel(&["prerelease"]), &release("published", "v1.0.0-rc.1", true, false)));
+        assert!(!reaction_matches(&EventToken::Release, &sel(&["prerelease"]), &release("published", "v1.0.0", false, false)));
+        assert!(reaction_matches(&EventToken::Release, &sel(&["draft"]), &release("created", "v1.0.0", false, true)));
+    }
+
+    #[test]
+    fn release_non_event_is_not_matched() {
+        assert!(!reaction_matches(&EventToken::Release, &sel(&[]), &push("refs/heads/main")));
     }
 
     #[test]

@@ -14,6 +14,7 @@ is a full valid JSON payload, exactly as GitHub would deliver it to a workflow
 | `pull_request-synchronize.json` | `pr-synchronized` | `action: synchronize` |
 | `pull_request-merged.json` | `pr-merged` | `action: closed` + `pull_request.merged: true` |
 | `pull_request-closed.json` | (unmerged close) | `action: closed` + `merged: false` — *not* a merge |
+| `release.json` | `release` (bare, or `release(published)`) | `release` object with `action: published` |
 
 Notes:
 
