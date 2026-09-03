@@ -49,6 +49,9 @@ pub fn render_instruction(instr: &Instruction) -> String {
             let mounts: Vec<String> = r.mounts.iter().map(render_mount).collect();
             let mut parts = vec!["RUN".to_string()];
             parts.extend(mounts);
+            if let Some(net) = &r.network {
+                parts.push(format!("--network={net}"));
+            }
             parts.push(render_command(&r.command));
             parts.join(" ")
         }
@@ -196,6 +199,7 @@ mod tests {
             }),
             Instruction::Run(crate::dsl::ast::Run {
                 mounts: vec![],
+                network: None,
                 command: Command::Shell("echo hi".to_string()),
             }),
         ];
@@ -211,6 +215,7 @@ mod tests {
     fn arg_expansion_changes_program() {
         let instrs = vec![Instruction::Run(crate::dsl::ast::Run {
             mounts: vec![],
+            network: None,
             command: Command::Shell("go build -ldflags \"-X main.version=${VERSION}\"".to_string()),
         })];
         let nover = program_hash(&instrs, &empty_resolve);

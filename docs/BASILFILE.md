@@ -114,16 +114,23 @@ Like `COPY`; a URL source marks the target non-hermetic.
 
 ### `RUN`
 ```
-RUN [--mount=…] <command>
+RUN [--mount=…] [--network=<none|host|default>] <command>
 ```
 Executes a command during the build. Two forms:
 - shell form: `RUN echo hi`
 - exec form: `RUN ["echo", "hi"]`
 
-`--mount` specs parse and are tracked in identity (`--mount=type=bind|secret|
-ssh|cache[…target=…]`), but the buildah backend currently renders only the
-command itself — mounts are not yet applied. Use them knowing the build output
-won't honor them today.
+`--mount` and `--network` are rendered to buildah (which supports them):
+- `--mount=type=bind,source=…,target=…[,readonly]`
+- `--mount=type=cache[,id=…],target=…`
+- `--mount=type=secret,id=…[,target=…]` — the secret value is supplied via
+  `BASIL_SECRET_<ID>` (uppercased ID) pointing at the file; missing → error.
+- `--mount=type=ssh[,id=…]` — forwarded as `--ssh` (the agent).
+- `--network=none|host|default`.
+
+Known limitation: `--mount=type=bind` renders correctly but buildah 1.39
+rootless may fail it at runtime ("mount not really mounted"); cache/secret/ssh
+and `--network` work.
 
 ### `OUTPUT`
 ```

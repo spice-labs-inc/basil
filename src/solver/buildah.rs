@@ -6,7 +6,7 @@
 //! multi-stage Containerfile whose final stage is the deliverable; `ON`/`TASK`/
 //! `PLATFORM` are omitted (side-effects / matching live in basil, not the image).
 
-use crate::dsl::ast::{BaseImage, Command, Instruction, Target};
+use crate::dsl::ast::{BaseImage, Command, Instruction, Mount, Target};
 
 /// Render the deliverable's stage graph as a multi-stage Containerfile.
 /// `targets` is the topologically-ordered set; `deliverable` must be one of
@@ -104,10 +104,21 @@ fn render_instruction(i: &Instruction) -> String {
             s.push_str(&a.dest);
             s
         }
-        Instruction::Run(r) => match &r.command {
-            Command::Shell(sh) => format!("RUN {}", sh),
-            Command::Exec(args) => format!("RUN {}", serde_json::to_string(args).unwrap_or_default()),
-        },
+        Instruction::Run(r) => {
+            let mut s = "RUN".to_string();
+            for m in &r.mounts {
+                s.push_str(&format!(" --mount={}", render_mount(m)));
+            }
+            if let Some(net) = &r.network {
+                s.push_str(&format!(" --network={net}"));
+            }
+            s.push(' ');
+            s.push_str(&match &r.command {
+                Command::Shell(sh) => sh.clone(),
+                Command::Exec(args) => serde_json::to_string(args).unwrap_or_default(),
+            });
+            s
+        }
         Instruction::Cmd(c) => format!("CMD {}", render_command(c)),
         Instruction::Entrypoint(c) => format!("ENTRYPOINT {}", render_command(c)),
         Instruction::User(u) => format!("USER {u}"),
@@ -129,6 +140,72 @@ fn render_command(c: &Command) -> String {
         Command::Shell(s) => s.clone(),
         Command::Exec(args) => serde_json::to_string(args).unwrap_or_default(),
     }
+}
+
+fn render_mount(m: &Mount) -> String {
+    match m {
+        Mount::Bind { source, target, read_only } => {
+            let mut s = "type=bind".to_string();
+            if let Some(src) = source {
+                s.push_str(&format!(",source={src}"));
+            }
+            s.push_str(&format!(",target={target}"));
+            if *read_only {
+                s.push_str(",readonly");
+            }
+            s
+        }
+        Mount::Secret { id, target } => {
+            let mut s = format!("type=secret,id={id}");
+            if let Some(t) = target {
+                s.push_str(&format!(",target={t}"));
+            }
+            s
+        }
+        Mount::Ssh { id } => match id {
+            Some(i) => format!("type=ssh,id={i}"),
+            None => "type=ssh".to_string(),
+        },
+        Mount::Cache { id, target } => {
+            let mut s = format!("type=cache,target={target}");
+            if let Some(i) = id {
+                s.push_str(&format!(",id={i}"));
+            }
+            s
+        }
+    }
+}
+
+/// Secret-requesting RUN mounts (`type=secret,id=<id>`) for a deliverable.
+fn collect_mount_secrets(targets: &[Target], deliverable: &str) -> Vec<(String, ())> {
+    collect_mounts(targets, deliverable)
+        .into_iter()
+        .filter_map(|m| match m {
+            Mount::Secret { id, .. } => Some((id.clone(), ())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether any RUN mount uses `type=ssh` (needs the agent forwarded).
+fn collect_mount_ssh(targets: &[Target], deliverable: &str) -> bool {
+    collect_mounts(targets, deliverable)
+        .into_iter()
+        .any(|m| matches!(m, Mount::Ssh { .. }))
+}
+
+fn collect_mounts(targets: &[Target], deliverable: &str) -> Vec<Mount> {
+    targets
+        .iter()
+        .filter(|t| t.name == deliverable)
+        .flat_map(|t| {
+            t.instructions.iter().filter_map(|i| match i {
+                Instruction::Run(r) => Some(r.mounts.clone()),
+                _ => None,
+            })
+        })
+        .flatten()
+        .collect()
 }
 
 /// Build one deliverable with buildah. Write the Containerfile, run
@@ -167,6 +244,22 @@ pub async fn build_deliverable(
     // build args before the context path.
     for (k, v) in build_args {
         cmd.arg("--build-arg").arg(format!("{k}={v}"));
+    }
+    // Forward secrets/ssh requested by any RUN --mount in the deliverable.
+    // Secrets read BASIL_SECRET_<ID> (uppercased ID) for the value path;
+    // ssh defaults to the agent (no extra value needed). Emitted like build
+    // args, before the positional context.
+    for (id, _) in collect_mount_secrets(targets, deliverable) {
+        let env = format!("BASIL_SECRET_{}", id.to_uppercase());
+        let path = std::env::var(&env).map_err(|_| {
+            anyhow::anyhow!(
+                "RUN --mount=type=secret,id={id} needs `{env}` to point at the secret file"
+            )
+        })?;
+        cmd.arg("--secret").arg(format!("id={id},src={path}"));
+    }
+    if collect_mount_ssh(targets, deliverable) {
+        cmd.arg("--ssh");
     }
     cmd.arg(context);
     let status = cmd
@@ -361,6 +454,15 @@ ON push(main) BUILD 127.0.0.1:5001/app\n";
         assert!(cf.contains("COPY --from=build /bin/app /app"));
         assert!(cf.contains("CMD [\"/app\"]"));
         assert!(!cf.contains("ON push"));
+    }
+
+    #[test]
+    fn renders_run_mounts_and_network() {
+        let src = "FROM alpine AS 127.0.0.1:5001/app\n\
+RUN --mount=type=cache,target=/cache --network=none echo hi\n";
+        let f = parse(src).unwrap();
+        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        assert!(cf.contains("RUN --mount=type=cache,target=/cache --network=none echo hi"), "{cf}");
     }
 
     #[test]

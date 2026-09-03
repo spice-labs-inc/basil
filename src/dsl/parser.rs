@@ -354,6 +354,7 @@ impl Parser {
             return self.err(line, "RUN heredocs (<<EOF) are deferred in basil v1");
         }
         let mut mounts = Vec::new();
+        let mut network = None;
         let mut command_text = rest.trim().to_string();
         loop {
             let t = command_text.trim_start();
@@ -362,7 +363,13 @@ impl Parser {
                 mounts.push(self.parse_mount(&spec, line)?);
                 command_text = rest2;
             } else if t.starts_with("--network=") {
-                return self.err(line, "RUN --network is deferred in basil v1");
+                let val = t.trim_start_matches("--network=").split_whitespace().next().unwrap_or("").to_string();
+                if !matches!(val.as_str(), "none" | "host" | "default") {
+                    return self.err(line, format!("unsupported RUN --network value `{val}`"));
+                }
+                network = Some(val);
+                let rest3 = t.trim_start_matches("--network=").trim_start_matches(&network.clone().unwrap()).to_string();
+                command_text = rest3;
             } else if t.starts_with("--security=") {
                 return self.err(line, "RUN --security is deferred in basil v1");
             } else if t.starts_with("--") {
@@ -375,7 +382,7 @@ impl Parser {
             return self.err(line, "RUN requires a command");
         }
         let command = self.parse_command(&command_text, line)?;
-        Ok(Instruction::Run(Run { mounts, command }))
+        Ok(Instruction::Run(Run { mounts, network, command }))
     }
 
     fn parse_mount(&self, spec: &str, line: usize) -> Result<Mount, Error> {
@@ -970,10 +977,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_run_network() {
+    fn parses_run_network() {
         let src = "FROM alpine\nRUN --network=host echo hi\n";
-        let e = parse(src).unwrap_err();
-        assert!(e.message.contains("--network"), "{}", e.message);
+        let f = parse(src).unwrap();
+        let Instruction::Run(r) = &f.targets[0].instructions[0] else {
+            panic!("expected RUN");
+        };
+        assert_eq!(r.network.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn rejects_run_network_bad_value() {
+        let e = parse("FROM alpine\nRUN --network=bogus echo hi\n").unwrap_err();
+        assert!(e.message.contains("--network value"), "{}", e.message);
+    }
+
+    #[test]
+    fn rejects_run_security() {
+        let e = parse("FROM alpine\nRUN --security=insecure echo hi\n").unwrap_err();
+        assert!(e.message.contains("--security"), "{}", e.message);
     }
 
     #[test]

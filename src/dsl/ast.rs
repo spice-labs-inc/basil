@@ -126,10 +126,12 @@ pub struct Add {
     pub dest: String,
 }
 
-/// `RUN [--mount=type=...] <command>`.
+/// `RUN [--mount=...] <command>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
     pub mounts: Vec<Mount>,
+    /// `RUN --network=<none|host|default>`.
+    pub network: Option<String>,
     pub command: Command,
 }
 
