@@ -256,6 +256,32 @@ pub fn derived_data_digest(target: &Target, context: &Path) -> anyhow::Result<[u
     snapshot_digest(&files, context)
 }
 
+/// Compute `derivedData(T)` and the total context bytes it reads, in one walk
+/// (avoids re-deriving the file set twice when the caller wants both).
+pub fn derived_data_digest_and_bytes(
+    target: &Target,
+    context: &Path,
+) -> anyhow::Result<([u8; 32], u64)> {
+    let files = derived_file_set(target, context)?;
+    let mut total = 0u64;
+    for rel in &files {
+        if rel.starts_with('<') {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(context.join(rel)) {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    Ok((snapshot_digest(&files, context)?, total))
+}
+
+/// Total bytes of the context files a target's derived-data reads. Used to
+/// warn when a build hashes a large context (e.g. an unexcluded big blob).
+pub fn derived_data_bytes(target: &Target, context: &Path) -> anyhow::Result<u64> {
+    let (_, b) = derived_data_digest_and_bytes(target, context)?;
+    Ok(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

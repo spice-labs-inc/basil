@@ -194,8 +194,17 @@ pub fn compute_closure(
 
 
             // Derive data (context files this target reads).
-            let derived = derived_data::derived_data_digest(target, context)
+            let (derived, bytes) = derived_data::derived_data_digest_and_bytes(target, context)
                 .map_err(|e| format!("deriving data for `{name}`: {e}"))?;
+            // Surface a large context so the operator knows what to dockerignore
+            // rather than silently hashing e.g. an unexcluded 512MB blob.
+            const LARGE_CONTEXT_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+            if bytes > LARGE_CONTEXT_BYTES {
+                tracing::warn!(
+                    "identity `{name}`: derived-data reads {:.0} MiB of context (100 MiB+) — check .dockerignore for large blobs",
+                    bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
 
             // Program hash with ARG/ENV expansion.
             let vctx = VarCtx {
