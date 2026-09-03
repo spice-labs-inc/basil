@@ -1,0 +1,12 @@
+# TODO
+
+- Systematically add anyhow error contexts to every file/filesystem access site
+  (std::fs::read_to_string, File::open, write, read_dir, metadata, canonicalize,
+  create_dir, remove_file, glob), with the filename in the context. Make the
+  context a structured map and use the key `filename`, so every file error
+  reports which file it relates to (not bare "Permission denied (os error 13)").
+  Sites: src/main.rs (rc file reads/writes), src/solver/orchestrate.rs
+  (Basilfile read), src/solver/buildah.rs (containerfile write/remove, output
+  dirs, rename), src/solver/registry.rs (auth config read),
+  src/identity/derived_data.rs (context walk/digest), src/identity/dockerignore.rs
+  (dockerignore read).

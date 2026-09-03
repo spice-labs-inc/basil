@@ -196,7 +196,15 @@ fn snapshot_digest(files: &BTreeSet<String>, context: &Path) -> anyhow::Result<[
             let full = context.join(rel);
             let meta = match std::fs::metadata(&full) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) => {
+                    // A file that was walked into the set but can't be read now
+                    // (e.g. permission denied on open). Surface the path so the
+                    // operator knows what to fix/dockertignore.
+                    return Err(anyhow::anyhow!(
+                        "reading context file `{rel}` ({}): {e}",
+                        full.display()
+                    ));
+                }
             };
             let mut header = tar::Header::new_ustar();
             header.set_uid(0);
@@ -208,23 +216,24 @@ fn snapshot_digest(files: &BTreeSet<String>, context: &Path) -> anyhow::Result<[
                 if !name.ends_with('/') {
                     name.push('/');
                 }
-                header.set_path(&name).map_err(|e| anyhow::anyhow!("{e}"))?;
+                header.set_path(&name).map_err(|e| anyhow::anyhow!("{rel}: {e}"))?;
                 header.set_mode(0o755);
                 builder
                     .append_data(&mut header, &name, std::io::empty())
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{rel}: {e}"))?;
             } else {
                 header.set_entry_type(tar::EntryType::Regular);
-                header.set_path(rel).map_err(|e| anyhow::anyhow!("{e}"))?;
+                header.set_path(rel).map_err(|e| anyhow::anyhow!("{rel}: {e}"))?;
                 header.set_size(meta.len());
                 header.set_mode(0o644);
-                let mut f = std::fs::File::open(&full).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let mut f = std::fs::File::open(&full)
+                    .map_err(|e| anyhow::anyhow!("reading context file `{rel}` ({}): {e}", full.display()))?;
                 builder
                     .append_data(&mut header, rel, &mut f)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{rel}: {e}"))?;
             }
         }
-        builder.finish().map_err(|e| anyhow::anyhow!("{e}"))?;
+        builder.finish().map_err(|e| anyhow::anyhow!("building context tar: {e}"))?;
     }
 
     // gzip at a fixed level (6) for determinism.
