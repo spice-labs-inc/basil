@@ -107,6 +107,7 @@ async fn promote_on_tag(
     payload: &Json,
     event_ref: &str,
     closures: &HashMap<String, [u8; 32]>,
+    targets: &[crate::dsl::ast::Target],
 ) -> anyhow::Result<()> {
     use crate::dsl::ast::EventToken;
 
@@ -139,15 +140,22 @@ async fn promote_on_tag(
     promoted.dedup();
 
     for (name, version) in &promoted {
+        // Resolve the build entry to its push ref (register, else name) so the
+        // version tag is set where the content is published.
+        let push_ref = targets
+            .iter()
+            .find(|t| &t.name == name || t.register.as_ref() == Some(name))
+            .map(|t| t.push_ref().to_string())
+            .unwrap_or_else(|| name.clone());
         let tag_hash = digest_of(name, closures)?;
-        let ir = crate::solver::registry::parse_ref(name, "")
-            .map_err(|e| anyhow::anyhow!("promote `{name}`: {e}"))?;
+        let ir = crate::solver::registry::parse_ref(&push_ref, "")
+            .map_err(|e| anyhow::anyhow!("promote `{push_ref}`: {e}"))?;
         let client = ir.client();
         let src = format!("{}:{tag_hash}", ir.repo);
         match client.retag(&ir.repo, &tag_hash, &format!("v{version}")).await {
-            Ok(d) => tracing::info!("promote `{name}:{src}` -> v{version} (digest {})", &d[..d.len().min(24)]),
+            Ok(d) => tracing::info!("promote `{push_ref}:{src}` -> v{version} (digest {})", &d[..d.len().min(24)]),
             Err(e) => {
-                anyhow::bail!("promotion immutability/retag failure for `{name}:v{version}`: {e}")
+                anyhow::bail!("promotion immutability/retag failure for `{push_ref}:v{version}`: {e}")
             }
         }
     }
@@ -165,39 +173,51 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     println!("basil: parsed {}", inp.file);
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
 
-    // Qualified deliverable targets are those named as image refs (host/repo).
-    let qualified: Vec<&str> = parsed
+    // A target is a deliverable if it names a registry ref directly (qualified
+    // name) or declares a `REGISTER` full ref. Each is tracked as
+    // (stage name, push ref) — the stage is addressed by `name`; the image is
+    // pushed/looked up by `push_ref` (register, else name).
+    let deliverable_entries: Vec<(String, String)> = parsed
         .targets
         .iter()
-        .filter(|t| t.name.split('/').count() >= 2)
-        .map(|t| t.name.as_str())
+        .filter(|t| is_deliverable(t))
+        .map(|t| (t.name.clone(), t.push_ref().to_string()))
         .collect();
-    let names: Vec<String> = match inp.target_filter {
-        Some(t) => vec![t.clone()],
-        None => qualified.into_iter().map(|s| s.to_string()).collect(),
-    };
-    // With -t <name>, the target must actually exist in the file (by its AS
-    // name). A typo ('-t fennel' when the deliverable is 'localhost:5001/fennel')
-    // errors clearly instead of silently computing nothing.
-    if let Some(t) = &inp.target_filter {
-        if !parsed.targets.iter().any(|x| x.name.as_str() == t.as_str()) {
-            return Err(anyhow::anyhow!(
-                "target `{t}` not found in {} (known: {})",
-                inp.file,
-                parsed
-                    .targets
-                    .iter()
-                    .map(|x| x.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+    // With -t <key>, find the target by its AS name OR its REGISTER ref, so both
+    // `-t fennel` and `-t 127.0.0.1:5001/fennel` build the same deliverable.
+    let deliverables: Vec<(String, String)> = match &inp.target_filter {
+        Some(key) => {
+            let t = parsed
+                .targets
+                .iter()
+                .find(|x| x.name.as_str() == key.as_str() || x.register.as_deref() == Some(key.as_str()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "target `{key}` not found in {} (known: {})",
+                        inp.file,
+                        parsed
+                            .targets
+                            .iter()
+                            .map(|x| format!("{}({})", x.name, x.push_ref()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            if !is_deliverable(t) {
+                return Err(anyhow::anyhow!(
+                    "target `{key}` is not a deliverable: give it a qualified name or a `REGISTER` ref"
+                ));
+            }
+            vec![(t.name.clone(), t.push_ref().to_string())]
         }
-    }
-    if names.is_empty() {
+        None => deliverable_entries,
+    };
+    if deliverables.is_empty() {
         return Err(anyhow::anyhow!(
             "no deliverable target to build: pass -t <target> or name a deliverable as a qualified image reference"
         ));
     }
+    let names: Vec<String> = deliverables.iter().map(|(n, _)| n.clone()).collect();
 
     // Only compute identity for the stages the build actually needs. With
     // -t <target>, that's the target + its transitive FROM / COPY --from stage
@@ -236,14 +256,14 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     // If the content tag already exists in the registry, the exact image is
     // already published — don't rebuild (parity with handle_event's idempotent
     // check).
-    let idempotent_skip = idempotent_all_exist(&names, &closures).await?;
+    let idempotent_skip = idempotent_all_exist(&deliverables, &closures).await?;
     if idempotent_skip {
         println!("basil: content tags already published -- no build (idempotent check)");
-        for name in &names {
+        for (name, push_ref) in &deliverables {
             // OUTPUT still runs: pull the published image and extract.
             let tag = digest_of(name, &closures)?;
             crate::solver::buildah::extract_outputs_from_image(
-                &format!("{name}:{tag}"),
+                &format!("{push_ref}:{tag}"),
                 inp.context,
                 &subset,
                 name,
@@ -255,14 +275,15 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         return Ok(out);
     }
 
-    for name in &names {
+    for (name, push_ref) in &deliverables {
         let tag = digest_of(name, &closures)?;
-        let insecure = crate::solver::registry::parse_ref(name, &tag)
+        let insecure = crate::solver::registry::parse_ref(push_ref, &tag)
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
             &subset,
             name,
+            push_ref,
             &tag,
             inp.context,
             &HashMap::new(),
@@ -375,14 +396,24 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         .unwrap_or("")
         .to_string();
 
-    let mut deliverable_names: Vec<String> = Vec::new();
+    // Resolve each `BUILD` entry to the target's (stage name, push ref). An
+    // entry may be the stage name (`fennel`) or its REGISTER ref; either way the
+    // image is pushed/looked up by the push ref.
+    let mut deliverables: Vec<(String, String)> = Vec::new();
     for r in &matched {
         for b in &r.build {
-            if !deliverable_names.contains(b) {
-                deliverable_names.push(b.clone());
+            let t = parsed
+                .targets
+                .iter()
+                .find(|t| &t.name == b || t.register.as_ref() == Some(b));
+            let entry = t.map(|t| (t.name.clone(), t.push_ref().to_string()))
+                .unwrap_or_else(|| (b.clone(), b.clone()));
+            if !deliverables.contains(&entry) {
+                deliverables.push(entry);
             }
         }
     }
+    let deliverable_names: Vec<String> = deliverables.iter().map(|(n, _)| n.clone()).collect();
     if matched.is_empty() {
         return Err(anyhow::anyhow!("no matching reactions for the delivered event"));
     }
@@ -442,21 +473,21 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
     // Idempotent check: skip when every deliverable's content tag exists.
-    let idempotent_skip = idempotent_all_exist(&deliverable_names, &closures).await?;
+    let idempotent_skip = idempotent_all_exist(&deliverables, &closures).await?;
     if idempotent_skip {
         println!("basil: content tags already published -- no build (idempotent check)");
         // OUTPUT still runs on a skip: pull the published image and extract.
-        for name in &deliverable_names {
+        for (name, push_ref) in &deliverables {
             let tag = digest_of(name, &closures)?;
             crate::solver::buildah::extract_outputs_from_image(
-                &format!("{name}:{tag}"),
+                &format!("{push_ref}:{tag}"),
                 inp.context,
                 &parsed.targets,
                 name,
             )
             .await?;
         }
-        promote_on_tag(&matched, &event_payload, &event_ref, &closures).await?;
+        promote_on_tag(&matched, &event_payload, &event_ref, &closures, &parsed.targets).await?;
         println!("basil: done ({})", deliverable_names.join(", "));
         return Ok(vec![
             ("result".to_string(), "idempotent-skip".to_string()),
@@ -465,14 +496,15 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     }
 
     // Build each deliverable with buildah.
-    for name in &deliverable_names {
+    for (name, push_ref) in &deliverables {
         let tag = digest_of(name, &closures)?;
-        let insecure = crate::solver::registry::parse_ref(name, &tag)
+        let insecure = crate::solver::registry::parse_ref(push_ref, &tag)
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
             &parsed.targets,
             name,
+            push_ref,
             &tag,
             inp.context,
             &build_args,
@@ -481,7 +513,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         .await?;
     }
 
-    promote_on_tag(&matched, &event_payload, &event_ref, &closures).await?;
+    promote_on_tag(&matched, &event_payload, &event_ref, &closures, &parsed.targets).await?;
     println!("basil: done ({})", deliverable_names.join(", "));
     Ok(vec![(
         "digest".to_string(),
@@ -490,32 +522,39 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
 }
 
 /// Idempotent check: every deliverable's content tag already exists in its
-/// registry.
+/// registry. `deliverables` are `(stage name, push ref)`; the check looks up
+/// the push ref (the registry where content is published).
 async fn idempotent_all_exist(
-    names: &[String],
+    deliverables: &[(String, String)],
     closures: &std::collections::HashMap<String, [u8; 32]>,
 ) -> anyhow::Result<bool> {
     let mut all = true;
-    for name in names {
+    for (name, push_ref) in deliverables {
         let tag = digest_of(name, closures)?;
-        let ir = crate::solver::registry::parse_ref(name, &tag)
-            .map_err(|e| anyhow::anyhow!("deliverable `{name}`: {e}"))?;
+        let ir = crate::solver::registry::parse_ref(push_ref, &tag)
+            .map_err(|e| anyhow::anyhow!("deliverable `{push_ref}`: {e}"))?;
         let client = ir.client();
         match client.manifest_exists(&ir.repo, &tag).await {
             Ok(true) => {}
             Ok(false) => {
-                tracing::info!("idempotent: `{name}:{tag}` does not exist yet (will build)");
+                tracing::info!("idempotent: `{push_ref}:{tag}` does not exist yet (will build)");
                 all = false;
                 break;
             }
             Err(e) => {
-                tracing::warn!("idempotent registry check for `{name}:{tag}` failed: {e}");
+                tracing::warn!("idempotent registry check for `{push_ref}:{tag}` failed: {e}");
                 all = false;
                 break;
             }
         }
     }
     Ok(all)
+}
+
+/// Whether a target is a deliverable: it names a registry ref directly
+/// (qualified `name`), or declares a `REGISTER` full ref.
+fn is_deliverable(t: &crate::dsl::ast::Target) -> bool {
+    t.register.is_some() || t.name.split('/').count() >= 2
 }
 
 /// The `tagHash` for a built deliverable, or an error if its closure wasn't

@@ -27,6 +27,12 @@ pub struct Target {
     /// (e.g. `ghcr.io/mycompany/app`); otherwise it is an internal/task name.
     /// Whether a target is a deliverable is decided later by `BUILD` membership.
     pub name: String,
+    /// `REGISTER <fullname>` — the fully-qualified image ref this deliverable is
+    /// pushed to, when the target's `name` is a short stage name. When present
+    /// the target is addressed by `name` (stage ref, `-t`, `BUILD`) but pushed
+    /// to `register`. It does NOT fold into the tagHash — content keeps its
+    /// digest across registries — it only selects *where* to look up/push it.
+    pub register: Option<String>,
     /// The stage's base image.
     pub base: BaseImage,
     /// Build steps in source order (no `FROM`; the base is separate).
@@ -39,6 +45,16 @@ pub struct Target {
     pub platforms: Option<Vec<Platform>>,
     /// 1-based source line of the target's `FROM`.
     pub line: usize,
+}
+
+impl Target {
+    /// The fully-qualified image ref this target pushes to: `register` when
+    /// present, else `name`. Delivers the digest-independent location that
+    /// content is looked up at. The stage is addressed by `name`; this returns
+    /// where the result image is published.
+    pub fn push_ref(&self) -> &str {
+        self.register.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// The base of a target's `FROM`.

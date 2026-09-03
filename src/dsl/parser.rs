@@ -108,6 +108,12 @@ impl Parser {
                 "TASK" if current.is_none() => {
                     return self.err(line.number, "TASK must appear inside a target (after FROM)");
                 }
+                "REGISTER" if current.is_none() => {
+                    return self.err(
+                        line.number,
+                        "REGISTER must appear inside a target (after FROM)",
+                    );
+                }
                 _ if !is_known_or_deferred(kw) => {
                     return self.err(line.number, format!("unexpected directive `{kw}`"));
                 }
@@ -125,6 +131,15 @@ impl Parser {
                         target.task = Some(TaskCmd {
                             command: self.parse_command(rest, line.number)?,
                         });
+                    } else if kw == "REGISTER" {
+                        if target.register.is_some() {
+                            return self.err(line.number, "duplicate REGISTER in target");
+                        }
+                        let value = rest.trim();
+                        if value.is_empty() {
+                            return self.err(line.number, "REGISTER requires a full image ref");
+                        }
+                        target.register = Some(value.to_string());
                     } else {
                         self.parse_instruction(target, kw, rest, line.number)?;
                     }
@@ -179,6 +194,7 @@ impl Parser {
 
         Ok(Target {
             name: name.unwrap_or_else(|| raw.clone()),
+            register: None,
             base: BaseImage { raw, tag, digest, platform },
             instructions: Vec::new(),
             task: None,
@@ -510,6 +526,7 @@ fn is_known_or_deferred(kw: &str) -> bool {
             | "VOLUME"
             | "OUTPUT"
             | "TASK"
+            | "REGISTER"
             | "SHELL"
             | "STOPSIGNAL"
             | "HEALTHCHECK"
@@ -911,6 +928,37 @@ mod tests {
         let f = parse(src).unwrap();
         let t = &f.targets[0];
         assert!(matches!(&t.task, Some(TaskCmd { command: Command::Shell(s) }) if s == "notify-my-thing.sh"));
+    }
+
+    #[test]
+    fn parses_register_full_ref() {
+        // A short stage name plus a REGISTER full ref: addressed by `fennel`,
+        // pushed to the register ref.
+        let src = "FROM alpine AS fennel\nRUN echo hi\nREGISTER 127.0.0.1:5001/fennel\n";
+        let f = parse(src).unwrap();
+        let t = &f.targets[0];
+        assert_eq!(t.name, "fennel");
+        assert_eq!(t.register.as_deref(), Some("127.0.0.1:5001/fennel"));
+        assert_eq!(t.push_ref(), "127.0.0.1:5001/fennel");
+    }
+
+    #[test]
+    fn register_outside_target_is_error() {
+        let e = parse("REGISTER 127.0.0.1:5001/fennel\n").unwrap_err();
+        assert!(e.message.contains("inside a target"), "{}", e.message);
+    }
+
+    #[test]
+    fn register_without_ref_is_error() {
+        let e = parse("FROM alpine\nREGISTER\n").unwrap_err();
+        assert!(e.message.contains("full image ref"), "{}", e.message);
+    }
+
+    #[test]
+    fn push_ref_defaults_to_name_when_no_register() {
+        let f = parse("FROM scratch AS ghcr.io/mycompany/app\n").unwrap();
+        assert_eq!(f.targets[0].register, None);
+        assert_eq!(f.targets[0].push_ref(), "ghcr.io/mycompany/app");
     }
 
     #[test]

@@ -14,7 +14,12 @@ A file holds **targets** (named stages) and **top-level reactions**. A target is
 a normal stage — `FROM <base> AS <name>` plus instructions — and may carry
 `TASK` clauses: commands run as side effects. A deliverable's `AS` name is its
 **fully-qualified image reference** (`ghcr.io/mycompany/app`); intermediates and
-task targets use plain internal names. A reaction maps one event to targets with
+task targets use plain internal names. A deliverable may instead keep a short
+`AS` name and declare its publish location with `REGISTER <fullname>`: it is
+then addressed by its name (`BUILD fennel`, `-t fennel`) but pushed to the
+register ref. `REGISTER` does not change the tagHash — content keeps its digest
+across registries, so the same image has the same hash anywhere; it only selects
+*where* the tag is looked up and pushed. A reaction maps one event to targets with
 two verbs:
 
 ```

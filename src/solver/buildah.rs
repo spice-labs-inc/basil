@@ -255,6 +255,7 @@ fn collect_mounts(targets: &[Target], deliverable: &str) -> Vec<Mount> {
 pub async fn build_deliverable(
     targets: &[Target],
     deliverable: &str,
+    push_ref: &str,
     tag: &str,
     context: &std::path::Path,
     build_args: &std::collections::HashMap<String, String>,
@@ -262,7 +263,7 @@ pub async fn build_deliverable(
 ) -> anyhow::Result<()> {
     let containerfile = render_containerfile(targets, deliverable);
 
-    let tag_ref = format!("{deliverable}:{tag}");
+    let tag_ref = format!("{push_ref}:{tag}");
 
     // Buildah's own output is streamed live to the terminal so the user sees
     // STEP n/n progress; status lines give the phase context. The Containerfile
@@ -325,7 +326,7 @@ pub async fn build_deliverable(
     println!("basil: built {deliverable}:{tag}");
 
     // Push the tagged image to the deliverable's registry.
-    println!("basil: push {deliverable}:{tag}");
+    println!("basil: push {push_ref}:{tag}");
     let mut push = tokio::process::Command::new("buildah");
     push.arg("push");
     if insecure {
@@ -338,7 +339,7 @@ pub async fn build_deliverable(
         push.arg("--authfile").arg(&authfile);
     }
     push.arg(&tag_ref)
-        .arg(format!("docker://{deliverable}:{tag}"))
+        .arg(format!("docker://{push_ref}:{tag}"))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());

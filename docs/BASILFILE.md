@@ -4,8 +4,8 @@ A Basilfile is a **Dockerfile-like DSL** with a superset of instructions plus
 basil-only clauses. It holds **targets** (named build stages) and **top-level
 reactions**. Because basil drives `buildah`, the build instructions mirror the
 Dockerfile semantics buildah understands; basil-only directives (`ON`, `TASK`,
-`PLATFORM`, `OUTPUT`) are handled by basil and stripped from the Containerfile
-it hands to buildah.
+`PLATFORM`, `OUTPUT`, `REGISTER`) are handled by basil and stripped from the
+Containerfile it hands to buildah.
 
 A file is a sequence of `FROM`…`ON` sections. Everything between a `FROM` and
 the next `FROM`/`ON` is that target's build steps.
@@ -27,13 +27,34 @@ FROM scratch AS ghcr.io/mycompany/app        # deliverable
 COPY --from=build /src/app /app
 ```
 
+A deliverable can also keep a short stage name and declare where it is pushed
+with `REGISTER`:
+
+```dockerfile
+FROM golang:1.23 AS build
+COPY . /src
+RUN go build -o /src/app
+
+FROM scratch AS fennel
+COPY --from=build /src/app /app
+REGISTER ghcr.io/mycompany/fennel        # pushed here; addressed as `fennel`
+```
+
 - The **base** is an image reference (`alpine`, `alpine:3.20`,
   `alpine@sha256:…`), `scratch`, or another target's name (a stage alias — a
   base matching a target's `AS` name resolves to that stage, not an image pull).
 - The **stage name**: an `AS <name>` alias, or the base's name when absent.
 - A **deliverable** is a target whose `AS` name is a fully-qualified image
-  reference (contains a `/`), e.g. `ghcr.io/mycompany/app`. Deliverables are
-  pushed under `<name>:<tagHash>`.
+  reference (contains a `/`), e.g. `ghcr.io/mycompany/app`, OR a target with a
+  `REGISTER` ref (short name + where it is published). Deliverables are pushed
+  under `<push-ref>:<tagHash>`.
+- **`REGISTER <fullname>`** — gives a short-named target its fully-qualified
+  push location. The target is *addressed* by its `AS` name (`-t fennel`,
+  `BUILD fennel`, `COPY --from=fennel`); the image is *published* to the
+  register ref (`-t 127.0.0.1:5001/fennel` also resolves it). `REGISTER` does
+  NOT change the tagHash — content keeps its digest across registries; it only
+  selects where the hash is looked up and pushed. `REGISTER` must appear inside
+  the target (after its `FROM`).
 - Intermediates (plain names) are built when needed by a deliverable but never
   tagged or pushed.
 
