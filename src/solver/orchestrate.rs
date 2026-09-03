@@ -42,26 +42,35 @@ async fn resolve_unpinned_bases(
     targets: &[crate::dsl::ast::Target],
 ) -> Result<HashMap<String, String>, String> {
     let mut resolved = HashMap::new();
+    // Resolve each distinct base ref once per run; many stages reuse the same
+    // base (e.g. ghcr.io/.../build-base), so dedupe by host/repo:tag.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for t in targets {
         let b = &t.base;
         if b.raw == "scratch" || b.digest.is_some() {
             continue;
         }
-        // Build the registry base_url for host/repo, default tag latest.
-        let Some((host, rest)) = b.raw.split_once('/') else {
-            // Single-word base like `alpine` — dockerd default registry. Skip
-            // for now (no Docker Hub metadata resolution); leave to error.
-            continue;
-        };
-        let repo = rest.rsplit_once(':').map(|(r, _)| r).unwrap_or(rest);
+        // Normalize the base ref via parse_ref: bare names (`rust`, `alpine`)
+        // map to Docker Hub `library/<name>`; qualified names keep host/repo.
+        // Default tag is latest.
         let tag = b.tag.clone().unwrap_or_else(|| "latest".to_string());
-        let base = crate::solver::registry::ImageRef {
-            host: host.to_string(),
-            repo: repo.to_string(),
-            tag: tag.clone(),
+        let ir = match crate::solver::registry::parse_ref(&b.raw, &tag) {
+            Ok(ir) => ir,
+            Err(e) => return Err(format!("unpinned base `{raw}`: {e}", raw = b.raw)),
+        };
+        let host = ir.host.clone();
+        let repo = ir.repo.clone();
+        let dedup_key = format!("{host}/{repo}:{tag}");
+        if !seen.insert(dedup_key) {
+            continue;
         }
-        .base_url();
-        let client = crate::solver::registry::RegistryClient::new(&base);
+        let client =
+            crate::solver::registry::RegistryClient::new(&crate::solver::registry::ImageRef {
+                host: host.clone(),
+                repo: repo.clone(),
+                tag: tag.clone(),
+            }
+            .base_url());
         let raw = &b.raw;
         match client.resolve_digest(&repo, &tag).await {
             Ok(digest) => {
