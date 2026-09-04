@@ -140,6 +140,14 @@ impl Parser {
                             return self.err(line.number, "REGISTER requires a full image ref");
                         }
                         target.register = Some(value.to_string());
+                    } else if kw == "GIVEN" {
+                        if target.given.is_some() {
+                            return self.err(line.number, "duplicate GIVEN in target");
+                        }
+                        for p in split_ws(rest) {
+                            self.validate_given_path(&p, line.number)?;
+                        }
+                        target.given = Some(split_ws(rest));
                     } else {
                         self.parse_instruction(target, kw, rest, line.number)?;
                     }
@@ -195,6 +203,7 @@ impl Parser {
         Ok(Target {
             name: name.unwrap_or_else(|| raw.clone()),
             register: None,
+            given: None,
             base: BaseImage { raw, tag, digest, platform },
             instructions: Vec::new(),
             task: None,
@@ -341,11 +350,24 @@ impl Parser {
         Ok(Instruction::Output(Output { source, dest }))
     }
 
+    /// Validate a `GIVEN` context path: it must be relative (no leading slash)
+    /// and not escape the build context via `..`, mirroring the `OUTPUT` dest
+    /// rules (a closure path outside the context would hash a non-hermetic
+    /// input).
+    fn validate_given_path(&self, p: &str, line: usize) -> Result<(), Error> {
+        if p.starts_with('/') {
+            return self.err(line, format!("GIVEN path `{p}` must be relative to the context"));
+        }
+        if p.split(['/', '\\']).any(|c| c == "..") {
+            return self.err(line, format!("GIVEN path `{p}` may not contain `..`"));
+        }
+        Ok(())
+    }
+
     fn parse_add(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
         if detect_heredoc(rest) {
             return self.err(line, "ADD heredocs (<<EOF) are deferred in basil v1");
-        }
-        let (flags, args) = parse_flags(rest).map_err(|m| self.err_at(line, m))?;
+        }        let (flags, args) = parse_flags(rest).map_err(|m| self.err_at(line, m))?;
         for name in flags.keys() {
             match name.as_str() {
                 "chown" | "chmod" => {}
@@ -527,6 +549,7 @@ fn is_known_or_deferred(kw: &str) -> bool {
             | "OUTPUT"
             | "TASK"
             | "REGISTER"
+            | "GIVEN"
             | "SHELL"
             | "STOPSIGNAL"
             | "HEALTHCHECK"
@@ -959,6 +982,42 @@ mod tests {
         let f = parse("FROM scratch AS ghcr.io/mycompany/app\n").unwrap();
         assert_eq!(f.targets[0].register, None);
         assert_eq!(f.targets[0].push_ref(), "ghcr.io/mycompany/app");
+    }
+
+    #[test]
+    fn parses_given_paths() {
+        let src = "FROM alpine AS t\nRUN echo hi\nGIVEN Cargo.toml src/ config/*.yaml\n";
+        let f = parse(src).unwrap();
+        assert_eq!(
+            f.targets[0].given.as_deref(),
+            Some(&["Cargo.toml".to_string(), "src/".to_string(), "config/*.yaml".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn given_without_path_is_ok() {
+        // An all-arg/external target may declare empty GIVEN to pin no context
+        // files.
+        let f = parse("FROM alpine AS t\nGIVEN\n").unwrap();
+        assert_eq!(f.targets[0].given.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn given_absolute_path_is_rejected() {
+        let e = parse("FROM alpine AS t\nGIVEN /etc/passwd\n").unwrap_err();
+        assert!(e.message.contains("relative"), "{}", e.message);
+    }
+
+    #[test]
+    fn given_parent_escape_is_rejected() {
+        let e = parse("FROM alpine AS t\nGIVEN ../secret\n").unwrap_err();
+        assert!(e.message.contains("`..`"), "{}", e.message);
+    }
+
+    #[test]
+    fn given_without_target_is_error() {
+        let e = parse("GIVEN Cargo.toml\n").unwrap_err();
+        assert!(e.message.contains("outside any target"), "{}", e.message);
     }
 
     #[test]

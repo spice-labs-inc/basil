@@ -58,6 +58,37 @@ REGISTER ghcr.io/mycompany/fennel        # pushed here; addressed as `fennel`
 - Intermediates (plain names) are built when needed by a deliverable but never
   tagged or pushed.
 
+## GIVEN clause
+
+```
+GIVEN <context-path>…
+```
+
+Declares a target's closure inputs explicitly. When present, the target's
+*derived-data* component (`derivedData(T)` in the identity formula) is computed
+from exactly these context paths — files, directories, or globs — instead of
+from its `COPY`/`ADD`/bind-mount sources:
+
+```dockerfile
+FROM scratch AS app
+COPY a.txt /a               # still builds the image...
+GIVEN b.txt                 # ...but identity is driven by b.txt alone
+```
+
+- **Identity only.** `GIVEN` only chooses which context files feed `tagHash`. The
+  `RUN`/`COPY`/`ADD` instructions still build the image, and the full recipe still
+  contributes through `programHash`. A changed recipe changes the hash; a changed
+  non-given context file does not.
+- **Relative paths only.** No leading `/`, no `..` escape past the context (the
+  same rule as `OUTPUT` host destinations). Both files and dirs are allowed;
+  dirs dive recursively, globs expand, and `.dockerignore` still applies.
+- An explicit `GIVEN` path excluded by `.dockerignore` is an error (identity must
+  not hash an input the build would reject).
+- A target may declare `GIVEN` with no paths to pin *no* context inputs (an
+  all-arg/external target).
+- Not rendered to the builder — like `ON`, `TASK`, `PLATFORM`, `OUTPUT`,
+  `REGISTER`, it is a basil-side directive stripped from the Containerfile.
+
 ## Reactions
 
 ```

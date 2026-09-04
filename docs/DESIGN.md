@@ -19,7 +19,9 @@ task targets use plain internal names. A deliverable may instead keep a short
 then addressed by its name (`BUILD fennel`, `-t fennel`) but pushed to the
 register ref. `REGISTER` does not change the tagHash — content keeps its digest
 across registries, so the same image has the same hash anywhere; it only selects
-*where* the tag is looked up and pushed. A reaction maps one event to targets with
+*where* the tag is looked up and pushed. A target may also declare
+`GIVEN <context-path>…` to pin its identity to explicit inputs instead of the
+`COPY`/`ADD`-derived set (see Identity below). A reaction maps one event to targets with
 two verbs:
 
 ```
@@ -122,7 +124,13 @@ C(T) = derivedData(T)
   at parse time: `COPY`/`ADD` sources and `--mount=type=bind,from=context`
   sources, filtered by `.dockerignore` (Docker's own rules, honored as-is),
   globs expanded against the local context. `COPY .` therefore means
-  whole-tree identity explicitly — there is no implicit default.
+  whole-tree identity explicitly — there is no implicit default. A target may
+  declare `GIVEN <context-path>…` to **replace** this set: `derivedData` is then
+  computed from exactly the given paths (files/dirs/globs, still
+  dockerignore-filtered) instead of the build-resolved sources. The build recipe
+  still builds the image and still contributes via `programHash` — `GIVEN` only
+  overrides which context files feed `derivedData`, decoupling identity from how
+  the image is assembled.
 - **`programHash`** — digest of the target's ordered instruction program with
   `ARG`/`ENV` references expanded. Includes every `RUN` command string and the
   image-config instructions (`ENV`, `CMD`, `ENTRYPOINT`, `USER`, `WORKDIR`,

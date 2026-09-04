@@ -252,11 +252,22 @@ fn snapshot_digest(files: &BTreeSet<String>, context: &Path) -> anyhow::Result<[
 
 /// Compute the derived-data for a target: the sorted set of context files it
 /// reads, returned in a deterministic form.
+///
+/// When the target declares `GIVEN <path>…`, that explicit path set replaces
+/// the COPY/ADD-derived set — `derivedData(T)` means exactly the given inputs.
 pub fn derived_file_set(target: &Target, context: &Path) -> anyhow::Result<BTreeSet<String>> {
     let ignore = Dockerignore::from_file_if_present(context);
     let mut out = BTreeSet::new();
-    for src in context_sources(target, context) {
-        expand_source(&src, context, &ignore, &mut out)
+    // GIVEN overrides the input set: hash exactly those context paths instead
+    // of the build-resolved sources. Still dockerignore-filtered (a GIVEN path
+    // excluded by .dockerignore is a real input mismatch, so it errors via
+    // expand_source's explicit-source rule).
+    let sources: Vec<String> = match &target.given {
+        Some(given) => given.clone(),
+        None => context_sources(target, context),
+    };
+    for src in &sources {
+        expand_source(src, context, &ignore, &mut out)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     Ok(out)
@@ -386,8 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_source_excluded_by_dockerignore_errors() {
-        // An ADD/COPY source explicitly listed AND excluded by .dockerignore is
+    fn explicit_source_excluded_by_dockerignore_errors() {        // An ADD/COPY source explicitly listed AND excluded by .dockerignore is
         // a hard error (buildah: "no items matching glob ... filtered out using
         // .dockerignore"), not a silent skip — identity must not hash an input
         // the build will reject.
@@ -404,6 +414,43 @@ mod tests {
             text.contains("rustfmt.toml") && text.contains(".dockerignore"),
             "expected the explicit+ignored source to be named:\n{text}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_overrides_copy_derived_set() {
+        // GIVEN declares the closure inputs explicitly: COPY . is ignored for
+        // identity; only the given paths feed derivedData.
+        let dir = std::env::temp_dir().join(format!("basil-test-given-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        ctx(&dir, "a.txt", "aaa");
+        ctx(&dir, "b.txt", "bbb");
+        ctx(&dir, "src/c.rs", "ccc");
+        // No GIVEN: COPY . reads the whole tree.
+        let without = parse("FROM alpine\nCOPY . /x\n").unwrap();
+        let w = derived_file_set(&without.targets[0], &dir).unwrap();
+        assert!(w.contains("a.txt") && w.contains("src/c.rs"));
+        // With GIVEN: only the given path is hashed, COPY . is ignored.
+        let with = parse("FROM alpine\nCOPY . /x\nGIVEN b.txt\n").unwrap();
+        let g = derived_file_set(&with.targets[0], &dir).unwrap();
+        assert_eq!(g.len(), 1);
+        assert!(g.contains("b.txt"), "{g:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_dir_and_glob_expand() {
+        let dir = std::env::temp_dir().join(format!("basil-test-given2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        ctx(&dir, "x/a.txt", "a");
+        ctx(&dir, "x/b.txt", "b");
+        ctx(&dir, "x/sub/c.txt", "c");
+        ctx(&dir, "y.txt", "y");
+        let with = parse("FROM alpine\nGIVEN x/ *.txt\n").unwrap();
+        let g = derived_file_set(&with.targets[0], &dir).unwrap();
+        assert!(g.contains("x/a.txt") && g.contains("x/b.txt"), "{g:?}");
+        assert!(g.contains("x/sub/c.txt"), "{g:?}"); // dir dives recursively
+        assert!(g.contains("y.txt"), "{g:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

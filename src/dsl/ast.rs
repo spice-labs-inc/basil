@@ -33,6 +33,14 @@ pub struct Target {
     /// to `register`. It does NOT fold into the tagHash — content keeps its
     /// digest across registries — it only selects *where* to look up/push it.
     pub register: Option<String>,
+    /// `GIVEN <path>…` — explicit closure inputs. When present the target's
+    /// *derived-data* component is computed from exactly these context paths
+    /// (files/dirs/globs, dockerignore-filtered) instead of from its `COPY`/`ADD`
+    /// sources. The build recipe (RUN/COPY/ADD) still builds the image and still
+    /// contributes via `programHash`; `GIVEN` only overrides which context files
+    /// feed the tagHash. It is an identity-only directive (not rendered to the
+    /// builder).
+    pub given: Option<Vec<String>>,
     /// The stage's base image.
     pub base: BaseImage,
     /// Build steps in source order (no `FROM`; the base is separate).
