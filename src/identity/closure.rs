@@ -114,6 +114,7 @@ pub fn compute_closure(
     targets: &[Target],
     file_default_platforms: &[Platform],
     context: &Path,
+    build_file: &Path,
     overrides: &std::collections::HashMap<String, String>,
     resolver: &mut dyn BaseResolver,
 ) -> Result<std::collections::HashMap<String, [u8; 32]>, String> {
@@ -193,8 +194,10 @@ pub fn compute_closure(
             };
 
 
-            // Derive data (context files this target reads).
-            let (derived, bytes) = derived_data::derived_data_digest_and_bytes(target, context)
+            // Derive data (context files this target reads). The build file that
+            // produced `targets` is excluded: its effect is already captured by
+            // programHash, so including it would make identity self-referential.
+            let (derived, bytes) = derived_data::derived_data_digest_and_bytes(target, context, build_file)
                 .map_err(|e| format!("deriving data for `{name}`: {e}"))?;
             // Surface a large context so the operator knows what to dockerignore
             // rather than silently hashing e.g. an unexcluded 512MB blob.
@@ -357,8 +360,8 @@ COPY marker.txt /x
 RUN go build\n";
         let f = parse(dsl).unwrap();
         let dir = tiny_ctx("det");
-        let r1 = compute_closure(&f.targets, &[], &dir, &HashMap::new(), &mut FakeResolver).unwrap();
-        let r2 = compute_closure(&f.targets, &[], &dir, &HashMap::new(), &mut FakeResolver).unwrap();
+        let r1 = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
         assert_eq!(r1, r2);
         assert_eq!(hex(&r1["alpine"]).len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
@@ -369,8 +372,8 @@ RUN go build\n";
         let dir = tiny_ctx("chg");
         let a = parse("FROM alpine\nRUN echo one\n").unwrap();
         let b = parse("FROM alpine\nRUN echo two\n").unwrap();
-        let ra = compute_closure(&a.targets, &[], &dir, &HashMap::new(), &mut FakeResolver).unwrap();
-        let rb = compute_closure(&b.targets, &[], &dir, &HashMap::new(), &mut FakeResolver).unwrap();
+        let ra = compute_closure(&a.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let rb = compute_closure(&b.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
         assert_ne!(ra["alpine"], rb["alpine"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -380,7 +383,7 @@ RUN go build\n";
         let dir = tiny_ctx("pin");
         let dsl = "FROM alpine:3.23@sha256:abcdef1234567890\nRUN echo hi\n";
         let f = parse(dsl).unwrap();
-        let r = compute_closure(&f.targets, &[], &dir, &HashMap::new(), &mut offline()).unwrap();
+        let r = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline()).unwrap();
         assert_eq!(hex(&r["alpine"]).len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -390,7 +393,7 @@ RUN go build\n";
         let dir = tiny_ctx("unp");
         let dsl = "FROM alpine:3.23\nRUN echo hi\n";
         let f = parse(dsl).unwrap();
-        let err = compute_closure(&f.targets, &[], &dir, &HashMap::new(), &mut offline()).unwrap_err();
+        let err = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline()).unwrap_err();
         assert!(err.contains("pinned"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -406,7 +409,7 @@ FROM scratch AS ghcr.io/mycompany/app
 COPY --from=build /a /a
 ";
         let f = parse(dsl).unwrap();
-        let r = compute_closure(&f.targets, &[], &dir, &HashMap::new(), &mut FakeResolver).unwrap();
+        let r = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
         assert!(r.contains_key("build"));
         assert!(r.contains_key("ghcr.io/mycompany/app"));
         assert_ne!(r["build"], r["ghcr.io/mycompany/app"]);
@@ -423,7 +426,7 @@ FROM scratch AS ghcr.io/mycompany/app
 COPY --from=build /a /a
 ";
         let f2 = parse(dsl2).unwrap();
-        let r2 = compute_closure(&f2.targets, &[], &dir, &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f2.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
         assert_ne!(
             r["ghcr.io/mycompany/app"],
             r2["ghcr.io/mycompany/app"],
@@ -439,8 +442,8 @@ COPY --from=build /a /a
         let f = parse(dsl).unwrap();
         let mut overrides = HashMap::new();
         overrides.insert("VERSION".to_string(), "1.0".to_string());
-        let r1 = compute_closure(&f.targets, &[], &dir, &HashMap::new(), &mut FakeResolver).unwrap();
-        let r2 = compute_closure(&f.targets, &[], &dir, &overrides, &mut FakeResolver).unwrap();
+        let r1 = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver).unwrap();
         assert_ne!(r1["alpine"], r2["alpine"]);
     }
 }

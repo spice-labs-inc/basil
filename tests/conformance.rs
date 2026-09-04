@@ -33,7 +33,8 @@ fn compute() -> BTreeMap<String, String> {
     let file = parse(&dsl).unwrap();
     let ctx = Path::new(FIXTURE).join("ctx");
     let overrides = HashMap::new();
-    let tags = compute_closure(&file.targets, &file.default_platforms, &ctx, &overrides, &mut PinnedResolver)
+    let build_file = Path::new(FIXTURE).join("Basilfile");
+    let tags = compute_closure(&file.targets, &file.default_platforms, &ctx, &build_file, &overrides, &mut PinnedResolver)
         .unwrap();
     tags.iter()
         .map(|(k, v)| (k.clone(), hex(v)))

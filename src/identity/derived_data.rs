@@ -255,7 +255,7 @@ fn snapshot_digest(files: &BTreeSet<String>, context: &Path) -> anyhow::Result<[
 ///
 /// When the target declares `GIVEN <path>…`, that explicit path set replaces
 /// the COPY/ADD-derived set — `derivedData(T)` means exactly the given inputs.
-pub fn derived_file_set(target: &Target, context: &Path) -> anyhow::Result<BTreeSet<String>> {
+pub fn derived_file_set(target: &Target, context: &Path, build_file: &Path) -> anyhow::Result<BTreeSet<String>> {
     let ignore = Dockerignore::from_file_if_present(context);
     let mut out = BTreeSet::new();
     // GIVEN overrides the input set: hash exactly those context paths instead
@@ -270,12 +270,22 @@ pub fn derived_file_set(target: &Target, context: &Path) -> anyhow::Result<BTree
         expand_source(src, context, &ignore, &mut out)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    // Exclude the build file that produced this target graph: its content is
+    // already represented by programHash, so hashing it here would make identity
+    // self-referential (editing the recipe would change the derived-data hash as
+    // well as the program hash). Resolve both sides absolute for a fair compare.
+    let build_path = std::path::absolute(context.join(build_file))
+        .unwrap_or_else(|_| build_file.to_path_buf());
+    out.retain(|rel| {
+        let abs = std::path::absolute(context.join(rel)).unwrap_or_else(|_| context.join(rel));
+        abs != build_path
+    });
     Ok(out)
 }
 
 /// Compute `derivedData(T)` as a digest.
-pub fn derived_data_digest(target: &Target, context: &Path) -> anyhow::Result<[u8; 32]> {
-    let files = derived_file_set(target, context)?;
+pub fn derived_data_digest(target: &Target, context: &Path, build_file: &Path) -> anyhow::Result<[u8; 32]> {
+    let files = derived_file_set(target, context, build_file)?;
     snapshot_digest(&files, context)
 }
 
@@ -284,8 +294,9 @@ pub fn derived_data_digest(target: &Target, context: &Path) -> anyhow::Result<[u
 pub fn derived_data_digest_and_bytes(
     target: &Target,
     context: &Path,
+    build_file: &Path,
 ) -> anyhow::Result<([u8; 32], u64)> {
-    let files = derived_file_set(target, context)?;
+    let files = derived_file_set(target, context, build_file)?;
     let mut total = 0u64;
     for rel in &files {
         if rel.starts_with('<') {
@@ -296,13 +307,6 @@ pub fn derived_data_digest_and_bytes(
         }
     }
     Ok((snapshot_digest(&files, context)?, total))
-}
-
-/// Total bytes of the context files a target's derived-data reads. Used to
-/// warn when a build hashes a large context (e.g. an unexcluded big blob).
-pub fn derived_data_bytes(target: &Target, context: &Path) -> anyhow::Result<u64> {
-    let (_, b) = derived_data_digest_and_bytes(target, context)?;
-    Ok(b)
 }
 
 #[cfg(test)]
@@ -330,7 +334,7 @@ mod tests {
         ctx(&dir.join("sub"), "c.txt", "ccc");
         let dsl = "FROM alpine\nCOPY a.txt /x\n";
         let f = parse(dsl).unwrap();
-        let files = derived_file_set(&f.targets[0], &dir).unwrap();
+        let files = derived_file_set(&f.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap();
         assert!(files.contains("a.txt"));
         assert!(!files.contains("b.txt"));
         assert!(!files.contains("sub/c.txt"));
@@ -345,7 +349,7 @@ mod tests {
         ctx(&dir.join("sub"), "b.txt", "b");
         let dsl = "FROM alpine\nCOPY . /src\n";
         let f = parse(dsl).unwrap();
-        let files = derived_file_set(&f.targets[0], &dir).unwrap();
+        let files = derived_file_set(&f.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap();
         assert!(files.contains("a.txt"));
         assert!(files.contains("sub/b.txt"));
         let _ = fs::remove_dir_all(&dir);
@@ -361,7 +365,7 @@ mod tests {
         ctx(&dir, "f.tmp", "f");
         let dsl = "FROM alpine\nCOPY . /src\n";
         let f = parse(dsl).unwrap();
-        let files = derived_file_set(&f.targets[0], &dir).unwrap();
+        let files = derived_file_set(&f.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap();
         assert!(files.contains("a.txt"));
         assert!(!files.contains("f.tmp"));
         assert!(!files.contains("node_modules/x.js"));
@@ -377,7 +381,7 @@ mod tests {
         ctx(&dir, "c.txt", "x");
         let dsl = "FROM alpine\nCOPY *.json /x/\n";
         let f = parse(dsl).unwrap();
-        let files = derived_file_set(&f.targets[0], &dir).unwrap();
+        let files = derived_file_set(&f.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap();
         assert!(files.contains("a.json"));
         assert!(files.contains("b.json"));
         assert!(!files.contains("c.txt"));
@@ -391,7 +395,7 @@ mod tests {
         ctx(&dir, "Makefile", "all:\n");
         let dsl = "FROM alpine\nRUN --mount=type=bind,source=Makefile,target=/m/Makefile make\n";
         let f = parse(dsl).unwrap();
-        let files = derived_file_set(&f.targets[0], &dir).unwrap();
+        let files = derived_file_set(&f.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap();
         assert!(files.contains("Makefile"));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -408,7 +412,7 @@ mod tests {
         ctx(&dir, "other.txt", "o");
         let dsl = "FROM alpine\nADD rustfmt.toml other.txt /x/\n";
         let f = parse(dsl).unwrap();
-        let err = derived_file_set(&f.targets[0], &dir).unwrap_err();
+        let err = derived_file_set(&f.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.contains("rustfmt.toml") && text.contains(".dockerignore"),
@@ -428,11 +432,11 @@ mod tests {
         ctx(&dir, "src/c.rs", "ccc");
         // No GIVEN: COPY . reads the whole tree.
         let without = parse("FROM alpine\nCOPY . /x\n").unwrap();
-        let w = derived_file_set(&without.targets[0], &dir).unwrap();
+        let w = derived_file_set(&without.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap();
         assert!(w.contains("a.txt") && w.contains("src/c.rs"));
         // With GIVEN: only the given path is hashed, COPY . is ignored.
         let with = parse("FROM alpine\nCOPY . /x\nGIVEN b.txt\n").unwrap();
-        let g = derived_file_set(&with.targets[0], &dir).unwrap();
+        let g = derived_file_set(&with.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap();
         assert_eq!(g.len(), 1);
         assert!(g.contains("b.txt"), "{g:?}");
         let _ = fs::remove_dir_all(&dir);
@@ -447,10 +451,29 @@ mod tests {
         ctx(&dir, "x/sub/c.txt", "c");
         ctx(&dir, "y.txt", "y");
         let with = parse("FROM alpine\nGIVEN x/ *.txt\n").unwrap();
-        let g = derived_file_set(&with.targets[0], &dir).unwrap();
+        let g = derived_file_set(&with.targets[0], &dir, std::path::Path::new("__buildfile__")).unwrap();
         assert!(g.contains("x/a.txt") && g.contains("x/b.txt"), "{g:?}");
         assert!(g.contains("x/sub/c.txt"), "{g:?}"); // dir dives recursively
         assert!(g.contains("y.txt"), "{g:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_file_is_excluded_from_derived_set() {
+        // The build file (the recipe that produced the target graph) must not be
+        // a content input: its effect is captured by programHash, so hashing it
+        // would make identity self-referential. `ADD .` over a context that
+        // contains the Basilfile must drop it from the derived set.
+        let dir = std::env::temp_dir().join(format!("basil-test-bf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        ctx(&dir, "Basilfile", "FROM alpine\nCOPY marker /m\n");
+        ctx(&dir, "marker.txt", "m");
+        let dsl = "FROM alpine\nCOPY . /x\n";
+        let f = parse(dsl).unwrap();
+        let build_file = dir.join("Basilfile");
+        let files = derived_file_set(&f.targets[0], &dir, &build_file).unwrap();
+        assert!(files.contains("marker.txt"), "{files:?}");
+        assert!(!files.contains("Basilfile"), "build file must be excluded: {files:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

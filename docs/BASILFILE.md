@@ -91,6 +91,11 @@ GIVEN b.txt                 # ...but identity is driven by b.txt alone
 - Not rendered to the builder — like `ON`, `TASK`, `PLATFORM`, `OUTPUT`,
   `REGISTER`, it is a basil-side directive stripped from the Containerfile.
 
+Regardless of `GIVEN`, the Basilfile itself is never a `derivedData` input: its
+job is encoded in `programHash`, so hashing it would make identity
+self-referential (editing the recipe would change the content hash as well as
+the program hash).
+
 ## Reactions
 
 ```

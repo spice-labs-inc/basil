@@ -234,11 +234,13 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
     let t0 = std::time::Instant::now();
     println!("basil: computing identity ({} target(s))...", subset.len());
+    let build_file = std::path::absolute(inp.file).unwrap_or_else(|_| inp.file.into());
     let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
         &subset,
         &parsed.default_platforms,
         inp.context,
+        &build_file,
         &HashMap::new(),
         &mut resolver,
     )
@@ -461,11 +463,13 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
     let t1 = std::time::Instant::now();
     println!("basil: computing identity ({} targets)...", parsed.targets.len());
+    let build_file = std::path::absolute(inp.file).unwrap_or_else(|_| inp.file.into());
     let mut resolver = RegistryResolver { resolved };
     let closures = compute_closure(
         &parsed.targets,
         &parsed.default_platforms,
         inp.context,
+        &build_file,
         &build_args,
         &mut resolver,
     )

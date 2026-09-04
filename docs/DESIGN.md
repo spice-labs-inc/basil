@@ -124,7 +124,10 @@ C(T) = derivedData(T)
   at parse time: `COPY`/`ADD` sources and `--mount=type=bind,from=context`
   sources, filtered by `.dockerignore` (Docker's own rules, honored as-is),
   globs expanded against the local context. `COPY .` therefore means
-  whole-tree identity explicitly — there is no implicit default. A target may
+  whole-tree identity explicitly — there is no implicit default. The build file
+  itself (the recipe that produced the target graph) is excluded: its effect is
+  already captured by `programHash`, so hashing it would make identity
+  self-referential. A target may
   declare `GIVEN <context-path>…` to **replace** this set: `derivedData` is then
   computed from exactly the given paths (files/dirs/globs, still
   dockerignore-filtered) instead of the build-resolved sources. The build recipe

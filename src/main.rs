@@ -37,10 +37,12 @@ fn main() -> anyhow::Result<()> {
             let src = basil::fsctx::fs_err(std::fs::read_to_string(&args.file), &args.file, "read")?;
             let file = basil::dsl::parser::parse(&src).map_err(anyhow::Error::msg)?;
             let ctx = std::path::Path::new(&args.context);
+            let build_file = std::path::absolute(&args.file).unwrap_or_else(|_| args.file.clone().into());
             let tags = basil::identity::closure::compute_closure(
                 &file.targets,
                 &file.default_platforms,
                 ctx,
+                &build_file,
                 &HashMap::new(),
                 &mut CliResolver,
             )
