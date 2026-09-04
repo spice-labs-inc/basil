@@ -81,7 +81,9 @@ GIVEN b.txt                 # ...but identity is driven by b.txt alone
   non-given context file does not.
 - **Relative paths only.** No leading `/`, no `..` escape past the context (the
   same rule as `OUTPUT` host destinations). Both files and dirs are allowed;
-  dirs dive recursively, globs expand, and `.dockerignore` still applies.
+  dirs dive recursively, globs expand, and `.dockerignore` still applies. Multiple
+  `GIVEN` lines accumulate into one closure set (e.g. `GIVEN Cargo.*` plus
+  `GIVEN */Cargo.toml`).
 - An explicit `GIVEN` path excluded by `.dockerignore` is an error (identity must
   not hash an input the build would reject).
 - A target may declare `GIVEN` with no paths to pin *no* context inputs (an

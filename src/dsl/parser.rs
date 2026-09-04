@@ -141,13 +141,13 @@ impl Parser {
                         }
                         target.register = Some(value.to_string());
                     } else if kw == "GIVEN" {
-                        if target.given.is_some() {
-                            return self.err(line.number, "duplicate GIVEN in target");
-                        }
+                        // Multiple GIVEN lines accumulate their paths into one
+                        // closure set (e.g. `GIVEN Cargo.*` then `GIVEN */Cargo.toml`).
+                        let entry = target.given.get_or_insert_with(Vec::new);
                         for p in split_ws(rest) {
                             self.validate_given_path(&p, line.number)?;
+                            entry.push(p);
                         }
-                        target.given = Some(split_ws(rest));
                     } else {
                         self.parse_instruction(target, kw, rest, line.number)?;
                     }
@@ -991,6 +991,18 @@ mod tests {
         assert_eq!(
             f.targets[0].given.as_deref(),
             Some(&["Cargo.toml".to_string(), "src/".to_string(), "config/*.yaml".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn given_lines_accumulate() {
+        // Multiple GIVEN lines combine into one closure set (fennel splits
+        // `GIVEN Cargo.*` then `GIVEN */Cargo.toml`).
+        let src = "FROM alpine AS t\nGIVEN Cargo.*\nGIVEN */Cargo.toml\n";
+        let f = parse(src).unwrap();
+        assert_eq!(
+            f.targets[0].given.as_deref(),
+            Some(&["Cargo.*".to_string(), "*/Cargo.toml".to_string()][..])
         );
     }
 
