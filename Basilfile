@@ -17,10 +17,11 @@ RUN cargo build --release --bin basil
 OUTPUT /src/target/release/basil target/basil
 
 # --- deliverable: the static binary on scratch ---
-FROM scratch AS 127.0.0.1:5001/basil
+FROM scratch AS basil
 COPY --from=builder /src/target/release/basil /basil
 ENV PATH=/usr/local/bin:/usr/bin:/bin
 ENTRYPOINT ["/basil"]
+REGISTER 127.0.0.1:5001/basil
 
 # Build on every push to main.
-ON push(main) BUILD 127.0.0.1:5001/basil
+ON push(main) BUILD basil
