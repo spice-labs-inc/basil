@@ -322,7 +322,9 @@ require it:
 
 - Manual trigger = `basil build [CONTEXT] [-f FILE] [-t target]` builds a
   deliverable directly, with no event (default: every qualified deliverable in
-  the file; the DSL file defaults to `<context>/Basilfile`, docker-style).
+  the file; the DSL file defaults to `<context>/Basilfile`, docker-style;
+  `--force` rebuilds and re-pushes even when every content tag already
+  exists).
 
 ## Promotion (version tags)
 

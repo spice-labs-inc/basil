@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
                     context: std::path::Path::new(&args.context),
                     event_json: None,
                     target_filter: args.target.as_ref(),
+                    force: args.force,
                 };
                 let results = basil::solver::orchestrate::build_targets(inp).await?;
                 for (k, v) in &results {
@@ -113,6 +114,7 @@ fn main() -> anyhow::Result<()> {
                     context: std::path::Path::new(&args.context),
                     event_json: Some(&event_json),
                     target_filter: None,
+                    force: args.force,
                 };
                 let results = basil::solver::orchestrate::handle_event(inp).await?;
                 for (k, v) in &results {

@@ -49,6 +49,7 @@ async fn buildah_e2e_build_and_config() {
         context: &dir,
         event_json: Some(event),
         target_filter: None,
+        force: false,
     };
     let results = handle_event(inp.clone()).await.unwrap();
     let digest = results
@@ -82,7 +83,7 @@ async fn buildah_e2e_build_and_config() {
     // A second delivery of the same event noops: the content tag exists, so
     // basil re-confirms the image is registered and reports an idempotent skip
     // instead of rebuilding. The registered image must still be pullable.
-    let results2 = handle_event(inp).await.unwrap();
+    let results2 = handle_event(inp.clone()).await.unwrap();
     let (_, result) = results2
         .iter()
         .find(|(k, _)| k == "result")
@@ -97,6 +98,23 @@ async fn buildah_e2e_build_and_config() {
     assert_eq!(digest2, digest, "noop re-derives the same content tag");
     let (_, manifest2) = c.get_manifest("bah_e2e_probe", &digest2).await.unwrap();
     assert!(!manifest2.is_empty(), "registered image must remain pullable");
+
+    // --force bypasses the idempotent check: the same event rebuilds and
+    // re-pushes even though the content tag is registered (no idempotent-skip
+    // result is emitted — the build path has no `result` key at all).
+    let mut forced = inp;
+    forced.force = true;
+    let results3 = handle_event(forced).await.unwrap();
+    let result3 = results3.iter().find(|(k, _)| k == "result");
+    assert!(result3.is_none(), "--force must take the build path, got {result3:?}");
+    let digest3 = results3
+        .iter()
+        .find(|(k, _)| k == "digest")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(digest3, digest, "forced rebuild re-derives the same content tag");
+    let (_, manifest3) = c.get_manifest("bah_e2e_probe", &digest3).await.unwrap();
+    assert!(!manifest3.is_empty(), "re-pushed image must be pullable");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

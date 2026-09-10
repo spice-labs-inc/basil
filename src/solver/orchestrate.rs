@@ -103,6 +103,8 @@ pub struct BuildInput<'a> {
     pub context: &'a std::path::Path,
     pub event_json: Option<&'a str>,
     pub target_filter: Option<&'a String>,
+    /// Bypass the idempotent check: always rebuild and re-push.
+    pub force: bool,
 }
 async fn promote_on_tag(
     matched: &[&crate::dsl::ast::Reaction],
@@ -261,24 +263,28 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     // If every content tag already exists in its registry, the exact images
     // are already published — don't rebuild (parity with handle_event's
     // idempotent check). The probes confirmed registration; the noop path
-    // still states each registered image and its content tag.
-    let published = idempotent_published(&deliverables, &closures).await?;
-    if !published.is_empty() {
-        println!("basil: content tags already published -- no build (idempotent check)");
-        for (name, push_ref, tag) in &published {
-            println!("basil: image {push_ref}:{tag} (registered)");
-            // OUTPUT still runs: pull the published image and extract.
-            crate::solver::buildah::extract_outputs_from_image(
-                &format!("{push_ref}:{tag}"),
-                inp.context,
-                crate::solver::buildah::Graph::new(&subset, &parsed.global_args),
-                name,
-            )
-            .await?;
-            out.push((name.clone(), tag.clone()));
+    // still states each registered image and its content tag. `--force`
+    // bypasses the check entirely: the probe is skipped and every deliverable
+    // rebuilds and re-pushes.
+    if !inp.force {
+        let published = idempotent_published(&deliverables, &closures).await?;
+        if !published.is_empty() {
+            println!("basil: content tags already published -- no build (idempotent check)");
+            for (name, push_ref, tag) in &published {
+                println!("basil: image {push_ref}:{tag} (registered)");
+                // OUTPUT still runs: pull the published image and extract.
+                crate::solver::buildah::extract_outputs_from_image(
+                    &format!("{push_ref}:{tag}"),
+                    inp.context,
+                    crate::solver::buildah::Graph::new(&subset, &parsed.global_args),
+                    name,
+                )
+                .await?;
+                out.push((name.clone(), tag.clone()));
+            }
+            println!("basil: done ({})", names.join(", "));
+            return Ok(out);
         }
-        println!("basil: done ({})", names.join(", "));
-        return Ok(out);
     }
 
     for (name, push_ref) in &deliverables {
@@ -482,29 +488,32 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
     // Idempotent check: skip when every deliverable's content tag exists, and
-    // state each registered image on the noop path.
-    let published = idempotent_published(&deliverables, &closures).await?;
-    if !published.is_empty() {
-        println!("basil: content tags already published -- no build (idempotent check)");
-        for (_, push_ref, tag) in &published {
-            println!("basil: image {push_ref}:{tag} (registered)");
+    // state each registered image on the noop path. `--force` bypasses the
+    // check entirely — no probe, always rebuild and re-push.
+    if !inp.force {
+        let published = idempotent_published(&deliverables, &closures).await?;
+        if !published.is_empty() {
+            println!("basil: content tags already published -- no build (idempotent check)");
+            for (_, push_ref, tag) in &published {
+                println!("basil: image {push_ref}:{tag} (registered)");
+            }
+            // OUTPUT still runs on a skip: pull the published image and extract.
+            for (name, push_ref, tag) in &published {
+                crate::solver::buildah::extract_outputs_from_image(
+                    &format!("{push_ref}:{tag}"),
+                    inp.context,
+                    crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args),
+                    name,
+                )
+                .await?;
+            }
+            promote_on_tag(&matched, &event_payload, &event_ref, &closures, &parsed.targets).await?;
+            println!("basil: done ({})", deliverable_names.join(", "));
+            return Ok(vec![
+                ("result".to_string(), "idempotent-skip".to_string()),
+                ("digest".to_string(), digest_of(&deliverable_names[0], &closures)?),
+            ]);
         }
-        // OUTPUT still runs on a skip: pull the published image and extract.
-        for (name, push_ref, tag) in &published {
-            crate::solver::buildah::extract_outputs_from_image(
-                &format!("{push_ref}:{tag}"),
-                inp.context,
-                crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args),
-                name,
-            )
-            .await?;
-        }
-        promote_on_tag(&matched, &event_payload, &event_ref, &closures, &parsed.targets).await?;
-        println!("basil: done ({})", deliverable_names.join(", "));
-        return Ok(vec![
-            ("result".to_string(), "idempotent-skip".to_string()),
-            ("digest".to_string(), digest_of(&deliverable_names[0], &closures)?),
-        ]);
     }
 
     // Build each deliverable with buildah.

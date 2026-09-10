@@ -48,6 +48,10 @@ pub struct BuildArgs {
     /// Target to build; default is every qualified deliverable target.
     #[arg(short = 't', long)]
     pub target: Option<String>,
+    /// Rebuild and re-push even when every content tag already exists in the
+    /// registry (bypasses the idempotent check).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args)]
@@ -62,6 +66,10 @@ pub struct HandleArgs {
     /// Path to an event JSON file; read stdin if absent.
     #[arg(long)]
     pub event: Option<String>,
+    /// Rebuild and re-push even when every content tag already exists in the
+    /// registry (bypasses the idempotent check).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args)]
