@@ -17,6 +17,11 @@ pub struct File {
     pub reactions: Vec<Reaction>,
     /// File-wide default platforms (`PLATFORM` before the first `FROM`).
     pub default_platforms: Vec<Platform>,
+    /// File-level (global-scope) `ARG` declarations before the first `FROM`.
+    /// These default every target's build args of the same name; a stage only
+    /// sees the value after it redeclares the arg (bare or defaulted) itself,
+    /// mirroring Dockerfile global-scope semantics.
+    pub global_args: Vec<Arg>,
 }
 
 /// One named stage (`FROM <base> AS <name>`, or an implicit single stage).

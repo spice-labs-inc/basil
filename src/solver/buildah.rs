@@ -6,7 +6,23 @@
 //! the deliverable; `ON`/`TASK`/`PLATFORM`/`OUTPUT` are omitted (side-effects /
 //! matching / reverse-copy live in basil, not the image).
 
-use crate::dsl::ast::{BaseImage, Command, Instruction, Mount, Target};
+use crate::dsl::ast::{Arg, BaseImage, Command, Instruction, Mount, Target};
+
+/// The parsed stage graph handed to the buildah backend: the targets in scope
+/// plus the file's global-scope `ARG`s. They travel together — the graph is
+/// what gets rendered to a Containerfile (a targeted build passes a
+/// `dependency_subset` slice with the same file-level args).
+#[derive(Clone, Copy)]
+pub struct Graph<'a> {
+    pub targets: &'a [Target],
+    pub global_args: &'a [Arg],
+}
+
+impl<'a> Graph<'a> {
+    pub fn new(targets: &'a [Target], global_args: &'a [Arg]) -> Self {
+        Graph { targets, global_args }
+    }
+}
 
 /// Render the deliverable's stage graph as a multi-stage Containerfile.
 /// `targets` is the topologically-ordered set; `deliverable` must be one of
@@ -14,9 +30,9 @@ use crate::dsl::ast::{BaseImage, Command, Instruction, Mount, Target};
 /// Render every stage with its `AS <name>` alias preserved, for a `buildah
 /// build --target <stage>` (an intermediate stage must keep its alias so
 /// `--target` can find it, unlike the deliverable which is the tagged image).
-pub fn render_containerfile_all(targets: &[Target]) -> String {
-    let mut out = String::new();
-    for t in targets {
+pub fn render_containerfile_all(g: Graph) -> String {
+    let mut out = render_global_args(g.global_args);
+    for t in g.targets {
         // Preserve the AS alias on every stage so --target / --from resolve.
         out.push_str(&format!("FROM {} AS {}\n", render_base(&t.base), t.name));
         for instr in &t.instructions {
@@ -27,16 +43,19 @@ pub fn render_containerfile_all(targets: &[Target]) -> String {
     out
 }
 
-pub fn render_containerfile(targets: &[Target], deliverable: &str) -> String {
+pub fn render_containerfile(g: Graph, deliverable: &str) -> String {
+    // File-level (global-scope) ARGs go before the first stage, exactly like a
+    // Dockerfile: they default every stage's build arg of the same name, and a
+    // stage becomes able to see one only by redeclaring it (bare or defaulted).
+    let mut out = render_global_args(g.global_args);
     // Emit every stage (multi-stage deps like COPY --from must resolve), with
     // the deliverable forced to be the last stage (that's what buildah tags).
-    let mut order: Vec<&Target> = targets.iter().collect();
+    let mut order: Vec<&Target> = g.targets.iter().collect();
     if let Some(pos) = order.iter().position(|t| t.name == deliverable) {
         let d = order.remove(pos);
         order.push(d);
     }
 
-    let mut out = String::new();
     for (i, t) in order.iter().enumerate() {
         let is_deliverable = t.name == deliverable;
         let is_last = i + 1 == order.len();
@@ -50,6 +69,17 @@ pub fn render_containerfile(targets: &[Target], deliverable: &str) -> String {
             out.push_str(&render_instruction(instr));
             out.push('\n');
         }
+    }
+    out
+}
+
+/// Render the file-level global `ARG`s (before the first `FROM`). Empty when
+/// the file declares none.
+fn render_global_args(args: &[Arg]) -> String {
+    let mut out = String::new();
+    for a in args {
+        out.push_str(&render_instruction(&Instruction::Arg(a.clone())));
+        out.push('\n');
     }
     out
 }
@@ -253,7 +283,7 @@ fn collect_mounts(targets: &[Target], deliverable: &str) -> Vec<Mount> {
 /// Build one deliverable with buildah. Write the Containerfile, run
 /// `buildah build --layers -t <name>:<tag> -f <file> <ctx>`, then push.
 pub async fn build_deliverable(
-    targets: &[Target],
+    g: Graph<'_>,
     deliverable: &str,
     push_ref: &str,
     tag: &str,
@@ -261,7 +291,7 @@ pub async fn build_deliverable(
     build_args: &std::collections::HashMap<String, String>,
     insecure: bool,
 ) -> anyhow::Result<()> {
-    let containerfile = render_containerfile(targets, deliverable);
+    let containerfile = render_containerfile(g, deliverable);
 
     let tag_ref = format!("{push_ref}:{tag}");
 
@@ -291,7 +321,7 @@ pub async fn build_deliverable(
     // Secrets read BASIL_SECRET_<ID> (uppercased ID) for the value path;
     // ssh defaults to the agent (no extra value needed). Emitted like build
     // args, before the positional context.
-    for (id, _) in collect_mount_secrets(targets, deliverable) {
+    for (id, _) in collect_mount_secrets(g.targets, deliverable) {
         let env = format!("BASIL_SECRET_{}", id.to_uppercase());
         let path = std::env::var(&env).map_err(|_| {
             anyhow::anyhow!(
@@ -300,7 +330,7 @@ pub async fn build_deliverable(
         })?;
         cmd.arg("--secret").arg(format!("id={id},src={path}"));
     }
-    if collect_mount_ssh(targets, deliverable) {
+    if collect_mount_ssh(g.targets, deliverable) {
         cmd.arg("--ssh");
     }
     cmd.arg(context);
@@ -354,7 +384,7 @@ pub async fn build_deliverable(
 
     // Reverse COPY: extract any OUTPUT files (from the stage that declares
     // them) to the host. No-op if there are none.
-    extract_outputs(targets, deliverable, &tag_ref, context).await?;
+    extract_outputs(g, deliverable, &tag_ref, context).await?;
     Ok(())
 }
 
@@ -367,10 +397,10 @@ pub async fn build_deliverable(
 pub async fn extract_outputs_from_image(
     image_ref: &str,
     context: &std::path::Path,
-    targets: &[Target],
+    g: Graph<'_>,
     deliverable: &str,
 ) -> anyhow::Result<()> {
-    extract_outputs(targets, deliverable, image_ref, context).await
+    extract_outputs(g, deliverable, image_ref, context).await
 }
 
 /// Reverse COPY: extract every `OUTPUT` (container-src, host-dest) out of the
@@ -380,7 +410,7 @@ pub async fn extract_outputs_from_image(
 /// mount`/`unshare` needed). Host dests are relative to the context and already
 /// validated relative at parse time.
 async fn extract_outputs(
-    targets: &[Target],
+    g: Graph<'_>,
     deliverable: &str,
     image_ref: &str,
     context: &std::path::Path,
@@ -388,7 +418,7 @@ async fn extract_outputs(
     // Group OUTPUTs by the stage that declares them.
     let mut by_stage: std::collections::BTreeMap<&str, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
-    for t in targets {
+    for t in g.targets {
         let outs: Vec<(String, String)> = t
             .instructions
             .iter()
@@ -408,7 +438,7 @@ async fn extract_outputs(
         } else {
             // Intermediate stage: build it as its own image via --target. The
             // Containerfile is fed on stdin (`-f -`); no temp file is written.
-            let containerfile = render_containerfile_all(targets);
+            let containerfile = render_containerfile_all(g);
             let local_img = format!("basil-output-{}", std::process::id());
             let mut build = tokio::process::Command::new("buildah");
             build.arg("build")
@@ -562,7 +592,7 @@ ENV FOO=bar\n\
 CMD [\"/app\"]\n\
 ON push(main) BUILD 127.0.0.1:5001/app\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
         assert!(cf.starts_with("FROM golang AS build\n"));
         // The deliverable is the final stage, tagged (no AS alias needed).
         assert!(cf.contains("FROM scratch\n"));
@@ -580,7 +610,7 @@ RUN go build -o /bin/app\n\
 FROM scratch AS app\n\
 COPY --from=build /bin/app /app\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile_all(&f.targets);
+        let cf = render_containerfile_all(Graph::new(&f.targets, &f.global_args));
         assert!(cf.contains("FROM golang AS build\n"), "{cf}");
         assert!(cf.contains("FROM scratch AS app\n"), "{cf}");
         assert!(cf.contains("COPY --from=build /bin/app /app"), "{cf}");
@@ -591,7 +621,7 @@ COPY --from=build /bin/app /app\n";
         let src = "FROM alpine AS 127.0.0.1:5001/app\n\
 RUN --mount=type=cache,target=/cache --network=none echo hi\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
         assert!(cf.contains("RUN --mount=type=cache,target=/cache --network=none echo hi"), "{cf}");
     }
 
@@ -607,7 +637,7 @@ RUN --mount=type=cache,target=/cache --network=none echo hi\n";
         let src = "FROM alpine AS 127.0.0.1:5001/app\n\
 ADD --chown=1000:1000 --chmod=0755 a.txt /x\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
         assert!(cf.contains("ADD --chown=1000:1000 --chmod=0755 a.txt /x"), "{cf}");
     }
 
@@ -616,11 +646,47 @@ ADD --chown=1000:1000 --chmod=0755 a.txt /x\n";
         let src = "FROM --platform=$BUILDPLATFORM alpine AS 127.0.0.1:5001/app\n\
 RUN echo hi\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
         assert!(
             cf.starts_with("FROM --platform=$BUILDPLATFORM alpine\n"),
             "expected platform selector in FROM:\n{cf}"
         );
+    }
+
+    #[test]
+    fn renders_global_args_at_top_scope_only() {
+        // File-level ARGs are emitted before the first FROM (Dockerfile global
+        // scope). A stage must redeclare an ARG itself to see it — basil adds
+        // nothing per stage.
+        let src = "ARG VERSION=\"\"\n\
+FROM alpine AS build\n\
+ARG VERSION\n\
+RUN echo $VERSION\n\
+FROM scratch AS 127.0.0.1:5001/app\n\
+COPY --from=build /x /x\n";
+        let f = parse(src).unwrap();
+        assert_eq!(f.global_args.len(), 1);
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        assert!(cf.starts_with("ARG VERSION=\"\"\n"), "global ARG must be topmost:\n{cf}");
+        // The stage's own redeclaration is preserved as written.
+        assert!(cf.contains("FROM alpine AS build\nARG VERSION\n"), "{cf}");
+        // The global ARG appears exactly once (top scope), not repeated per stage.
+        assert_eq!(cf.matches("ARG VERSION=\"\"").count(), 1, "{cf}");
+        // No global args -> nothing prepended.
+        let plain = parse("FROM alpine AS 127.0.0.1:5001/app\nRUN echo hi\n").unwrap();
+        let cf2 = render_containerfile(Graph::new(&plain.targets, &plain.global_args), "127.0.0.1:5001/app");
+        assert!(cf2.starts_with("FROM alpine\n"), "{cf2}");
+    }
+
+    #[test]
+    fn renders_bare_global_arg() {
+        let src = "ARG VERSION\nFROM alpine AS 127.0.0.1:5001/app\n";
+        let f = parse(src).unwrap();
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        assert!(cf.starts_with("ARG VERSION\nFROM alpine\n"), "{cf}");
+        // The all-stages renderer (--target builds) gets them too.
+        let all = render_containerfile_all(Graph::new(&f.targets, &f.global_args));
+        assert!(all.starts_with("ARG VERSION\nFROM alpine AS 127.0.0.1:5001/app\n"), "{all}");
     }
 
     #[test]
@@ -636,7 +702,7 @@ ON push(main) BUILD 127.0.0.1:5001/app\n";
         let app = f.targets.iter().find(|t| t.name == "127.0.0.1:5001/app").unwrap();
         assert!(app.task.is_some(), "task should parse onto the target");
 
-        let cf = render_containerfile(&f.targets, "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
         assert!(
             !cf.contains("task-ran"),
             "TASK command leaked into the Containerfile:\n{cf}"

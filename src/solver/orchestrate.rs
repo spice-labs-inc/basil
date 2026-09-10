@@ -239,6 +239,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     let closures = compute_closure(
         &subset,
         &parsed.default_platforms,
+        &parsed.global_args,
         inp.context,
         &build_file,
         &HashMap::new(),
@@ -267,7 +268,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             crate::solver::buildah::extract_outputs_from_image(
                 &format!("{push_ref}:{tag}"),
                 inp.context,
-                &subset,
+                crate::solver::buildah::Graph::new(&subset, &parsed.global_args),
                 name,
             )
             .await?;
@@ -283,7 +284,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            &subset,
+            crate::solver::buildah::Graph::new(&subset, &parsed.global_args),
             name,
             push_ref,
             &tag,
@@ -468,6 +469,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     let closures = compute_closure(
         &parsed.targets,
         &parsed.default_platforms,
+        &parsed.global_args,
         inp.context,
         &build_file,
         &build_args,
@@ -486,7 +488,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             crate::solver::buildah::extract_outputs_from_image(
                 &format!("{push_ref}:{tag}"),
                 inp.context,
-                &parsed.targets,
+                crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args),
                 name,
             )
             .await?;
@@ -506,7 +508,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            &parsed.targets,
+            crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args),
             name,
             push_ref,
             &tag,

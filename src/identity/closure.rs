@@ -53,24 +53,39 @@ impl BaseResolver for OfflineResolver {
     }
 }
 
-/// All in-closure build args for a target: declared `ARG`s with their resolved
-/// value (default from the clause, or an override). Unresolvable ARGs (neither
-/// default nor provided) are folded as `<unset>` so their presence is still
-/// visible (and an ARG only entering the closure if actually used).
+/// Per-target build-arg resolver: the `ARG`s a target declares, with their
+/// resolved value (`--build-arg` override, else the clause default, else the
+/// global-scope default of the same name). Bare redeclarations inherit the
+/// global default, mirroring Dockerfile scope rules.
+///
+/// This map is the *resolver* for `$VAR` substitution only — it never folds
+/// itself into the identity record. An ARG only reaches identity through the
+/// substituted form at a `${VAR}` use site in an identity-affecting
+/// instruction (RUN/COPY/ENV/...). A global arg the target never redeclares is
+/// invisible here, exactly like buildah's stage scope.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     map: std::collections::BTreeMap<String, Option<String>>,
 }
 
 impl Args {
-    pub fn from_target(target: &Target, overrides: &std::collections::HashMap<String, String>) -> Self {
+    pub fn from_target(
+        target: &Target,
+        global_args: &[crate::dsl::ast::Arg],
+        overrides: &std::collections::HashMap<String, String>,
+    ) -> Self {
         let mut map = std::collections::BTreeMap::new();
         for instr in &target.instructions {
             if let crate::dsl::ast::Instruction::Arg(a) = instr {
+                let global_default = global_args
+                    .iter()
+                    .find(|g| g.name == a.name)
+                    .and_then(|g| g.default.clone());
                 let value = overrides
                     .get(&a.name)
                     .cloned()
-                    .or_else(|| a.default.clone());
+                    .or_else(|| a.default.clone())
+                    .or(global_default);
                 map.insert(a.name.clone(), value);
             }
         }
@@ -113,6 +128,7 @@ enum BaseRef {
 pub fn compute_closure(
     targets: &[Target],
     file_default_platforms: &[Platform],
+    global_args: &[crate::dsl::ast::Arg],
     context: &Path,
     build_file: &Path,
     overrides: &std::collections::HashMap<String, String>,
@@ -132,8 +148,10 @@ pub fn compute_closure(
         let mut progressed = false;
         let mut next = Vec::new();
         for (name, target) in remaining {
-            // Associate arg values for this target.
-            let args = Args::from_target(target, overrides);
+            // Associate arg values for this target. Args are the resolver for
+            // `$VAR` substitution; they never fold into the identity record
+            // themselves (identity reflects the substituted form only).
+            let args = Args::from_target(target, global_args, overrides);
 
             // Stage dependencies: the FROM base (if a local stage) plus every
             // COPY --from=<stage> source. Both must be resolved before this
@@ -216,16 +234,16 @@ pub fn compute_closure(
             };
             let prog = program_hash::program_hash(&target.instructions, &|k| vctx.resolve(k));
 
-            // Assemble canonical components and compute tagHash.
+            // Assemble canonical components and compute tagHash. ARG is NOT
+            // folded here: identity reflects the substituted form at `${VAR}`
+            // use sites inside identity-affecting instructions, never the ARG
+            // declaration itself.
             let mut record = Vec::new();
             push(
                 &mut record,
                 "derivedData",
                 &hex(&derived),
             );
-            for (k, v) in &args.map {
-                push(&mut record, &format!("arg.{k}"), v.as_deref().unwrap_or("<unset>"));
-            }
             let platforms = target_platform_list(target, file_default_platforms);
             for p in platforms {
                 push(&mut record, "platform", &p.to_string());
@@ -360,8 +378,8 @@ COPY marker.txt /x
 RUN go build\n";
         let f = parse(dsl).unwrap();
         let dir = tiny_ctx("det");
-        let r1 = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
-        let r2 = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
         assert_eq!(r1, r2);
         assert_eq!(hex(&r1["alpine"]).len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
@@ -372,8 +390,8 @@ RUN go build\n";
         let dir = tiny_ctx("chg");
         let a = parse("FROM alpine\nRUN echo one\n").unwrap();
         let b = parse("FROM alpine\nRUN echo two\n").unwrap();
-        let ra = compute_closure(&a.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
-        let rb = compute_closure(&b.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let ra = compute_closure(&a.targets, &[], &a.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let rb = compute_closure(&b.targets, &[], &b.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
         assert_ne!(ra["alpine"], rb["alpine"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -383,7 +401,7 @@ RUN go build\n";
         let dir = tiny_ctx("pin");
         let dsl = "FROM alpine:3.23@sha256:abcdef1234567890\nRUN echo hi\n";
         let f = parse(dsl).unwrap();
-        let r = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline()).unwrap();
+        let r = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline()).unwrap();
         assert_eq!(hex(&r["alpine"]).len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -393,7 +411,7 @@ RUN go build\n";
         let dir = tiny_ctx("unp");
         let dsl = "FROM alpine:3.23\nRUN echo hi\n";
         let f = parse(dsl).unwrap();
-        let err = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline()).unwrap_err();
+        let err = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline()).unwrap_err();
         assert!(err.contains("pinned"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -409,7 +427,7 @@ FROM scratch AS ghcr.io/mycompany/app
 COPY --from=build /a /a
 ";
         let f = parse(dsl).unwrap();
-        let r = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
         assert!(r.contains_key("build"));
         assert!(r.contains_key("ghcr.io/mycompany/app"));
         assert_ne!(r["build"], r["ghcr.io/mycompany/app"]);
@@ -426,7 +444,7 @@ FROM scratch AS ghcr.io/mycompany/app
 COPY --from=build /a /a
 ";
         let f2 = parse(dsl2).unwrap();
-        let r2 = compute_closure(&f2.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f2.targets, &[], &f2.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
         assert_ne!(
             r["ghcr.io/mycompany/app"],
             r2["ghcr.io/mycompany/app"],
@@ -442,8 +460,65 @@ COPY --from=build /a /a
         let f = parse(dsl).unwrap();
         let mut overrides = HashMap::new();
         overrides.insert("VERSION".to_string(), "1.0".to_string());
-        let r1 = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
-        let r2 = compute_closure(&f.targets, &[], &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver).unwrap();
+        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver).unwrap();
         assert_ne!(r1["alpine"], r2["alpine"]);
+    }
+
+    #[test]
+    fn unreferenced_global_arg_does_not_change_tag() {
+        // The directive: ARG itself never enters identity — only the substituted
+        // form at a `${VAR}` use site does. A file-level `ARG VERSION=""` that
+        // no instruction references must leave the tagHash identical to the
+        // same file without it.
+        let dir = tiny_ctx("glob-unused");
+        let without = parse("FROM alpine\nRUN echo hi\n").unwrap();
+        let with = parse("ARG VERSION=\"\"\nFROM alpine\nRUN echo hi\n").unwrap();
+        let r_without = compute_closure(&without.targets, &[], &without.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r_with = compute_closure(&with.targets, &[], &with.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        assert_eq!(r_without["alpine"], r_with["alpine"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_arg_value_enters_tag_only_when_referenced() {
+        // A stage that redeclares the global arg (bare `ARG VERSION`, Dockerfile
+        // global-scope rules) and references `$VERSION` must see the substituted
+        // value; the default and the override both change the tag.
+        let dir = tiny_ctx("glob-used");
+        let dsl = "ARG VERSION=\"0.0.0\"\nFROM alpine\nARG VERSION\nRUN echo $VERSION\n";
+        let f = parse(dsl).unwrap();
+
+        // Default (no override) vs override: different substituted forms.
+        let mut overrides = HashMap::new();
+        overrides.insert("VERSION".to_string(), "1.5.8".to_string());
+        let r_default = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r_override = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver).unwrap();
+        assert_ne!(r_default["alpine"], r_override["alpine"]);
+
+        // The global default flows through the bare stage redeclaration: the
+        // substituted form contains `0.0.0` (the default), not empty.
+        let dsl2 = "ARG VERSION=\"9.9.9\"\nFROM alpine\nARG VERSION\nRUN echo $VERSION\n";
+        let f2 = parse(dsl2).unwrap();
+        let r2 = compute_closure(&f2.targets, &[], &f2.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        assert_ne!(r_default["alpine"], r2["alpine"], "global default must reach the substituted form");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_arg_invisible_in_stage_without_redeclaration() {
+        // Dockerfile scope (option A): a global ARG not redeclared in the stage
+        // is invisible there — `$FOO` expands empty, exactly like buildah. The
+        // resolver must mirror this so identity equals the built image.
+        let dir = tiny_ctx("glob-invis");
+        let dsl = "ARG FOO=bar\nFROM alpine\nRUN echo [$FOO]\n";
+        let f = parse(dsl).unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert("FOO".to_string(), "qux".to_string());
+        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver).unwrap();
+        // An override for an arg the stage never redeclares changes nothing.
+        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        assert_eq!(r1["alpine"], r2["alpine"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

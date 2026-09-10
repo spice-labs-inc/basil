@@ -71,6 +71,7 @@ impl Parser {
         let mut targets = Vec::new();
         let mut reactions = Vec::new();
         let mut default_platforms = Vec::new();
+        let mut global_args = Vec::new();
         let mut current: Option<Target> = None;
 
         while let Some(line) = self.peek().cloned() {
@@ -114,6 +115,17 @@ impl Parser {
                         "REGISTER must appear inside a target (after FROM)",
                     );
                 }
+                "ARG" if current.is_none() => {
+                    // File-level (global-scope) ARG before the first FROM: a
+                    // default for every target's build arg of the same name,
+                    // visible to a stage only after it redeclares the arg
+                    // itself (Dockerfile global-scope semantics).
+                    self.bump();
+                    let parsed = self.parse_arg(rest, line.number)?;
+                    if let Instruction::Arg(a) = parsed {
+                        global_args.push(a);
+                    }
+                }
                 _ if !is_known_or_deferred(kw) => {
                     return self.err(line.number, format!("unexpected directive `{kw}`"));
                 }
@@ -139,7 +151,14 @@ impl Parser {
                         if value.is_empty() {
                             return self.err(line.number, "REGISTER requires a full image ref");
                         }
-                        target.register = Some(value.to_string());
+                        // Expand `$VAR` / `${VAR}` against the ARGs in scope:
+                        // per-target declarations (earlier in the stage), then
+                        // the file-level global scope. An unresolved reference
+                        // is a parse error — a push location must never
+                        // silently become an empty string.
+                        let expanded =
+                            self.expand_register_vars(value, target, &global_args, line.number)?;
+                        target.register = Some(expanded);
                     } else if kw == "GIVEN" {
                         // Multiple GIVEN lines accumulate their paths into one
                         // closure set (e.g. `GIVEN Cargo.*` then `GIVEN */Cargo.toml`).
@@ -164,6 +183,7 @@ impl Parser {
             targets,
             reactions,
             default_platforms,
+            global_args,
         })
     }
 
@@ -252,6 +272,89 @@ impl Parser {
         };
         target.instructions.push(instr);
         Ok(())
+    }
+
+    /// Expand `$VAR` / `${VAR}` references in a `REGISTER` value. Resolves
+    /// against the ARGs in scope: per-target declarations already parsed (so
+    /// `ARG` lines above the REGISTER win over globals), then the file-level
+    /// global scope. An unresolved reference is a parse error — a push
+    /// location must not silently become an empty string.
+    fn expand_register_vars(
+        &self,
+        value: &str,
+        target: &Target,
+        global_args: &[Arg],
+        line: usize,
+    ) -> Result<String, Error> {
+        // Resolver: target-scope ARG defaults first, then global-scope defaults.
+        let mut scope: HashMap<&str, &str> = HashMap::new();
+        for instr in &target.instructions {
+            if let Instruction::Arg(a) = instr {
+                if let Some(d) = a.default.as_deref() {
+                    scope.insert(&a.name, d);
+                }
+            }
+        }
+        for a in global_args {
+            if let Some(d) = a.default.as_deref() {
+                scope.entry(&a.name).or_insert(d);
+            }
+        }
+
+        let bytes = value.as_bytes();
+        let mut out = String::with_capacity(value.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c == '$' && i + 1 < bytes.len() {
+                if bytes[i + 1] == b'{' {
+                    if let Some(close) = value[i + 2..].find('}') {
+                        let name = &value[i + 2..i + 2 + close];
+                        match scope.get(name) {
+                            Some(v) => out.push_str(v),
+                            None => {
+                                return self.err(
+                                    line,
+                                    format!(
+                                        "REGISTER references `${{{name}}}` but no ARG with a default declares it"
+                                    ),
+                                )
+                            }
+                        }
+                        i += 2 + close + 1;
+                        continue;
+                    }
+                } else if bytes[i + 1] == b'$' {
+                    out.push('$');
+                    i += 2;
+                    continue;
+                } else if bytes[i + 1].is_ascii_alphanumeric() || bytes[i + 1] == b'_' {
+                    let mut j = i + 1;
+                    while j < bytes.len()
+                        && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                    {
+                        j += 1;
+                    }
+                    let name = &value[i + 1..j];
+                    match scope.get(name) {
+                        Some(v) => out.push_str(v),
+                        None => {
+                            return self.err(
+                                line,
+                                format!(
+                                    "REGISTER references `${name}` but no ARG with a default declares it"
+                                ),
+                            )
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        Ok(out)
     }
 
     fn parse_arg(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
@@ -985,6 +1088,49 @@ mod tests {
     }
 
     #[test]
+    fn register_expands_global_arg_var() {
+        // `REGISTER ${registry}/fennel` resolves the file-level global ARG.
+        let src = "ARG registry=127.0.0.1:5001\nFROM alpine AS fennel\nREGISTER ${registry}/fennel\n";
+        let f = parse(src).unwrap();
+        assert_eq!(f.targets[0].register.as_deref(), Some("127.0.0.1:5001/fennel"));
+        assert_eq!(f.targets[0].push_ref(), "127.0.0.1:5001/fennel");
+    }
+
+    #[test]
+    fn register_expands_bare_var_and_dollar_syntax() {
+        // `$VAR` (no braces), `${VAR}`, and `$$` (literal dollar) all work.
+        let src = "ARG h=127.0.0.1\nARG port=5001\n\
+FROM alpine AS app\nREGISTER $h:${port}/app:$$tag\n";
+        let f = parse(src).unwrap();
+        assert_eq!(f.targets[0].register.as_deref(), Some("127.0.0.1:5001/app:$tag"));
+    }
+
+    #[test]
+    fn register_target_arg_overrides_global() {
+        // A per-target ARG default wins over the same-named global default.
+        let src = "ARG registry=global:5000\nFROM alpine AS app\n\
+ARG registry=127.0.0.1:5001\nREGISTER ${registry}/app\n";
+        let f = parse(src).unwrap();
+        assert_eq!(f.targets[0].register.as_deref(), Some("127.0.0.1:5001/app"));
+    }
+
+    #[test]
+    fn register_unresolved_var_is_error() {
+        // A pushed location must never silently become empty: an undeclared
+        // variable is a parse error, not an empty substitution.
+        let e = parse("FROM alpine AS app\nREGISTER ${registry}/app\n").unwrap_err();
+        assert!(e.message.contains("no ARG with a default declares it"), "{}", e.message);
+        assert!(e.message.contains("${registry}"), "{}", e.message);
+    }
+
+    #[test]
+    fn register_undeclared_bare_var_is_error() {
+        let e = parse("FROM alpine AS app\nREGISTER $host/app\n").unwrap_err();
+        assert!(e.message.contains("no ARG with a default declares it"), "{}", e.message);
+        assert!(e.message.contains("$host"), "{}", e.message);
+    }
+
+    #[test]
     fn parses_given_paths() {
         let src = "FROM alpine AS t\nRUN echo hi\nGIVEN Cargo.toml src/ config/*.yaml\n";
         let f = parse(src).unwrap();
@@ -1072,6 +1218,45 @@ mod tests {
     fn rejects_instruction_outside_target() {
         let e = parse("RUN echo hi\n").unwrap_err();
         assert!(e.message.contains("outside any target"), "{}", e.message);
+    }
+
+    #[test]
+    fn parses_global_arg_before_from() {
+        // File-level (global-scope) ARG before the first FROM is accepted and
+        // collected separately from per-target ARGs.
+        let src = "ARG VERSION=\"\"\nFROM alpine\nARG LOCAL=1\nRUN echo hi\n";
+        let f = parse(src).unwrap();
+        assert_eq!(f.global_args.len(), 1);
+        assert_eq!(f.global_args[0].name, "VERSION");
+        // Quote characters are preserved verbatim in the default (same as
+        // per-target ARG parsing).
+        assert_eq!(f.global_args[0].default.as_deref(), Some("\"\""));
+        // The per-target ARG stays on the target, not the global list.
+        assert_eq!(f.targets[0].instructions.len(), 2);
+        assert_eq!(f.targets[0].instructions[0], Instruction::Arg(crate::dsl::ast::Arg {
+            name: "LOCAL".to_string(),
+            default: Some("1".to_string()),
+            line: 3,
+        }));
+    }
+
+    #[test]
+    fn parses_bare_global_arg() {
+        let src = "ARG VERSION\nFROM alpine\n";
+        let f = parse(src).unwrap();
+        assert_eq!(f.global_args.len(), 1);
+        assert_eq!(f.global_args[0].default, None);
+    }
+
+    #[test]
+    fn global_arg_after_from_is_target_scoped() {
+        // Once a target has started, ARG belongs to that target — not the
+        // global list.
+        let src = "FROM alpine\nARG X=2\n";
+        let f = parse(src).unwrap();
+        assert!(f.global_args.is_empty());
+        assert_eq!(f.targets[0].instructions.len(), 1);
+        assert!(matches!(&f.targets[0].instructions[0], Instruction::Arg(a) if a.name == "X"));
     }
 
     #[test]

@@ -114,7 +114,6 @@ a declared allowlist. Per target `T`:
 C(T) = derivedData(T)
        ∪ C(B)   for every depended stage B          // FROM <stage>, COPY --from=<stage>
        ∪ { resolvedDigest(X) }  for external bases  // FROM <image>
-       ∪ args(T)                                   // resolved ARG / --build-arg
        ∪ platforms(T)                              // declared build platforms
        ∪ programHash(T)                            // ordered, arg-expanded instructions
        ∪ { basil-version }
@@ -138,8 +137,20 @@ C(T) = derivedData(T)
   `ARG`/`ENV` references expanded. Includes every `RUN` command string and the
   image-config instructions (`ENV`, `CMD`, `ENTRYPOINT`, `USER`, `WORKDIR`,
   `LABEL`, `EXPOSE`, `VOLUME`), so a command or config change changes identity.
+  `ARG` declarations themselves are excluded: an ARG is a textual substitution,
+  so only its **substituted form** at a `$VAR` use site matters. An unreferenced
+  ARG (global or per-target) has zero identity effect; a referenced one enters
+  through the expanded text, so a `--build-arg` override changes the tag only
+  for targets that use the variable.
   Excludes comments and whitespace (they don't churn the tag) and the
   reaction/TASK clauses (policy and side effects, not image content).
+
+**Build args (`ARG`)** — declared either at file scope (before the first
+`FROM`, Dockerfile global scope) or inside a target. A file-level ARG defaults
+its name across the file; a stage only sees it after redeclaring the arg
+(bare, or with its own default), mirroring Dockerfile scope rules. The
+resolver feeds `programHash`'s expansion only — ARG values never enter the
+closure as a separate record.
 - **`FROM` digest** — folded resolved, not as the ref string. Because registries
   are content-addressed, a manifest digest is a commitment over every layer:
   the whole base image is covered without fetching a blob.
@@ -315,9 +326,9 @@ a target's image. Promotion is not a new verb: it is `ON tag BUILD <target>…`
 - **Version as input** — basil reserves `ARG VERSION` and passes
   `--build-arg VERSION=<version>` when a `tag` or `release` event matches. Because identity
   is derived, only a target that actually references `VERSION` consumes it:
-  - **Referenced** (`RUN go build -ldflags "-X main.version=$VERSION"`) — the
-    version joins `args(T)` -> a fresh `tagHash` -> a real build -> the built
-    image is tagged `<name>:v1.5.8`.
+  - **Referenced** (`RUN go build -ldflags "-X main.version=$VERSION"`, with the
+    arg declared), the override reaches programHash's substitution -> a fresh
+    `tagHash` -> a real build -> the built image is tagged `<name>:v1.5.8`.
   - **Unreferenced** — the closure is unchanged -> `<name>:<tagHash>` already
     exists -> the same manifest is **retagged** as `<name>:v1.5.8` (a registry
     PUT, no build).

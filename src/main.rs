@@ -41,6 +41,7 @@ fn main() -> anyhow::Result<()> {
             let tags = basil::identity::closure::compute_closure(
                 &file.targets,
                 &file.default_platforms,
+                &file.global_args,
                 ctx,
                 &build_file,
                 &HashMap::new(),

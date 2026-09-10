@@ -164,13 +164,18 @@ fn var_decl(name: &str, default: &str) -> String {
 }
 
 /// Compute the program hash: SHA-256 over canonical, arg-expanded instruction
-/// text joined by a separator.
+/// text joined by a separator. `ARG` declarations themselves are skipped —
+/// identity reflects the substituted form at `$VAR` use sites in the other
+/// instructions, never the ARG line (so an unreferenced ARG has zero effect).
 pub fn program_hash(
     instructions: &[Instruction],
     resolve: &dyn Fn(&str) -> Option<String>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for instr in instructions {
+        if matches!(instr, Instruction::Arg(_)) {
+            continue;
+        }
         let rendered = render_instruction(instr);
         let expanded = expand_vars(&rendered, resolve);
         hasher.update(expanded.as_bytes());
