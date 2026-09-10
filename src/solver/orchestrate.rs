@@ -96,6 +96,8 @@ async fn resolve_unpinned_bases(
 }
 
 /// Inputs to a build.
+/// Everything a build entry point needs about the run.
+#[derive(Clone)]
 pub struct BuildInput<'a> {
     pub file: &'a str,
     pub context: &'a std::path::Path,
@@ -256,15 +258,16 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
 
     let mut out: Vec<(String, String)> = Vec::new();
 
-    // If the content tag already exists in the registry, the exact image is
-    // already published — don't rebuild (parity with handle_event's idempotent
-    // check).
-    let idempotent_skip = idempotent_all_exist(&deliverables, &closures).await?;
-    if idempotent_skip {
+    // If every content tag already exists in its registry, the exact images
+    // are already published — don't rebuild (parity with handle_event's
+    // idempotent check). The probes confirmed registration; the noop path
+    // still states each registered image and its content tag.
+    let published = idempotent_published(&deliverables, &closures).await?;
+    if !published.is_empty() {
         println!("basil: content tags already published -- no build (idempotent check)");
-        for (name, push_ref) in &deliverables {
+        for (name, push_ref, tag) in &published {
+            println!("basil: image {push_ref}:{tag} (registered)");
             // OUTPUT still runs: pull the published image and extract.
-            let tag = digest_of(name, &closures)?;
             crate::solver::buildah::extract_outputs_from_image(
                 &format!("{push_ref}:{tag}"),
                 inp.context,
@@ -478,13 +481,16 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     .map_err(anyhow::Error::msg)?;
     println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
-    // Idempotent check: skip when every deliverable's content tag exists.
-    let idempotent_skip = idempotent_all_exist(&deliverables, &closures).await?;
-    if idempotent_skip {
+    // Idempotent check: skip when every deliverable's content tag exists, and
+    // state each registered image on the noop path.
+    let published = idempotent_published(&deliverables, &closures).await?;
+    if !published.is_empty() {
         println!("basil: content tags already published -- no build (idempotent check)");
+        for (_, push_ref, tag) in &published {
+            println!("basil: image {push_ref}:{tag} (registered)");
+        }
         // OUTPUT still runs on a skip: pull the published image and extract.
-        for (name, push_ref) in &deliverables {
-            let tag = digest_of(name, &closures)?;
+        for (name, push_ref, tag) in &published {
             crate::solver::buildah::extract_outputs_from_image(
                 &format!("{push_ref}:{tag}"),
                 inp.context,
@@ -527,34 +533,36 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     )])
 }
 
-/// Idempotent check: every deliverable's content tag already exists in its
-/// registry. `deliverables` are `(stage name, push ref)`; the check looks up
-/// the push ref (the registry where content is published).
-async fn idempotent_all_exist(
+/// Idempotent check: every deliverable's content tag must already exist in its
+/// registry. Returns the registered (stage name, push ref, content tag) triples
+/// when the build can be skipped outright — the noop path prints each published
+/// image from this list, so a noop rebuild still makes the registry
+/// registration explicit. A missing tag stops the check (the build will
+/// publish it); a probe error falls back to building, which re-surfaces any
+/// real registry problem at push time.
+async fn idempotent_published(
     deliverables: &[(String, String)],
     closures: &std::collections::HashMap<String, [u8; 32]>,
-) -> anyhow::Result<bool> {
-    let mut all = true;
+) -> anyhow::Result<Vec<(String, String, String)>> {
+    let mut published = Vec::new();
     for (name, push_ref) in deliverables {
         let tag = digest_of(name, closures)?;
         let ir = crate::solver::registry::parse_ref(push_ref, &tag)
             .map_err(|e| anyhow::anyhow!("deliverable `{push_ref}`: {e}"))?;
         let client = ir.client();
         match client.manifest_exists(&ir.repo, &tag).await {
-            Ok(true) => {}
+            Ok(true) => published.push((name.clone(), push_ref.clone(), tag)),
             Ok(false) => {
                 tracing::info!("idempotent: `{push_ref}:{tag}` does not exist yet (will build)");
-                all = false;
-                break;
+                return Ok(Vec::new());
             }
             Err(e) => {
                 tracing::warn!("idempotent registry check for `{push_ref}:{tag}` failed: {e}");
-                all = false;
-                break;
+                return Ok(Vec::new());
             }
         }
     }
-    Ok(all)
+    Ok(published)
 }
 
 /// Whether a target is a deliverable: it names a registry ref directly

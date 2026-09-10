@@ -14,9 +14,14 @@ fn buildah_present() -> bool {
 }
 
 async fn registry_up() -> bool {
-    let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
-    // tags/list on a nonexistent repo still proves the registry answers.
-    c.list_tags("probe").await.is_ok()
+    // The registry answers /v2/ on any healthy deployment (200, or 401 when
+    // auth is on) — the probe must not require an existing repo, which a fresh
+    // throwaway registry has none of.
+    reqwest::Client::new()
+        .head("http://127.0.0.1:5001/v2/")
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success() || r.status().as_u16() == 401)
 }
 
 /// The fixture: a scratch deliverable carrying a context file + config.
@@ -45,7 +50,7 @@ async fn buildah_e2e_build_and_config() {
         event_json: Some(event),
         target_filter: None,
     };
-    let results = handle_event(inp).await.unwrap();
+    let results = handle_event(inp.clone()).await.unwrap();
     let digest = results
         .iter()
         .find(|(k, _)| k == "digest")
@@ -73,6 +78,25 @@ async fn buildah_e2e_build_and_config() {
         cfg["Env"]
     );
     assert!(digest.len() == 64, "bad digest {digest}");
+
+    // A second delivery of the same event noops: the content tag exists, so
+    // basil re-confirms the image is registered and reports an idempotent skip
+    // instead of rebuilding. The registered image must still be pullable.
+    let results2 = handle_event(inp).await.unwrap();
+    let (_, result) = results2
+        .iter()
+        .find(|(k, _)| k == "result")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .unwrap();
+    assert_eq!(result, "idempotent-skip", "second delivery must noop");
+    let digest2 = results2
+        .iter()
+        .find(|(k, _)| k == "digest")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(digest2, digest, "noop re-derives the same content tag");
+    let (_, manifest2) = c.get_manifest("bah_e2e_probe", &digest2).await.unwrap();
+    assert!(!manifest2.is_empty(), "registered image must remain pullable");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
