@@ -320,8 +320,9 @@ require it:
   Other events (e.g. `image-published`) are **deferred** — a native carrier
   exists (`registry_package`), but the mapping is not pinned yet.
 
-- Manual trigger = `basil build [-t target]` builds a deliverable directly,
-  with no event (default: every qualified deliverable in the file).
+- Manual trigger = `basil build [CONTEXT] [-f FILE] [-t target]` builds a
+  deliverable directly, with no event (default: every qualified deliverable in
+  the file; the DSL file defaults to `<context>/Basilfile`, docker-style).
 
 ## Promotion (version tags)
 

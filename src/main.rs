@@ -23,6 +23,24 @@ impl basil::identity::closure::BaseResolver for CliResolver {
         })
     }
 }
+
+/// Resolve the DSL file the way `docker build` resolves its Dockerfile: an
+/// explicit `-f` path is absolute as-is or relative against the current
+/// directory; with no `-f`, the default is `<context>/Basilfile`.
+fn resolve_build_file(file: &Option<String>, context: &str) -> String {
+    match file.as_deref() {
+        Some(f) if std::path::Path::new(f).is_absolute() => f.to_string(),
+        Some(f) => std::env::current_dir()
+            .map(|cwd| cwd.join(f))
+            .unwrap_or_else(|_| std::path::PathBuf::from(f))
+            .to_string_lossy()
+            .into_owned(),
+        None => std::path::Path::new(context)
+            .join("Basilfile")
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -34,22 +52,23 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Closure(args) => {
-            let src = basil::fsctx::fs_err(std::fs::read_to_string(&args.file), &args.file, "read")?;
-            let file = basil::dsl::parser::parse(&src).map_err(anyhow::Error::msg)?;
+            let file = resolve_build_file(&args.file, &args.context);
+            let src = basil::fsctx::fs_err(std::fs::read_to_string(&file), &file, "read")?;
+            let parsed = basil::dsl::parser::parse(&src).map_err(anyhow::Error::msg)?;
             let ctx = std::path::Path::new(&args.context);
-            let build_file = std::path::absolute(&args.file).unwrap_or_else(|_| args.file.clone().into());
+            let build_file = std::path::absolute(&file).unwrap_or_else(|_| file.clone().into());
             let tags = basil::identity::closure::compute_closure(
-                &file.targets,
-                &file.default_platforms,
-                &file.global_args,
+                &parsed.targets,
+                &parsed.default_platforms,
+                &parsed.global_args,
                 ctx,
                 &build_file,
                 &HashMap::new(),
                 &mut CliResolver,
             )
             .map_err(anyhow::Error::msg)?;
-            println!("{} target(s), {} reaction(s)\n", file.targets.len(), file.reactions.len());
-            for t in &file.targets {
+            println!("{} target(s), {} reaction(s)\n", parsed.targets.len(), parsed.reactions.len());
+            for t in &parsed.targets {
                 let tag = basil::identity::closure::hex(
                     &tags.get(&t.name).copied().unwrap_or([0; 32]),
                 );
@@ -59,10 +78,11 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Build(args) => {
+            let file = resolve_build_file(&args.file, &args.context);
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 let inp = basil::solver::orchestrate::BuildInput {
-                    file: &args.file,
+                    file: &file,
                     context: std::path::Path::new(&args.context),
                     event_json: None,
                     target_filter: args.target.as_ref(),
@@ -76,6 +96,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Handle(args) => {
+            let file = resolve_build_file(&args.file, &args.context);
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 let event_json: String = match &args.event {
@@ -88,7 +109,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 };
                 let inp = basil::solver::orchestrate::BuildInput {
-                    file: &args.file,
+                    file: &file,
                     context: std::path::Path::new(&args.context),
                     event_json: Some(&event_json),
                     target_filter: None,

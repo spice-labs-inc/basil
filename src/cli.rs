@@ -25,24 +25,26 @@ pub enum Command {
 
 #[derive(clap::Args)]
 pub struct ClosureArgs {
-    /// The DSL file to parse.
-    #[arg(default_value = "Basilfile")]
-    pub file: String,
     /// Build context root (where COPY/ADD and `.dockerignore` resolve).
-    #[arg(long, default_value = ".")]
+    #[arg(default_value = ".")]
     pub context: String,
+    /// DSL file to parse; defaults to `<context>/Basilfile` (docker-style).
+    /// A relative `-f` path resolves against the current directory.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<String>,
     /// Restrict the report to one target.
     pub target: Option<String>,
 }
 
 #[derive(clap::Args)]
 pub struct BuildArgs {
-    /// The DSL file to parse.
-    #[arg(default_value = "Basilfile")]
-    pub file: String,
     /// Build context root (where COPY/ADD and `.dockerignore` resolve).
-    #[arg(long, default_value = ".")]
+    #[arg(default_value = ".")]
     pub context: String,
+    /// DSL file to parse; defaults to `<context>/Basilfile` (docker-style).
+    /// A relative `-f` path resolves against the current directory.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<String>,
     /// Target to build; default is every qualified deliverable target.
     #[arg(short = 't', long)]
     pub target: Option<String>,
@@ -50,12 +52,13 @@ pub struct BuildArgs {
 
 #[derive(clap::Args)]
 pub struct HandleArgs {
-    /// The DSL file to parse.
-    #[arg(default_value = "Basilfile")]
-    pub file: String,
     /// Build context root (where COPY/ADD and `.dockerignore` resolve).
-    #[arg(long, default_value = ".")]
+    #[arg(default_value = ".")]
     pub context: String,
+    /// DSL file to parse; defaults to `<context>/Basilfile` (docker-style).
+    /// A relative `-f` path resolves against the current directory.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<String>,
     /// Path to an event JSON file; read stdin if absent.
     #[arg(long)]
     pub event: Option<String>,

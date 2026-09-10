@@ -260,12 +260,16 @@ Whether an image is rebuilt is decided by whether that tag already exists (the
 ## Command reference
 
 ```
-basil closure [FILE] [TARGET] [--context DIR]   # report each target's tagHash
-basil build [FILE] [--context DIR] [-t TARGET]  # build a deliverable directly (no event)
-basil handle [FILE] [--context DIR] [--event F] # read an event (stdin or -F) and react
-basil pin [FILE]                               # resolve unpinned bases to @sha256 in place
+basil closure [CONTEXT] [TARGET] [-f FILE]   # report each target's tagHash
+basil build [CONTEXT] [-f FILE] [-t TARGET]  # build a deliverable directly (no event)
+basil handle [CONTEXT] [-f FILE] [--event F] # read an event (stdin or --event) and react
+basil pin [FILE]                            # resolve unpinned bases to @sha256 in place
 basil gc <AGE> [FILE] [--repo FQ] [--dry-run]   # prune basil-owned tags older than <AGE>
 ```
+
+The context is a bare positional arg, docker-style: the DSL file defaults to
+`<context>/Basilfile`; `-f FILE` overrides it (a relative `-f` resolves against
+the current directory, not the context).
 
 - **`build`** never reads stdin; with no `-t` it builds every qualified
   deliverable.
