@@ -14,7 +14,7 @@
 //!
 //! `tagHash = H(C(T))`, a SHA-256 over a canonical, deterministically sorted,
 //! length-prefixed record of scalar components. `derivedData` is folded in as
-//! its synthetic-snapshot digest; an internal base `C(B)` is folded in as B's
+//! its git-tree digest; an internal base `C(B)` is folded in as B's
 //! own `tagHash` (so the record stays bounded even across deep DAGs). The
 //! closure is resolved bottom-up (dependencies before dependents).
 
@@ -140,6 +140,11 @@ pub fn compute_closure(
     let by_name: std::collections::HashMap<&str, &Target> =
         targets.iter().map(|t| (t.name.as_str(), t)).collect();
 
+    // Snapshot the git state under the context once: clean tracked subtrees
+    // borrow git's precomputed hashes, so every target's derived-data digest
+    // shares one probe round.
+    let repo = derived_data::discover_git(context);
+
     // Topological order: repeatedly resolve targets whose bases are done.
     let mut done = std::collections::HashSet::new();
     let mut remaining: Vec<(&str, &Target)> = targets.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -215,14 +220,16 @@ pub fn compute_closure(
             // Derive data (context files this target reads). The build file that
             // produced `targets` is excluded: its effect is already captured by
             // programHash, so including it would make identity self-referential.
-            let (derived, bytes) = derived_data::derived_data_digest_and_bytes(target, context, build_file)
+            let (derived, bytes) = derived_data::derived_data_digest_and_bytes(target, context, build_file, &repo)
                 .map_err(|e| format!("deriving data for `{name}`: {e}"))?;
-            // Surface a large context so the operator knows what to dockerignore
-            // rather than silently hashing e.g. an unexcluded 512MB blob.
+            // Surface large data the operator may want dockerignored: the byte
+            // count covers only what basil actually reads while hashing — a
+            // clean tracked blob covered by a borrowed git tree hash is never
+            // read and never warns.
             const LARGE_CONTEXT_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
             if bytes > LARGE_CONTEXT_BYTES {
                 tracing::warn!(
-                    "identity `{name}`: derived-data reads {:.0} MiB of context (100 MiB+) — check .dockerignore for large blobs",
+                    "identity `{name}`: derived-data hashes {:.0} MiB of context not covered by a git tree (100 MiB+) — check .dockerignore for large blobs",
                     bytes as f64 / (1024.0 * 1024.0)
                 );
             }

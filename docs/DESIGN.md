@@ -123,7 +123,9 @@ C(T) = derivedData(T)
   at parse time: `COPY`/`ADD` sources and `--mount=type=bind,from=context`
   sources, filtered by `.dockerignore` (Docker's own rules, honored as-is),
   globs expanded against the local context. `COPY .` therefore means
-  whole-tree identity explicitly — there is no implicit default. The build file
+  whole-tree identity explicitly — there is no implicit default. The git
+  metadata directory (`.git`, at any depth) is always excluded, like Docker's
+  context archive: it can never feed identity. The build file
   itself (the recipe that produced the target graph) is excluded: its effect is
   already captured by `programHash`, so hashing it would make identity
   self-referential. A target may
@@ -160,10 +162,19 @@ closure as a separate record.
   same artifact shape.
 
 `tagHash = H(C(T))` — a deterministic digest over a canonical serialization of
-`C(T)`. `derivedData` is digested as an OCI-style synthetic snapshot
-(deterministic tar: sorted entries, `uid`/`gid` 0, normalized headers; gzip at
-fixed level, no mtime/name in the header). Scalar components (`programHash`,
-base digests, args, version) are encoded as a sorted, length-prefixed record.
+`C(T)`. `derivedData` is digested as a synthetic **git tree object** built with
+git's own object model and hash: a subtree the local git index already covers —
+fully tracked, unmodified, and entirely contained in the derived set —
+contributes git's precomputed tree/blob hashes instead of re-hashing file
+contents; partial (dockerignore/GIVEN/glob-filtered) or dirty
+(modified/untracked) subtrees are hashed from the working tree. A context
+outside any git repository has nothing borrowable and is fully computed — the
+same object model, so the digest stays deterministic in both cases. Because the
+digest commits to git's modes, the executable bit of a context file now changes
+identity (a `chmod +x` retags anything that `COPY`s it). Empty directories
+(git cannot represent them) fold in as a synthetic zero-entry tree. Scalar
+components (`programHash`, base digests, args, version) are encoded as a sorted,
+length-prefixed record.
 Determinism is a correctness requirement, pinned by a **conformance fixture**:
 checked-in golden inputs whose expected digest the test suite recomputes.
 
