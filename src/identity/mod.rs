@@ -3,4 +3,5 @@
 pub mod closure;
 pub mod derived_data;
 pub mod dockerignore;
+pub mod modules;
 pub mod program_hash;

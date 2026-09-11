@@ -57,6 +57,16 @@ fn main() -> anyhow::Result<()> {
             let parsed = basil::dsl::parser::parse(&src).map_err(anyhow::Error::msg)?;
             let ctx = std::path::Path::new(&args.context);
             let build_file = std::path::absolute(&file).unwrap_or_else(|_| file.clone().into());
+            let file_dir = build_file.parent().unwrap_or(std::path::Path::new("."));
+            // Modules resolved offline (pinned bases only — an unpinned module
+            // base fails hard, matching the offline closure rule).
+            let index = basil::identity::modules::discover_module_index(&parsed.targets, file_dir)
+                .map_err(anyhow::Error::msg)?;
+            let module_digests = basil::identity::modules::compute_module_digests(
+                &index,
+                &mut CliResolver,
+            )
+            .map_err(anyhow::Error::msg)?;
             let tags = basil::identity::closure::compute_closure(
                 &parsed.targets,
                 &parsed.default_platforms,
@@ -65,6 +75,7 @@ fn main() -> anyhow::Result<()> {
                 &build_file,
                 &HashMap::new(),
                 &mut CliResolver,
+                &module_digests,
             )
             .map_err(anyhow::Error::msg)?;
             println!("{} target(s), {} reaction(s)\n", parsed.targets.len(), parsed.reactions.len());

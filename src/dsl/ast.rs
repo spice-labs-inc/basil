@@ -46,8 +46,9 @@ pub struct Target {
     /// feed the tagHash. It is an identity-only directive (not rendered to the
     /// builder).
     pub given: Option<Vec<String>>,
-    /// The stage's base image.
-    pub base: BaseImage,
+    /// The stage's base — `FROM` image or `MODULE` dependency. Exactly one of
+    /// the base forms is set (the parser enforces it).
+    pub base: Base,
     /// Build steps in source order (no `FROM`; the base is separate).
     pub instructions: Vec<Instruction>,
     /// Optional `TASK` clause — side-effect commands run on the resolved base
@@ -67,6 +68,15 @@ impl Target {
     /// where the result image is published.
     pub fn push_ref(&self) -> &str {
         self.register.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The `FROM` image base, when this target's base is an image (not a
+    /// `MODULE`). Module-base targets return `None`.
+    pub fn base_image(&self) -> Option<&BaseImage> {
+        match &self.base {
+            Base::Image(b) => Some(b),
+            Base::Module(_) => None,
+        }
     }
 }
 
@@ -89,6 +99,36 @@ pub struct BaseImage {
     /// `$TARGETPLATFORM` are build-staged vars buildah expands at build time;
     /// a literal `linux/amd64` selects that platform.
     pub platform: Option<String>,
+}
+
+/// A `MODULE <path> [-f <file>] [TARGET <name>] [AS <name>]` base: the stage's
+/// base image is another basil build — its own context + Basilfile.
+///
+/// The module is a separate closure domain: its deliverable's `tagHash` is
+/// folded into the importer's identity and the importer's Containerfile renders
+/// `FROM <module-register>:<module-tagHash> AS <alias>`. Build semantics are
+/// use-or-build: if that content tag exists in the module's registry the image
+/// is pulled, otherwise the module is built and pushed first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRef {
+    /// Module context dir, resolved against the importing file's directory
+    /// (absolute paths used as-is).
+    pub path: String,
+    /// The module's Basilfile name; defaults to `<path>/Basilfile`.
+    pub file: Option<String>,
+    /// Optional deliverable selector (`TARGET <name>`); when absent the module
+    /// file must declare exactly one qualified deliverable.
+    pub target: Option<String>,
+    /// DSL line number (error context).
+    pub line: usize,
+}
+
+/// A target's base: either a `FROM <image>` or a `MODULE <path>` dependency.
+/// Exactly one is set — the parser enforces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Base {
+    Image(BaseImage),
+    Module(ModuleRef),
 }
 
 /// A build instruction inside a target.

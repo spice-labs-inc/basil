@@ -1,4 +1,6 @@
 {
   "build": "34c36ef685034dda73078a8e395f434e13abc5e40b70aad3d71f0c681a8bc3bb",
-  "ghcr.io/conformance/app": "fd3f0293cd7d4403fb0885cfebc60ddd1ed7e5300d7e4e64cce3d46b3bbd3d74"
+  "ghcr.io/conformance/app": "fd3f0293cd7d4403fb0885cfebc60ddd1ed7e5300d7e4e64cce3d46b3bbd3d74",
+  "ghcr.io/conformance/app2": "1f65ce0d823c21c1edbc3b978eab34ac70228274f17d47499952207d8d34cd1a",
+  "mod": "84ce5210be19ea21936181a0449f34bb7d943fb9ef24b6f138baa8999cda1ee8"
 }

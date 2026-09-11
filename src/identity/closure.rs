@@ -24,6 +24,9 @@ use crate::dsl::ast::{Platform, Target};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+#[cfg(test)]
+use std::collections::BTreeMap;
+
 /// The basil build-time version folded into every closure.
 pub const BASIL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -118,6 +121,8 @@ enum BaseRef {
     External(String),
     /// Another target's closure hash.
     Stage(String),
+    /// A module deliverable's closure hash + its import key.
+    Module([u8; 32], String),
 }
 
 /// Compute every target's `tagHash` bottom-up.
@@ -133,6 +138,7 @@ pub fn compute_closure(
     build_file: &Path,
     overrides: &std::collections::HashMap<String, String>,
     resolver: &mut dyn BaseResolver,
+    modules: &std::collections::BTreeMap<String, [u8; 32]>,
 ) -> Result<std::collections::HashMap<String, [u8; 32]>, String> {
     let mut result: std::collections::HashMap<String, [u8; 32]> =
         std::collections::HashMap::new();
@@ -163,10 +169,13 @@ pub fn compute_closure(
             // target; their closure hashes are folded into the tagHash (the
             // DOC-string invariant `∪ C(B) for each depended stage B`).
             let mut stage_deps: Vec<String> = Vec::new();
-            let crate::dsl::ast::BaseImage { raw, .. } = &target.base;
-            if let Some(bs) = by_name.get(raw.as_str()) {
-                if bs.name != name {
-                    stage_deps.push(bs.name.to_string());
+            if let crate::dsl::ast::Base::Image(crate::dsl::ast::BaseImage { raw, .. }) =
+                &target.base
+            {
+                if let Some(bs) = by_name.get(raw.as_str()) {
+                    if bs.name != name {
+                        stage_deps.push(bs.name.to_string());
+                    }
                 }
             }
             for instr in &target.instructions {
@@ -193,9 +202,13 @@ pub fn compute_closure(
             }
 
             // Resolve the base reference.
-            let _base_platform = target.base.platform.clone();
+            let base_platform = match &target.base {
+                crate::dsl::ast::Base::Image(b) => b.platform.clone(),
+                crate::dsl::ast::Base::Module(_) => None,
+            };
+            let _base_platform = base_platform;
             let base_ref = match &target.base {
-                crate::dsl::ast::BaseImage { raw, tag, digest, .. } => {
+                crate::dsl::ast::Base::Image(crate::dsl::ast::BaseImage { raw, tag, digest, .. }) => {
                     if let Some(bs_name) = by_name.get(raw.as_str()).map(|t| t.name.as_str()) {
                         if bs_name != name {
                             Some(BaseRef::Stage(hex(&result[bs_name])))
@@ -213,6 +226,21 @@ pub fn compute_closure(
                                 .map_err(|e| format!("`{raw}`: {e}"))?,
                         ))
                     }
+                }
+                crate::dsl::ast::Base::Module(m) => {
+                    let key = crate::identity::modules::module_key(
+                        build_file.parent().unwrap_or_else(|| Path::new(".")),
+                        m,
+                    )
+                    .map_err(|e| format!("module base: {e}"))?;
+                    let hash = modules.get(&key).ok_or_else(|| {
+                        format!(
+                            "module `{}` (line {}): no computed digest — the module was not \
+                             resolved before the importer",
+                            m.path, m.line
+                        )
+                    })?;
+                    Some(BaseRef::Module(*hash, key.clone()))
                 }
             };
 
@@ -262,6 +290,9 @@ pub fn compute_closure(
             }
             if let Some(BaseRef::Stage(hash)) = &base_ref {
                 push(&mut record, &format!("base.stage.{}", stage_clean(name)), hash);
+            }
+            if let Some(BaseRef::Module(hash, _key)) = &base_ref {
+                push(&mut record, &format!("base.module.{}", stage_clean(name)), &hex(hash));
             }
             if let Some(p) = &_base_platform {
                 push(&mut record, "base.platform", p);
@@ -385,8 +416,8 @@ COPY marker.txt /x
 RUN go build\n";
         let f = parse(dsl).unwrap();
         let dir = tiny_ctx("det");
-        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
-        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert_eq!(r1, r2);
         assert_eq!(hex(&r1["alpine"]).len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
@@ -397,8 +428,8 @@ RUN go build\n";
         let dir = tiny_ctx("chg");
         let a = parse("FROM alpine\nRUN echo one\n").unwrap();
         let b = parse("FROM alpine\nRUN echo two\n").unwrap();
-        let ra = compute_closure(&a.targets, &[], &a.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
-        let rb = compute_closure(&b.targets, &[], &b.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let ra = compute_closure(&a.targets, &[], &a.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        let rb = compute_closure(&b.targets, &[], &b.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert_ne!(ra["alpine"], rb["alpine"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -408,7 +439,7 @@ RUN go build\n";
         let dir = tiny_ctx("pin");
         let dsl = "FROM alpine:3.23@sha256:abcdef1234567890\nRUN echo hi\n";
         let f = parse(dsl).unwrap();
-        let r = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline()).unwrap();
+        let r = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline(), &BTreeMap::new()).unwrap();
         assert_eq!(hex(&r["alpine"]).len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -418,7 +449,7 @@ RUN go build\n";
         let dir = tiny_ctx("unp");
         let dsl = "FROM alpine:3.23\nRUN echo hi\n";
         let f = parse(dsl).unwrap();
-        let err = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline()).unwrap_err();
+        let err = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline(), &BTreeMap::new()).unwrap_err();
         assert!(err.contains("pinned"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -434,7 +465,7 @@ FROM scratch AS ghcr.io/mycompany/app
 COPY --from=build /a /a
 ";
         let f = parse(dsl).unwrap();
-        let r = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert!(r.contains_key("build"));
         assert!(r.contains_key("ghcr.io/mycompany/app"));
         assert_ne!(r["build"], r["ghcr.io/mycompany/app"]);
@@ -451,7 +482,7 @@ FROM scratch AS ghcr.io/mycompany/app
 COPY --from=build /a /a
 ";
         let f2 = parse(dsl2).unwrap();
-        let r2 = compute_closure(&f2.targets, &[], &f2.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f2.targets, &[], &f2.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert_ne!(
             r["ghcr.io/mycompany/app"],
             r2["ghcr.io/mycompany/app"],
@@ -467,8 +498,8 @@ COPY --from=build /a /a
         let f = parse(dsl).unwrap();
         let mut overrides = HashMap::new();
         overrides.insert("VERSION".to_string(), "1.0".to_string());
-        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
-        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver).unwrap();
+        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert_ne!(r1["alpine"], r2["alpine"]);
     }
 
@@ -481,8 +512,8 @@ COPY --from=build /a /a
         let dir = tiny_ctx("glob-unused");
         let without = parse("FROM alpine\nRUN echo hi\n").unwrap();
         let with = parse("ARG VERSION=\"\"\nFROM alpine\nRUN echo hi\n").unwrap();
-        let r_without = compute_closure(&without.targets, &[], &without.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
-        let r_with = compute_closure(&with.targets, &[], &with.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r_without = compute_closure(&without.targets, &[], &without.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        let r_with = compute_closure(&with.targets, &[], &with.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert_eq!(r_without["alpine"], r_with["alpine"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -499,15 +530,15 @@ COPY --from=build /a /a
         // Default (no override) vs override: different substituted forms.
         let mut overrides = HashMap::new();
         overrides.insert("VERSION".to_string(), "1.5.8".to_string());
-        let r_default = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
-        let r_override = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver).unwrap();
+        let r_default = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        let r_override = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert_ne!(r_default["alpine"], r_override["alpine"]);
 
         // The global default flows through the bare stage redeclaration: the
         // substituted form contains `0.0.0` (the default), not empty.
         let dsl2 = "ARG VERSION=\"9.9.9\"\nFROM alpine\nARG VERSION\nRUN echo $VERSION\n";
         let f2 = parse(dsl2).unwrap();
-        let r2 = compute_closure(&f2.targets, &[], &f2.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f2.targets, &[], &f2.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert_ne!(r_default["alpine"], r2["alpine"], "global default must reach the substituted form");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -522,9 +553,9 @@ COPY --from=build /a /a
         let f = parse(dsl).unwrap();
         let mut overrides = HashMap::new();
         overrides.insert("FOO".to_string(), "qux".to_string());
-        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver).unwrap();
+        let r1 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &overrides, &mut FakeResolver, &BTreeMap::new()).unwrap();
         // An override for an arg the stage never redeclares changes nothing.
-        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver).unwrap();
+        let r2 = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
         assert_eq!(r1["alpine"], r2["alpine"]);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -43,7 +43,9 @@ pub async fn pin_file(src: &str) -> Result<String, String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for t in &file.targets {
-        let b = &t.base;
+        let crate::dsl::ast::Base::Image(b) = &t.base else {
+            continue; // MODULE bases have no FROM line to pin (D5: no recursion)
+        };
         if b.raw == "scratch" || b.digest.is_some() {
             continue; // no digest to add (scratch) or already pinned
         }
@@ -80,10 +82,11 @@ pub async fn pin_file(src: &str) -> Result<String, String> {
     // (after `FROM `, leading `--platform=...` allowed) and swap it.
     let mut lines: Vec<String> = src.lines().map(|l| l.to_string()).collect();
     for t in &file.targets {
-        if let Some(new_base) = pinned.get(&written_base(&t.base)) {
+        let crate::dsl::ast::Base::Image(base_image) = &t.base else { continue };
+        if let Some(new_base) = pinned.get(&written_base(base_image)) {
             let idx = t.line.saturating_sub(1); // 0-based
             if let Some(line) = lines.get_mut(idx) {
-                let replaced = rewrite_from_base(line, &written_base(&t.base), new_base);
+                let replaced = rewrite_from_base(line, &written_base(base_image), new_base);
                 if let Some(r) = replaced {
                     *line = r;
                 }

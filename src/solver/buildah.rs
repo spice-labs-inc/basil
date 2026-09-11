@@ -6,21 +6,38 @@
 //! the deliverable; `ON`/`TASK`/`PLATFORM`/`OUTPUT` are omitted (side-effects /
 //! matching / reverse-copy live in basil, not the image).
 
-use crate::dsl::ast::{Arg, BaseImage, Command, Instruction, Mount, Target};
+use crate::dsl::ast::{Arg, Base, Command, Instruction, Mount, Target};
+
+/// Empty module refs for render tests (module-free files).
+#[cfg(test)]
+static EMPTY_MODULES: std::collections::BTreeMap<std::string::String, std::string::String> =
+    std::collections::BTreeMap::new();
 
 /// The parsed stage graph handed to the buildah backend: the targets in scope
 /// plus the file's global-scope `ARG`s. They travel together — the graph is
 /// what gets rendered to a Containerfile (a targeted build passes a
-/// `dependency_subset` slice with the same file-level args).
+/// `dependency_subset` slice with the same file-level args). Module bases
+/// render to their resolved `FROM <push-ref>:<tagHash>` — the refs map is
+/// keyed by `identity::modules::module_key`, computed against `file_dir` (the
+/// importing file's directory, D4).
 #[derive(Clone, Copy)]
 pub struct Graph<'a> {
     pub targets: &'a [Target],
     pub global_args: &'a [Arg],
+    /// Directory of the importing Basilfile — module paths resolve against it.
+    pub file_dir: &'a std::path::Path,
+    /// Module key -> `FROM`-ready ref (`<push-ref>:<tagHash>`).
+    pub modules: &'a std::collections::BTreeMap<String, String>,
 }
 
 impl<'a> Graph<'a> {
-    pub fn new(targets: &'a [Target], global_args: &'a [Arg]) -> Self {
-        Graph { targets, global_args }
+    pub fn new(
+        targets: &'a [Target],
+        global_args: &'a [Arg],
+        file_dir: &'a std::path::Path,
+        modules: &'a std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        Graph { targets, global_args, file_dir, modules }
     }
 }
 
@@ -34,7 +51,7 @@ pub fn render_containerfile_all(g: Graph) -> String {
     let mut out = render_global_args(g.global_args);
     for t in g.targets {
         // Preserve the AS alias on every stage so --target / --from resolve.
-        out.push_str(&format!("FROM {} AS {}\n", render_base(&t.base), t.name));
+        out.push_str(&format!("FROM {} AS {}\n", render_base(&t.base, g.file_dir, g.modules), t.name));
         for instr in &t.instructions {
             out.push_str(&render_instruction(instr));
             out.push('\n');
@@ -64,7 +81,7 @@ pub fn render_containerfile(g: Graph, deliverable: &str) -> String {
         } else {
             format!(" AS {}", t.name)
         };
-        out.push_str(&format!("FROM {}{}\n", render_base(&t.base), alias));
+        out.push_str(&format!("FROM {}{}\n", render_base(&t.base, g.file_dir, g.modules), alias));
         for instr in &t.instructions {
             out.push_str(&render_instruction(instr));
             out.push('\n');
@@ -85,28 +102,43 @@ fn render_global_args(args: &[Arg]) -> String {
 }
 
 /// Render a `FROM` base. Internal stage deps (`FROM <stage>`) stay as a bare
-/// name (buildah's `AS` alias); external images keep their ref. For non-final
-/// stages we add `AS <name>` only when the name shadows/is referenced; for
-/// simplicity every non-deliverable stage gets `AS <name>` so `--from` works.
-fn render_base(base: &BaseImage) -> String {
-    let mut s = String::new();
-    if let Some(p) = &base.platform {
-        s.push_str(&format!("--platform={p} "));
+/// name (buildah's `AS` alias); external images keep their ref. A module base
+/// renders as its resolved `FROM <push-ref>:<tagHash>` — the module's image is
+/// a real base once built/pushed.
+fn render_base(
+    base: &Base,
+    file_dir: &std::path::Path,
+    modules: &std::collections::BTreeMap<String, String>,
+) -> String {
+    match base {
+        Base::Module(m) => {
+            let key = crate::identity::modules::module_key(file_dir, m).unwrap_or_default();
+            modules
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| format!("MODULE:{}", m.path))
+        }
+        Base::Image(b) => {
+            let mut s = String::new();
+            if let Some(p) = &b.platform {
+                s.push_str(&format!("--platform={p} "));
+            }
+            if b.raw == "scratch" {
+                s.push_str("scratch");
+            } else {
+                s.push_str(&b.raw);
+            }
+            if let Some(tag) = &b.tag {
+                s.push(':');
+                s.push_str(tag);
+            }
+            if let Some(d) = &b.digest {
+                s.push('@');
+                s.push_str(d);
+            }
+            s
+        }
     }
-    if base.raw == "scratch" {
-        s.push_str("scratch");
-    } else {
-        s.push_str(&base.raw);
-    }
-    if let Some(tag) = &base.tag {
-        s.push(':');
-        s.push_str(tag);
-    }
-    if let Some(d) = &base.digest {
-        s.push('@');
-        s.push_str(d);
-    }
-    s
 }
 
 fn render_instruction(i: &Instruction) -> String {
@@ -592,7 +624,7 @@ ENV FOO=bar\n\
 CMD [\"/app\"]\n\
 ON push(main) BUILD 127.0.0.1:5001/app\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
         assert!(cf.starts_with("FROM golang AS build\n"));
         // The deliverable is the final stage, tagged (no AS alias needed).
         assert!(cf.contains("FROM scratch\n"));
@@ -610,7 +642,7 @@ RUN go build -o /bin/app\n\
 FROM scratch AS app\n\
 COPY --from=build /bin/app /app\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile_all(Graph::new(&f.targets, &f.global_args));
+        let cf = render_containerfile_all(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES));
         assert!(cf.contains("FROM golang AS build\n"), "{cf}");
         assert!(cf.contains("FROM scratch AS app\n"), "{cf}");
         assert!(cf.contains("COPY --from=build /bin/app /app"), "{cf}");
@@ -621,7 +653,7 @@ COPY --from=build /bin/app /app\n";
         let src = "FROM alpine AS 127.0.0.1:5001/app\n\
 RUN --mount=type=cache,target=/cache --network=none echo hi\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
         assert!(cf.contains("RUN --mount=type=cache,target=/cache --network=none echo hi"), "{cf}");
     }
 
@@ -637,7 +669,7 @@ RUN --mount=type=cache,target=/cache --network=none echo hi\n";
         let src = "FROM alpine AS 127.0.0.1:5001/app\n\
 ADD --chown=1000:1000 --chmod=0755 a.txt /x\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
         assert!(cf.contains("ADD --chown=1000:1000 --chmod=0755 a.txt /x"), "{cf}");
     }
 
@@ -646,7 +678,7 @@ ADD --chown=1000:1000 --chmod=0755 a.txt /x\n";
         let src = "FROM --platform=$BUILDPLATFORM alpine AS 127.0.0.1:5001/app\n\
 RUN echo hi\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
         assert!(
             cf.starts_with("FROM --platform=$BUILDPLATFORM alpine\n"),
             "expected platform selector in FROM:\n{cf}"
@@ -666,7 +698,7 @@ FROM scratch AS 127.0.0.1:5001/app\n\
 COPY --from=build /x /x\n";
         let f = parse(src).unwrap();
         assert_eq!(f.global_args.len(), 1);
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
         assert!(cf.starts_with("ARG VERSION=\"\"\n"), "global ARG must be topmost:\n{cf}");
         // The stage's own redeclaration is preserved as written.
         assert!(cf.contains("FROM alpine AS build\nARG VERSION\n"), "{cf}");
@@ -674,7 +706,7 @@ COPY --from=build /x /x\n";
         assert_eq!(cf.matches("ARG VERSION=\"\"").count(), 1, "{cf}");
         // No global args -> nothing prepended.
         let plain = parse("FROM alpine AS 127.0.0.1:5001/app\nRUN echo hi\n").unwrap();
-        let cf2 = render_containerfile(Graph::new(&plain.targets, &plain.global_args), "127.0.0.1:5001/app");
+        let cf2 = render_containerfile(Graph::new(&plain.targets, &plain.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
         assert!(cf2.starts_with("FROM alpine\n"), "{cf2}");
     }
 
@@ -682,10 +714,10 @@ COPY --from=build /x /x\n";
     fn renders_bare_global_arg() {
         let src = "ARG VERSION\nFROM alpine AS 127.0.0.1:5001/app\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
         assert!(cf.starts_with("ARG VERSION\nFROM alpine\n"), "{cf}");
         // The all-stages renderer (--target builds) gets them too.
-        let all = render_containerfile_all(Graph::new(&f.targets, &f.global_args));
+        let all = render_containerfile_all(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES));
         assert!(all.starts_with("ARG VERSION\nFROM alpine AS 127.0.0.1:5001/app\n"), "{all}");
     }
 
@@ -702,7 +734,7 @@ ON push(main) BUILD 127.0.0.1:5001/app\n";
         let app = f.targets.iter().find(|t| t.name == "127.0.0.1:5001/app").unwrap();
         assert!(app.task.is_some(), "task should parse onto the target");
 
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
         assert!(
             !cf.contains("task-ran"),
             "TASK command leaked into the Containerfile:\n{cf}"

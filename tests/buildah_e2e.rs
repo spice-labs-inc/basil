@@ -129,3 +129,81 @@ fn tempfile() -> std::path::PathBuf {
     std::fs::create_dir_all(&p).unwrap();
     p
 }
+
+/// A sibling module (its own context + Basilfile): the importer FROMs its
+/// image, so the module is built+published once, then the importer pulls it.
+/// The second delivery of the same event must not rebuild the module (its
+/// content tag exists) — use-or-build verified end to end.
+const MODULE_BASILFILE: &str = "FROM alpine AS 127.0.0.1:5001/bah_e2e_mod\n\
+COPY mod.txt /mod.txt\n";
+
+const IMPORTER_BASILFILE: &str = "MODULE ../mod -f Basilfile TARGET 127.0.0.1:5001/bah_e2e_mod AS mod\n\
+FROM scratch AS 127.0.0.1:5001/bah_e2e_imp\n\
+COPY --from=mod /mod.txt /out.txt\n\
+CMD [\"/bin/cat\",\"/out.txt\"]\n\
+ON push(main) BUILD 127.0.0.1:5001/bah_e2e_imp\n";
+
+#[tokio::test]
+async fn buildah_e2e_module_dependency() {
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
+        return;
+    }
+    let root = tempfile();
+    // Importer context `app/` with the module as a SIBLING (`./mod` resolved
+    // file-relative against app/Basilfile -> <root>/mod).
+    let app = root.join("app");
+    let mod_dir = root.join("mod");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&mod_dir).unwrap();
+    std::fs::write(app.join("Basilfile"), IMPORTER_BASILFILE).unwrap();
+    std::fs::write(mod_dir.join("Basilfile"), MODULE_BASILFILE).unwrap();
+    std::fs::write(mod_dir.join("mod.txt"), "from module\n").unwrap();
+
+    let file_path = app.join("Basilfile");
+    let file_str = file_path.to_str().unwrap();
+    let event = r#"{"ref":"refs/heads/main","before":"0","after":"1"}"#;
+    let inp = BuildInput {
+        file: file_str,
+        context: &app,
+        event_json: Some(event),
+        target_filter: None,
+        force: false,
+    };
+    // First delivery: builds the module (not yet registered), then the importer.
+    let results = handle_event(inp.clone()).await.unwrap();
+    let digest = results
+        .iter()
+        .find(|(k, _)| k == "digest")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    // The importer image folds the module content: the pushed config must
+    // contain the module's file (copied from the module image).
+    let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
+    let (_, manifest) = c.get_manifest("bah_e2e_imp", &digest).await.unwrap();
+    let m: Value = serde_json::from_slice(&manifest).unwrap();
+    let cfg_digest = m["config"]["digest"].as_str().unwrap().to_string();
+    let cfg_url = format!("http://127.0.0.1:5001/v2/bah_e2e_imp/blobs/{cfg_digest}");
+    let resp = reqwest::Client::new().get(&cfg_url).send().await.unwrap();
+    let cfg: Value = resp.json().await.unwrap();
+    assert_eq!(cfg["config"]["Cmd"], serde_json::json!(["/bin/cat", "/out.txt"]));
+    // The module was built and pushed at its content tag: its repo now lists a
+    // 64-hex tag (the module's closure tagHash) alongside any mutable tags.
+    let mod_tags = c.list_tags("bah_e2e_mod").await.unwrap();
+    assert!(
+        mod_tags.iter().any(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())),
+        "module must be published at its content tag, got {mod_tags:?}"
+    );
+
+    // Second delivery: module already registered -> importer noops; the module
+    // must NOT be rebuilt (its content tag exists) — the noop path only runs
+    // OUTPUT extraction, which this fixture has none of.
+    let results2 = handle_event(inp).await.unwrap();
+    let (_, result2) = results2
+        .iter()
+        .find(|(k, _)| k == "result")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .unwrap();
+    assert_eq!(result2, "idempotent-skip", "second delivery must noop");
+    let _ = std::fs::remove_dir_all(&root);
+}

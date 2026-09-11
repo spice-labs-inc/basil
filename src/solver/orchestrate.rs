@@ -51,7 +51,9 @@ async fn resolve_unpinned_bases(
     let by_name: std::collections::HashSet<&str> =
         targets.iter().map(|t| t.name.as_str()).collect();
     for t in targets {
-        let b = &t.base;
+        let crate::dsl::ast::Base::Image(b) = &t.base else {
+            continue; // module bases resolve to their own digests, never a pull
+        };
         if b.raw == "scratch" || b.digest.is_some() {
             continue;
         }
@@ -229,17 +231,41 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     let subset = dependency_subset(&parsed.targets, &names);
     println!("basil: {} target(s) in scope (of {} total)", subset.len(), parsed.targets.len());
 
-    // Resolve unpinned external bases (network: auth token + manifest GETs).
+    // The build file's own path/context; module paths resolve against its
+    // directory (D4: file-relative).
+    let build_file = std::path::absolute(inp.file).unwrap_or_else(|_| inp.file.into());
+    let file_dir = build_file.parent().unwrap_or(std::path::Path::new("."));
+
+    // Discover module dependencies (recursive, cycle-checked, pure file walk).
+    let index = crate::identity::modules::discover_module_index(&subset, file_dir)
+        .map_err(anyhow::Error::msg)?;
+    if !index.order.is_empty() {
+        println!("basil: {} module(s) discovered", index.order.len());
+    }
+
+    // Resolve unpinned external bases (network: auth token + manifest GETs) —
+    // for the importer's in-scope set AND every module file's targets.
     println!("basil: resolving base(s) from registries...");
     let t0 = std::time::Instant::now();
-    let resolved = resolve_unpinned_bases(&subset)
+    let mut resolved = resolve_unpinned_bases(&subset)
         .await
         .map_err(anyhow::Error::msg)?;
+    for key in &index.order {
+        let e = &index.entries[key];
+        let module_resolved = resolve_unpinned_bases(&e.parsed.targets)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        resolved.extend(module_resolved);
+    }
     println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
     let t0 = std::time::Instant::now();
     println!("basil: computing identity ({} target(s))...", subset.len());
-    let build_file = std::path::absolute(inp.file).unwrap_or_else(|_| inp.file.into());
     let mut resolver = RegistryResolver { resolved };
+    // Module deliverable digests first (their own bases resolved above), so
+    // the importer closure folds `base.module.*` from them.
+    let module_digests =
+        crate::identity::modules::compute_module_digests(&index, &mut resolver)
+            .map_err(anyhow::Error::msg)?;
     let closures = compute_closure(
         &subset,
         &parsed.default_platforms,
@@ -248,8 +274,17 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         &build_file,
         &HashMap::new(),
         &mut resolver,
+        &module_digests,
     )
     .map_err(anyhow::Error::msg)?;
+    // Module key -> `FROM <push-ref>:<tagHash>` for the importer's Containerfile.
+    let mut module_refs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for key in &index.order {
+        let e = &index.entries[key];
+        let tag = crate::identity::closure::hex(&module_digests[key]);
+        module_refs.insert(key.clone(), format!("{}:{}", e.push_ref, tag));
+    }
     println!("basil: identity computed in {:.1}s", t0.elapsed().as_secs_f64());
     for name in &names {
         println!(
@@ -270,13 +305,14 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         let published = idempotent_published(&deliverables, &closures).await?;
         if !published.is_empty() {
             println!("basil: content tags already published -- no build (idempotent check)");
+            let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs);
             for (name, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
                 // OUTPUT still runs: pull the published image and extract.
                 crate::solver::buildah::extract_outputs_from_image(
                     &format!("{push_ref}:{tag}"),
                     inp.context,
-                    crate::solver::buildah::Graph::new(&subset, &parsed.global_args),
+                    g,
                     name,
                 )
                 .await?;
@@ -287,13 +323,19 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         }
     }
 
+    // Build path: every module dependency must exist as its content-tagged
+    // image before the importer renders FROM it — probe; build + push the
+    // module when missing (recursive; the module's own modules were already
+    // ensured when its digest was computed? No — ensure here, bottom-up).
+    ensure_modules_built(&index, &module_refs).await?;
+
     for (name, push_ref) in &deliverables {
         let tag = digest_of(name, &closures)?;
         let insecure = crate::solver::registry::parse_ref(push_ref, &tag)
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&subset, &parsed.global_args),
+            crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs),
             name,
             push_ref,
             &tag,
@@ -326,7 +368,11 @@ pub fn dependency_subset(all: &[crate::dsl::ast::Target], roots: &[String]) -> V
         let Some(t) = by_name.get(name.as_str()) else {
             continue; // external ref, not a local stage
         };
-        let crate::dsl::ast::BaseImage { raw, .. } = &t.base;
+        // A module base reaches no local stage — its artifact is a separate
+        // build, so the subset ends at the importing target.
+        let crate::dsl::ast::Base::Image(crate::dsl::ast::BaseImage { raw, .. }) = &t.base else {
+            continue;
+        };
         if let Some(b) = by_name.get(raw.as_str()) {
             if b.name != name {
                 stack.push(b.name.clone());
@@ -435,7 +481,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             for do_name in &r.do_list {
                 if let Some(t) = parsed.targets.iter().find(|t| &t.name == do_name) {
                     if let Some(task) = &t.task {
-                        let image = resolved_image(&t.base);
+                        let crate::dsl::ast::Base::Image(base_image) = &t.base else {
+                            anyhow::bail!("DO task `{do_name}`: module bases are not runnable as tasks");
+                        };
+                        let image = resolved_image(base_image);
                         let env = vec![format!("BASIL_EVENT={}", event_ref)];
                         let code = crate::solver::buildah::run_task(&image, &task.command, &env).await?;
                         if code != 0 {
@@ -467,14 +516,35 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     }
     println!("basil: resolving {} base(s) from registries...", parsed.targets.len());
     let t0 = std::time::Instant::now();
-    let resolved = resolve_unpinned_bases(&parsed.targets)
+    let mut resolved = resolve_unpinned_bases(&parsed.targets)
         .await
         .map_err(anyhow::Error::msg)?;
+    // The build file's own path/context; module paths resolve against its
+    // directory (D4: file-relative).
+    let build_file = std::path::absolute(inp.file).unwrap_or_else(|_| inp.file.into());
+    let file_dir = build_file.parent().unwrap_or(std::path::Path::new("."));
+    // Discover module dependencies (recursive, cycle-checked, pure file walk).
+    let index = crate::identity::modules::discover_module_index(&parsed.targets, file_dir)
+        .map_err(anyhow::Error::msg)?;
+    if !index.order.is_empty() {
+        println!("basil: {} module(s) discovered", index.order.len());
+    }
+    for key in &index.order {
+        let e = &index.entries[key];
+        let module_resolved = resolve_unpinned_bases(&e.parsed.targets)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        resolved.extend(module_resolved);
+    }
     println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
     let t1 = std::time::Instant::now();
     println!("basil: computing identity ({} targets)...", parsed.targets.len());
-    let build_file = std::path::absolute(inp.file).unwrap_or_else(|_| inp.file.into());
     let mut resolver = RegistryResolver { resolved };
+    // Module deliverable digests first (their own bases resolved above), so
+    // the importer closure folds `base.module.*` from them.
+    let module_digests =
+        crate::identity::modules::compute_module_digests(&index, &mut resolver)
+            .map_err(anyhow::Error::msg)?;
     let closures = compute_closure(
         &parsed.targets,
         &parsed.default_platforms,
@@ -483,8 +553,17 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         &build_file,
         &build_args,
         &mut resolver,
+        &module_digests,
     )
     .map_err(anyhow::Error::msg)?;
+    // Module key -> `FROM <push-ref>:<tagHash>` for the importer's Containerfile.
+    let mut module_refs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for key in &index.order {
+        let e = &index.entries[key];
+        let tag = crate::identity::closure::hex(&module_digests[key]);
+        module_refs.insert(key.clone(), format!("{}:{}", e.push_ref, tag));
+    }
     println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
     // Idempotent check: skip when every deliverable's content tag exists, and
@@ -494,6 +573,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         let published = idempotent_published(&deliverables, &closures).await?;
         if !published.is_empty() {
             println!("basil: content tags already published -- no build (idempotent check)");
+            let g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs);
             for (_, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
             }
@@ -502,7 +582,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
                 crate::solver::buildah::extract_outputs_from_image(
                     &format!("{push_ref}:{tag}"),
                     inp.context,
-                    crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args),
+                    g,
                     name,
                 )
                 .await?;
@@ -516,6 +596,12 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         }
     }
 
+    // Build path: every module dependency must exist as its content-tagged
+    // image before the importer renders FROM it — probe; build + push the
+    // module when missing (recursive). `--force` never propagates: modules are
+    // still reconciled by existence, only the importer is force-built.
+    ensure_modules_built(&index, &module_refs).await?;
+
     // Build each deliverable with buildah.
     for (name, push_ref) in &deliverables {
         let tag = digest_of(name, &closures)?;
@@ -523,7 +609,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args),
+            crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs),
             name,
             push_ref,
             &tag,
@@ -540,6 +626,57 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         "digest".to_string(),
         digest_of(&deliverable_names[0], &closures)?,
     )])
+}
+
+/// Ensure each module dependency exists as its content-tagged image in its
+/// registry: probe `<push-ref>:<tagHash>`; build + push the module when
+/// missing. Iterates dependency-first so a module's own module deps are in
+/// place before it builds. `--force` does NOT propagate here — modules are
+/// reconciled by existence, always (use-or-build).
+async fn ensure_modules_built(
+    index: &crate::identity::modules::ModuleIndex,
+    module_refs: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    for key in &index.order {
+        let e = &index.entries[key];
+        let from_ref = &module_refs[key];
+        let tag = from_ref.strip_prefix(&format!("{}:", e.push_ref)).unwrap_or(from_ref);
+        let ir = crate::solver::registry::parse_ref(&e.push_ref, tag)
+            .map_err(|err| anyhow::anyhow!("module `{}` ref `{}`: {err}", key, e.push_ref))?;
+        let exists = match ir.client().manifest_exists(&ir.repo, tag).await {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!("module `{}` registry probe failed ({err}); will build", key);
+                false
+            }
+        };
+        if exists {
+            println!("basil: module {key} -> {from_ref} (using existing image)");
+            continue;
+        }
+        println!("basil: module {key} -> building {from_ref}");
+        let insecure = ir.is_local();
+        // The module's own graph: its file's targets + global args, its own
+        // file dir for ITS module deps, and the full refs map (nested modules
+        // included) for rendering.
+        let g = crate::solver::buildah::Graph::new(
+            &e.parsed.targets,
+            &e.parsed.global_args,
+            &e.context,
+            module_refs,
+        );
+        crate::solver::buildah::build_deliverable(
+            g,
+            &e.deliverable,
+            &e.push_ref,
+            tag,
+            &e.context,
+            &std::collections::HashMap::new(),
+            insecure,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Idempotent check: every deliverable's content tag must already exist in its

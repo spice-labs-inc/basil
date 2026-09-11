@@ -34,8 +34,26 @@ fn compute() -> BTreeMap<String, String> {
     let ctx = Path::new(FIXTURE).join("ctx");
     let overrides = HashMap::new();
     let build_file = Path::new(FIXTURE).join("Basilfile");
-    let tags = compute_closure(&file.targets, &file.default_platforms, &file.global_args, &ctx, &build_file, &overrides, &mut PinnedResolver)
-        .unwrap();
+    let file_dir = build_file.parent().unwrap();
+    // The fixture imports a module (sibling `mod/`): discover it and fold its
+    // deliverable digest into the importer targets, exactly like the build path.
+    let index = basil::identity::modules::discover_module_index(&file.targets, file_dir).unwrap();
+    let module_digests = basil::identity::modules::compute_module_digests(
+        &index,
+        &mut PinnedResolver,
+    )
+    .unwrap();
+    let tags = compute_closure(
+        &file.targets,
+        &file.default_platforms,
+        &file.global_args,
+        &ctx,
+        &build_file,
+        &overrides,
+        &mut PinnedResolver,
+        &module_digests,
+    )
+    .unwrap();
     tags.iter()
         .map(|(k, v)| (k.clone(), hex(v)))
         .collect::<std::collections::BTreeMap<_, _>>()

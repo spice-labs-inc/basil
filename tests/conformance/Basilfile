@@ -4,3 +4,8 @@ RUN cat /src/greeting.txt > /src/out.txt
 
 FROM scratch AS ghcr.io/conformance/app
 COPY --from=build /src/out.txt /out.txt
+
+MODULE mod TARGET out AS mod
+
+FROM scratch AS ghcr.io/conformance/app2
+COPY --from=mod /out.txt /mod2.txt

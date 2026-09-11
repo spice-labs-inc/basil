@@ -77,7 +77,7 @@ impl Parser {
         while let Some(line) = self.peek().cloned() {
             let (kw, rest) = split_keyword(&line.text);
 
-            let top_level = matches!(kw, "FROM" | "ON");
+            let top_level = matches!(kw, "FROM" | "MODULE" | "ON");
             if top_level {
                 if let Some(t) = current.take() {
                     targets.push(t);
@@ -88,6 +88,10 @@ impl Parser {
                 "FROM" => {
                     self.bump();
                     current = Some(self.parse_from(&line.text, line.number)?);
+                }
+                "MODULE" => {
+                    self.bump();
+                    current = Some(self.parse_module(&line.text, line.number)?);
                 }
                 "ON" => {
                     self.bump();
@@ -224,7 +228,67 @@ impl Parser {
             name: name.unwrap_or_else(|| raw.clone()),
             register: None,
             given: None,
-            base: BaseImage { raw, tag, digest, platform },
+            base: Base::Image(BaseImage { raw, tag, digest, platform }),
+            instructions: Vec::new(),
+            task: None,
+            platforms: None,
+            line,
+        })
+    }
+
+    /// Parse `MODULE <path> [-f <file>] [TARGET <name>] [AS <name>]`. The path
+    /// is the module's context dir (file-relative); `-f` names its Basilfile
+    /// (default `<path>/Basilfile`); `TARGET` selects its deliverable;
+    /// `AS` gives the importer's stage alias for `COPY --from=<alias>`.
+    fn parse_module(&self, full_line: &str, line: usize) -> Result<Target, Error> {
+        let (_, rest) = split_keyword(full_line);
+        let mut parts = split_ws(rest);
+        if parts.is_empty() {
+            return self.err(line, "MODULE requires a context path");
+        }
+        let path = parts.remove(0);
+        let mut file: Option<String> = None;
+        let mut target: Option<String> = None;
+        let mut name: Option<String> = None;
+        while !parts.is_empty() {
+            match parts[0].as_str() {
+                "-f" => {
+                    if parts.len() < 2 {
+                        return self.err(line, "MODULE -f requires a file name");
+                    }
+                    file = Some(parts[1].clone());
+                    parts.drain(0..2);
+                }
+                "TARGET" => {
+                    if parts.len() < 2 {
+                        return self.err(line, "MODULE TARGET requires a target name");
+                    }
+                    target = Some(parts[1].clone());
+                    parts.drain(0..2);
+                }
+                "AS" => {
+                    if parts.len() < 2 {
+                        return self.err(line, "MODULE ... AS requires a stage name");
+                    }
+                    name = Some(parts[1].clone());
+                    if parts.len() > 2 {
+                        return self.err(line, "unexpected token after MODULE stage name");
+                    }
+                    parts.clear();
+                }
+                other => {
+                    return self.err(
+                        line,
+                        format!("unexpected token `{other}` in MODULE line"),
+                    )
+                }
+            }
+        }
+        Ok(Target {
+            name: name.unwrap_or_else(|| path.clone()),
+            register: None,
+            given: None,
+            base: Base::Module(ModuleRef { path, file, target, line }),
             instructions: Vec::new(),
             task: None,
             platforms: None,
@@ -968,33 +1032,34 @@ fn split_json_strings(s: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::ast::Base;
 
     #[test]
     fn parses_trivial_from() {
         let f = parse("FROM alpine\n").unwrap();
         assert_eq!(f.targets.len(), 1);
         assert_eq!(f.targets[0].name, "alpine");
-        assert_eq!(f.targets[0].base.raw, "alpine");
+        assert_eq!(f.targets[0].base_image().unwrap().raw, "alpine");
     }
 
     #[test]
     fn parses_from_as() {
         let f = parse("FROM golang AS build\n").unwrap();
         assert_eq!(f.targets[0].name, "build");
-        assert_eq!(f.targets[0].base.raw, "golang");
+        assert_eq!(f.targets[0].base_image().unwrap().raw, "golang");
     }
 
     #[test]
     fn parses_from_platform_buildplatform() {
         let f = parse("FROM --platform=$BUILDPLATFORM alpine AS build\n").unwrap();
-        assert_eq!(f.targets[0].base.platform.as_deref(), Some("$BUILDPLATFORM"));
-        assert_eq!(f.targets[0].base.raw, "alpine");
+        assert_eq!(f.targets[0].base_image().unwrap().platform.as_deref(), Some("$BUILDPLATFORM"));
+        assert_eq!(f.targets[0].base_image().unwrap().raw, "alpine");
     }
 
     #[test]
     fn parses_from_platform_literal() {
         let f = parse("FROM --platform=linux/arm64 alpine\n").unwrap();
-        assert_eq!(f.targets[0].base.platform.as_deref(), Some("linux/arm64"));
+        assert_eq!(f.targets[0].base_image().unwrap().platform.as_deref(), Some("linux/arm64"));
     }
 
     #[test]
@@ -1017,7 +1082,7 @@ mod tests {
     #[test]
     fn parses_external_ref_with_tag_and_digest() {
         let f = parse("FROM alpine:3.23@sha256:abc123\n").unwrap();
-        let b = &f.targets[0].base;
+        let b = f.targets[0].base_image().unwrap();
         assert_eq!(b.raw, "alpine");
         assert_eq!(b.tag.as_deref(), Some("3.23"));
         assert_eq!(b.digest.as_deref(), Some("sha256:abc123"));
@@ -1027,7 +1092,7 @@ mod tests {
     fn parses_qualified_image_bare() {
         // `FROM ghcr.io/a/b:v1` → tag v1
         let f = parse("FROM ghcr.io/a/b:v1 AS app\n").unwrap();
-        let b = &f.targets[0].base;
+        let b = f.targets[0].base_image().unwrap();
         assert_eq!(b.raw, "ghcr.io/a/b");
         assert_eq!(b.tag.as_deref(), Some("v1"));
     }
@@ -1036,7 +1101,7 @@ mod tests {
     fn parses_localhost_port_image() {
         // `localhost:5000/img` — the ':' is a port, no tag.
         let f = parse("FROM localhost:5000/img AS app\n").unwrap();
-        let b = &f.targets[0].base;
+        let b = f.targets[0].base_image().unwrap();
         assert_eq!(b.raw, "localhost:5000/img");
         assert_eq!(b.tag, None);
     }
@@ -1045,7 +1110,45 @@ mod tests {
     fn parses_qualified_image_as_name() {
         let f = parse("FROM scratch AS ghcr.io/mycompany/app\n").unwrap();
         assert_eq!(f.targets[0].name, "ghcr.io/mycompany/app");
-        assert_eq!(f.targets[0].base.raw, "scratch");
+        assert_eq!(f.targets[0].base_image().unwrap().raw, "scratch");
+    }
+
+    #[test]
+    fn parses_module_base() {
+        let f = parse("MODULE vendor/x AS shared\nCOPY --from=shared /a /a\n").unwrap();
+        let t = &f.targets[0];
+        assert_eq!(t.name, "shared");
+        let Base::Module(m) = &t.base else {
+            panic!("expected a module base");
+        };
+        assert_eq!(m.path, "vendor/x");
+        assert_eq!(m.file, None);
+        assert_eq!(m.target, None);
+        // MODULE is a stage entry like FROM: a second FROM closes the stage.
+        assert_eq!(f.targets.len(), 1);
+    }
+
+    #[test]
+    fn parses_module_with_file_target() {
+        let f = parse("MODULE ../shared -f Basilfile.x TARGET deps AS shared\n").unwrap();
+        let Base::Module(m) = &f.targets[0].base else {
+            panic!("expected a module base");
+        };
+        assert_eq!(m.path, "../shared");
+        assert_eq!(m.file.as_deref(), Some("Basilfile.x"));
+        assert_eq!(m.target.as_deref(), Some("deps"));
+    }
+
+    #[test]
+    fn module_line_requires_path_and_rejects_junk() {
+        let e = parse("MODULE\n").unwrap_err();
+        assert!(e.message.contains("MODULE requires a context path"), "{}", e.message);
+        let e = parse("MODULE vendor/x -f\n").unwrap_err();
+        assert!(e.message.contains("-f requires a file name"), "{}", e.message);
+        let e = parse("MODULE vendor/x bogus AS a\n").unwrap_err();
+        assert!(e.message.contains("bogus"), "{}", e.message);
+        let e = parse("MODULE vendor/x AS\n").unwrap_err();
+        assert!(e.message.contains("requires a stage name"), "{}", e.message);
     }
 
     #[test]

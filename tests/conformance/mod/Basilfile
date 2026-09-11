@@ -1,0 +1,11 @@
+FROM alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef AS build
+COPY mod.txt /mod.txt
+RUN cat /mod.txt > /built.txt
+
+FROM scratch AS out
+COPY --from=build /built.txt /out.txt
+REGISTER 127.0.0.1:5099/conformance-mod
+
+FROM alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef AS thumb
+LABEL role=thumb
+REGISTER 127.0.0.1:5099/conformance-thumb
