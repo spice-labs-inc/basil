@@ -142,6 +142,32 @@ at build time; a literal `linux/arm64` selects that platform directly. A
 build stage that must run natively uses `FROM --platform=$BUILDPLATFORM …`.
 See [Targets](#targets).
 
+### `MODULE`
+```
+MODULE <path> [-f <file>] [TARGET <name>] [AS <name>]
+```
+A target's base is **another basil build** instead of an image: `<path>` is the
+module's context directory (its own Basilfile + its own build inputs),
+resolved relative to the importing file's directory (absolute paths allowed).
+`-f` names the module's Basilfile (default `<path>/Basilfile`); `TARGET`
+selects its deliverable (when omitted the module file must declare exactly one
+qualified deliverable — a `REGISTER` or qualified name); `AS` gives the
+importer's stage alias for `COPY --from=<alias>`.
+
+The module is a separate identity domain: its deliverable's `tagHash` is
+folded into the importer (`base.module.<alias>`), and its build is
+use-or-build — if `<module-push-ref>:<tagHash>` already exists in the module's
+registry the importer's `FROM <ref>:<tagHash>` just pulls it, otherwise the
+module is built and pushed first (recursively; module cycles are an error). A
+module inside the importer's context is *not* excluded from the importer's
+`derivedData` — dockerignore it there if `COPY .` would grab it (sibling
+modules avoid the question entirely).
+```
+FROM scratch AS app
+MODULE ../shared -f Basilfile.shared TARGET build AS shared
+COPY --from=shared /out/artifact /artifact
+```
+
 ### `ARG`
 ```
 ARG <name>[=<default>]
@@ -247,6 +273,7 @@ Every target's `tagHash` is **derived**, not declared:
 C(T) = derivedData(T)                          # context files the target reads
      ∪ C(B)  for every depended stage B         # FROM <stage>, COPY --from=<stage>
      ∪ {resolved-digest}  for external bases    # FROM <image>
+     ∪ C(M)  for every module base             # MODULE <path> — the module's deliverable tagHash
      ∪ args(T)                                  # resolved ARG / --build-arg
      ∪ platforms(T)
      ∪ programHash(T)                          # ordered, arg-expanded instructions
@@ -269,8 +296,8 @@ basil gc <AGE> [FILE] [--repo FQ] [--dry-run]   # prune basil-owned tags older t
 
 The context is a bare positional arg, docker-style: the DSL file defaults to
 `<context>/Basilfile`; `-f FILE` overrides it (a relative `-f` resolves against
-the current directory, not the context).
-
+the current directory, not the context). `pin` does not recurse into `MODULE`
+files — pin each module file directly; `gc` stays per-file too.
 - **`build`** never reads stdin; with no `-t` it builds every qualified
   deliverable.
 - **`handle`** reads the event JSON from stdin (or `--event`), matches `ON`

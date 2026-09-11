@@ -156,6 +156,23 @@ closure as a separate record.
 - **`FROM` digest** — folded resolved, not as the ref string. Because registries
   are content-addressed, a manifest digest is a commitment over every layer:
   the whole base image is covered without fetching a blob.
+- **`MODULE`** — a target's base can be another basil build
+  (`MODULE <path> [-f <file>] [TARGET <name>] [AS <alias>]`), a separate
+  closure domain: the module is parsed, its own bases resolved, its closure
+  computed bottom-up, and its deliverable's `tagHash` folded (as
+  `base.module.<alias>`), so a module change retags the importer exactly once,
+  through the derived artifact. At build time the module is use-or-built: if
+  `<module-push-ref>:<tagHash>` exists in its registry the importer's rendered
+  `FROM <ref>:<tagHash>` pulls it; otherwise the module is built and pushed
+  first (recursive; cycles between modules are an error at discovery). Module
+  paths resolve against the importing file's directory (D4); the module's own
+  dockerignore/globs/args resolve against its own context. The module's raw
+  files never enter the importer's derivedData (only its tagHash does) — a
+  module inside the importer context is the operator's responsibility to
+  dockerignore if `COPY .` would grab it (D3). `pin` does not recurse into
+  module files; module `TASK`/`ON` reactions never fire on importer events;
+  `--force` never propagates to module builds (they are reconciled by
+  existence, always).
 - **`platforms`** — the target's declared build-platform list (its `PLATFORM`
   clause, or the inherited file-wide default). Folded so a single-platform vs
   multi-platform build is a different tag — the content tag always identifies the
