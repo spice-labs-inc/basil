@@ -197,19 +197,23 @@ checked-in golden inputs whose expected digest the test suite recomputes.
 
 **One digest drives two refs** (per target):
 
-1. `<name>:<tagHash>` — stable immutable content tag, where `<name>` is the
-   deliverable's **fully-qualified `AS` name** (`ghcr.io/mycompany/app`).
+1. `<name>:basil-<tagHash>` — stable immutable content tag, where `<name>` is the
+   deliverable's **fully-qualified `AS` name** (`ghcr.io/mycompany/app`). The
+   `basil-` prefix is basil's tag namespace: gc only prunes tags in it, so a
+   foreign 64-hex tag is never mistaken for basil's.
    **Deliverable targets only.** One platform → a single image; several → an OCI
     index. Checked first; on hit, the idempotent check skips the rebuild.
 2. **Cache refs** — exported under the deliverable's repo with four tags:
-   `cache-<tagHash>` (exact closure), `cache-<YYYYMMDD>`, `cache-<YYYYMM>`,
-   `cache-<YYYY>` (build date). The exact tag reattaches the identical closure;
-   the date tags are shared by every build in that period, so cache accumulates
-   across content changes, and each period ages out on a retention schedule.
-   Imports read `cache-<tagHash>` plus the current day/month/year tags.
+   `basil-cache-<tagHash>` (exact closure), `basil-cache-<YYYYMMDD>`,
+   `basil-cache-<YYYYMM>`, `basil-cache-<YYYY>` (build date). The exact tag
+   reattaches the identical closure; the date tags are shared by every build in
+   that period, so cache accumulates across content changes, and each period
+   ages out on a retention schedule. Imports read `basil-cache-<tagHash>` plus
+   the current day/month/year tags.
 
-Only the exact-closure cache tag (`cache-<tagHash>`) is keyed on `tagHash`; the
-date tags are shared, best-effort cache and do not affect identity.
+Only the exact-closure cache tag (`basil-cache-<tagHash>`) is keyed on
+`tagHash`; the date tags are shared, best-effort cache and do not affect
+identity.
 
 **`FROM` — three cases.**
 
@@ -422,8 +426,8 @@ so it never matches today.)
   refs. The idempotent check (content tag exists) already skips the entire build,
   so layer reattach is a secondary optimization.
 - **Cache refs**: basil names exported intermediate cache under
-  `cache-<tagHash>`, `cache-<YYYYMMDD>`, `cache-<YYYYMM>`, `cache-<YYYY>` for
-  cross-run reuse.
+  `basil-cache-<tagHash>`, `basil-cache-<YYYYMMDD>`, `basil-cache-<YYYYMM>`,
+  `basil-cache-<YYYY>` for cross-run reuse.
 - **Multiple deliverables** = one rendered multi-stage Containerfile; each
   deliverable is built and pushed under its content tag.
 
@@ -435,11 +439,12 @@ so it never matches today.)
 - **Scope** — the deliverable repos named by the file's fully-qualified `AS`
   names, or one repo via `--repo <fq>`. Credentials are the operator's
   Docker/Podman config, as everywhere else.
-- **What it prunes** — only basil's own ephemeral tags:
-  - `cache-*` refs: the date-encoded ones (`cache-<YYYYMMDD>`, `-<YYYYMM>`,
-    `-<YYYY>`) are pruned directly from the tag name; `cache-<tagHash>` by the
-    image's `created` time.
-  - content tags (`<name>:<tagHash>`), by the image's `created` time.
+- **What it prunes** — only basil's own ephemeral tags (the `basil-`
+  namespace), never a foreign tag:
+  - `basil-cache-*` refs: the date-encoded ones (`basil-cache-<YYYYMMDD>`,
+    `-<YYYYMM>`, `-<YYYY>`) are pruned directly from the tag name;
+    `basil-cache-<tagHash>` by the image's `created` time.
+  - content tags (`<name>:basil-<tagHash>`), by the image's `created` time.
   - version tags (`<name>:vX.Y.Z`) are **never pruned** — they are
     user-created releases, not basil's to reclaim (no `--include-versions`).
 - **Safety** — `--dry-run` lists what would be deleted without deleting.
@@ -453,11 +458,13 @@ so it never matches today.)
 
 ## Decided defaults
 
-- **Content tag**: `<fully-qualified-AS>:<tagHash>` — the deliverable's `AS`
-  name is its image reference; the closure digest is the tag (no `basil`
-  marker). `basil-version` is a closure component, so a basil change yields a
-  different tag.
-- **Cache refs**: `<fully-qualified-AS>:cache-<tagHash>`,
-  `<fully-qualified-AS>:cache-<YYYYMMDD>`, `…:cache-<YYYYMM>`, `…:cache-<YYYY>`.
-  The repo defaults to the deliverable's `AS` name, overridable via
+- **Content tag**: `<fully-qualified-AS>:basil-<tagHash>` — the deliverable's
+  `AS` name is its image reference; the closure digest is the tag, prefixed
+  with `basil-` so basil's tags are self-identifying for gc and never collide
+  with a foreign 64-hex tag. `basil-version` is a closure component, so a basil
+  change yields a different tag.
+- **Cache refs**: `<fully-qualified-AS>:basil-cache-<tagHash>`,
+  `<fully-qualified-AS>:basil-cache-<YYYYMMDD>`, `…:basil-cache-<YYYYMM>`,
+  `…:basil-cache-<YYYY>`. The repo defaults to the deliverable's `AS` name,
+  overridable via
   `BASIL_CACHE_REF`. Exporter: `type=registry` (my rec).

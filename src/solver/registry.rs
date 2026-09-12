@@ -83,6 +83,20 @@ pub fn parse_rfc3339(s: &str) -> Option<u64> {
     let secs_utc = days * 86400 + hours * 3600 + mins * 60 + secs;
     Some((secs_utc - offset) as u64)
 }
+/// The prefix basil puts before every content tag it pushes, so its tags are
+/// self-identifying: `basil-<tagHash>` (content) and `basil-cache-*` (cache
+/// namespaces). `basil gc` only ever prunes tags in this namespace — never a
+/// foreign 64-hex or `cache-*` tag.
+pub const BASIL_TAG_PREFIX: &str = "basil-";
+
+/// The cache-tag prefix, above the content prefix.
+pub const BASIL_CACHE_PREFIX: &str = "basil-cache-";
+
+/// Convert a bare content hash to the actual registry tag: `basil-<hash>`.
+pub fn content_tag(hash: &str) -> String {
+    format!("{BASIL_TAG_PREFIX}{hash}")
+}
+
 pub fn parse_ref(name: &str, default_tag: &str) -> Result<ImageRef, String> {
     let s = name;
     let (host, path) = match s.find('/') {

@@ -157,8 +157,10 @@ async fn promote_on_tag(
         let ir = crate::solver::registry::parse_ref(&push_ref, "")
             .map_err(|e| anyhow::anyhow!("promote `{push_ref}`: {e}"))?;
         let client = ir.client();
-        let src = format!("{}:{tag_hash}", ir.repo);
-        match client.retag(&ir.repo, &tag_hash, &format!("v{version}")).await {
+        // Promote FROM the namespaced content tag (`basil-<hash>`) to the
+        // immutable `v<version>` tag.
+        let src = format!("{}:{}", ir.repo, crate::solver::registry::content_tag(&tag_hash));
+        match client.retag(&ir.repo, &crate::solver::registry::content_tag(&tag_hash), &format!("v{version}")).await {
             Ok(d) => tracing::info!("promote `{push_ref}:{src}` -> v{version} (digest {})", &d[..d.len().min(24)]),
             Err(e) => {
                 anyhow::bail!("promotion immutability/retag failure for `{push_ref}:v{version}`: {e}")
@@ -283,7 +285,10 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     for key in &index.order {
         let e = &index.entries[key];
         let tag = crate::identity::closure::hex(&module_digests[key]);
-        module_refs.insert(key.clone(), format!("{}:{}", e.push_ref, tag));
+        module_refs.insert(
+            key.clone(),
+            format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
+        );
     }
     println!("basil: identity computed in {:.1}s", t0.elapsed().as_secs_f64());
     for name in &names {
@@ -567,7 +572,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     for key in &index.order {
         let e = &index.entries[key];
         let tag = crate::identity::closure::hex(&module_digests[key]);
-        module_refs.insert(key.clone(), format!("{}:{}", e.push_ref, tag));
+        module_refs.insert(
+            key.clone(),
+            format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
+        );
     }
     println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
@@ -650,10 +658,16 @@ async fn ensure_modules_built(
     for key in &index.order {
         let e = &index.entries[key];
         let from_ref = &module_refs[key];
-        let tag = from_ref.strip_prefix(&format!("{}:", e.push_ref)).unwrap_or(from_ref);
-        let ir = crate::solver::registry::parse_ref(&e.push_ref, tag)
+        // `from_ref` is `<push-ref>:basil-<hash>`; keep the full namespaced tag
+        // for the existence probe (that is the tag as stored in the registry)
+        // but hand build_deliverable the bare hash — it re-prefixes internally.
+        let full_tag = from_ref.strip_prefix(&format!("{}:", e.push_ref)).unwrap_or(from_ref);
+        let hash = full_tag
+            .strip_prefix(crate::solver::registry::BASIL_TAG_PREFIX)
+            .unwrap_or(full_tag);
+        let ir = crate::solver::registry::parse_ref(&e.push_ref, full_tag)
             .map_err(|err| anyhow::anyhow!("module `{}` ref `{}`: {err}", key, e.push_ref))?;
-        let exists = match ir.client().manifest_exists(&ir.repo, tag).await {
+        let exists = match ir.client().manifest_exists(&ir.repo, full_tag).await {
             Ok(b) => b,
             Err(err) => {
                 tracing::warn!("module `{}` registry probe failed ({err}); will build", key);
@@ -679,7 +693,7 @@ async fn ensure_modules_built(
             g,
             &e.deliverable,
             &e.push_ref,
-            tag,
+            hash,
             &e.context,
             &std::collections::HashMap::new(),
             insecure,
@@ -704,8 +718,9 @@ async fn idempotent_published(
 ) -> anyhow::Result<Vec<(String, String, String)>> {
     let mut published = Vec::new();
     for (name, push_ref) in deliverables {
-        let tag = digest_of(name, closures)?;
-        let ir = crate::solver::registry::parse_ref(push_ref, &tag)
+        let tag_hash = digest_of(name, closures)?;
+        let tag = crate::solver::registry::content_tag(&tag_hash);
+        let ir = crate::solver::registry::parse_ref(&push_ref, &tag)
             .map_err(|e| anyhow::anyhow!("deliverable `{push_ref}`: {e}"))?;
         let client = ir.client();
         match client.manifest_exists(&ir.repo, &tag).await {

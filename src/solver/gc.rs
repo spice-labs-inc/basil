@@ -37,20 +37,27 @@ enum Kind {
 }
 
 fn classify(tag: &str) -> Kind {
-    if let Some(rest) = tag.strip_prefix("cache-") {
+    // Basil-owned tags live in the `basil-` namespace: cache namespaces
+    // (`basil-cache-*`) sort above content tags (`basil-<tagHash>`). Tags
+    // outside the namespace — including any bare 64-hex or `cache-*` tag — are
+    // never pruned.
+    if let Some(rest) = tag.strip_prefix(crate::solver::registry::BASIL_CACHE_PREFIX) {
         if rest.len() >= 4 && rest.len() <= 8 && rest.chars().all(|c| c.is_ascii_digit()) {
             let n: u64 = rest.parse().unwrap_or(0);
             return Kind::CacheDate(n, rest.len());
         }
         return Kind::CacheHash;
     }
+    if let Some(rest) = tag.strip_prefix(crate::solver::registry::BASIL_TAG_PREFIX) {
+        if rest.len() == 64 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Kind::CacheHash;
+        }
+        return Kind::Foreign;
+    }
     if let Some(rest) = tag.strip_prefix('v') {
         if !rest.is_empty() && rest.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
             return Kind::Version;
         }
-    }
-    if tag.len() == 64 && tag.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Kind::CacheHash;
     }
     Kind::Foreign
 }
@@ -158,14 +165,31 @@ mod tests {
     }
 
     #[test]
-    fn never_prunes_version_or_foreign() {
-        assert!(matches!(classify("cache-20240901"), Kind::CacheDate(20240901, 8)));
-        assert!(matches!(classify("cache-202409"), Kind::CacheDate(202409, 6)));
-        assert!(matches!(classify("v1.5.8"), Kind::Version));
-        assert!(matches!(classify("latest"), Kind::Foreign));
+    fn prunes_only_basil_namespaced_tags() {
         assert!(matches!(
-            classify("0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609"),
+            classify("basil-cache-20240901"),
+            Kind::CacheDate(20240901, 8)
+        ));
+        assert!(matches!(
+            classify("basil-cache-202409"),
+            Kind::CacheDate(202409, 6)
+        ));
+        assert!(matches!(
+            classify("basil-cache-0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609"),
             Kind::CacheHash
         ));
+        assert!(matches!(
+            classify("basil-0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609"),
+            Kind::CacheHash
+        ));
+        assert!(matches!(classify("v1.5.8"), Kind::Version));
+        assert!(matches!(classify("latest"), Kind::Foreign));
+        // Pre-namespace shapes are foreign now (no transition needed): a bare
+        // 64-hex tag could be anyone's, and a bare `cache-*` is not basil's.
+        assert!(matches!(
+            classify("0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609"),
+            Kind::Foreign
+        ));
+        assert!(matches!(classify("cache-20240901"), Kind::Foreign));
     }
 }

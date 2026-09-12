@@ -324,6 +324,9 @@ pub async fn build_deliverable(
     insecure: bool,
     force: bool,
 ) -> anyhow::Result<()> {
+    // The registry tag is namespaced (`basil-<tagHash>`), so basil's tags are
+    // self-identifying for gc and never collide with a foreign 64-hex tag.
+    let tag = &crate::solver::registry::content_tag(tag);
     let tag_ref = format!("{push_ref}:{tag}");
 
     // If the exact content-tagged image already exists in local

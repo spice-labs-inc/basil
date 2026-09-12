@@ -64,9 +64,11 @@ async fn buildah_e2e_build_and_config() {
         .map(|(_, v)| v.clone())
         .unwrap();
 
-    // The pushed image has the closure tagHash as its tag.
+    // The pushed image is tagged `basil-<tagHash>`; the `digest` result key is
+    // the bare closure hash.
     let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
-    let (_, manifest) = c.get_manifest("bah_e2e_probe", &digest).await.unwrap();
+    let ctag = |h: &str| format!("basil-{h}");
+    let (_, manifest) = c.get_manifest("bah_e2e_probe", &ctag(&digest)).await.unwrap();
     let m: Value = serde_json::from_slice(&manifest).unwrap();
     let cfg_digest = m["config"]["digest"].as_str().unwrap().to_string();
     // Fetch the config blob directly (async).
@@ -102,7 +104,7 @@ async fn buildah_e2e_build_and_config() {
         .map(|(_, v)| v.clone())
         .unwrap();
     assert_eq!(digest2, digest, "noop re-derives the same content tag");
-    let (_, manifest2) = c.get_manifest("bah_e2e_probe", &digest2).await.unwrap();
+    let (_, manifest2) = c.get_manifest("bah_e2e_probe", &ctag(&digest2)).await.unwrap();
     assert!(!manifest2.is_empty(), "registered image must remain pullable");
 
     // --force bypasses the idempotent check: the same event rebuilds and
@@ -119,17 +121,17 @@ async fn buildah_e2e_build_and_config() {
         .map(|(_, v)| v.clone())
         .unwrap();
     assert_eq!(digest3, digest, "forced rebuild re-derives the same content tag");
-    let (_, manifest3) = c.get_manifest("bah_e2e_probe", &digest3).await.unwrap();
+    let (_, manifest3) = c.get_manifest("bah_e2e_probe", &ctag(&digest3)).await.unwrap();
     assert!(!manifest3.is_empty(), "re-pushed image must be pullable");
 
     // Idempotence invariant: if the image does not exist it must be built (and
     // pushed). Delete the registered content tag and re-run — the next delivery
     // must take the build path, restoring the artifact, not report a skip.
-    c.delete_tag("bah_e2e_probe", &digest).await.unwrap();
+    c.delete_tag("bah_e2e_probe", &ctag(&digest)).await.unwrap();
     let results4 = handle_event(inp.clone()).await.unwrap();
     let result4 = results4.iter().find(|(k, _)| k == "result");
     assert!(result4.is_none(), "deleted artifact must rebuild, got {result4:?}");
-    let (_, manifest4) = c.get_manifest("bah_e2e_probe", &digest).await.unwrap();
+    let (_, manifest4) = c.get_manifest("bah_e2e_probe", &ctag(&digest)).await.unwrap();
     assert!(!manifest4.is_empty(), "deleted artifact must be re-pushed");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -352,18 +354,23 @@ async fn buildah_e2e_module_dependency() {
     // The importer image folds the module content: the pushed config must
     // contain the module's file (copied from the module image).
     let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
-    let (_, manifest) = c.get_manifest("bah_e2e_imp", &digest).await.unwrap();
+    let ctag = |h: &str| format!("basil-{h}");
+    let (_, manifest) = c.get_manifest("bah_e2e_imp", &ctag(&digest)).await.unwrap();
     let m: Value = serde_json::from_slice(&manifest).unwrap();
     let cfg_digest = m["config"]["digest"].as_str().unwrap().to_string();
     let cfg_url = format!("http://127.0.0.1:5001/v2/bah_e2e_imp/blobs/{cfg_digest}");
     let resp = reqwest::Client::new().get(&cfg_url).send().await.unwrap();
     let cfg: Value = resp.json().await.unwrap();
     assert_eq!(cfg["config"]["Cmd"], serde_json::json!(["/bin/cat", "/out.txt"]));
-    // The module was built and pushed at its content tag: its repo now lists a
-    // 64-hex tag (the module's closure tagHash) alongside any mutable tags.
+    // The module is published at `basil-<tagHash>`: its repo lists a namespaced
+    // content tag alongside any mutable tags.
+    let is_content_tag = |t: &str| {
+        t.strip_prefix("basil-")
+            .is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+    };
     let mod_tags = c.list_tags("bah_e2e_mod").await.unwrap();
     assert!(
-        mod_tags.iter().any(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())),
+        mod_tags.iter().any(|t| is_content_tag(t)),
         "module must be published at its content tag, got {mod_tags:?}"
     );
 
@@ -385,7 +392,7 @@ async fn buildah_e2e_module_dependency() {
     let mod_tags_before = c.list_tags("bah_e2e_mod").await.unwrap();
     let content_tag = mod_tags_before
         .iter()
-        .find(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .find(|t| is_content_tag(t))
         .expect("module content tag present")
         .clone();
     c.delete_tag("bah_e2e_mod", &content_tag).await.unwrap();

@@ -19,7 +19,7 @@ wherever you want a build to happen.
   `buildkitd`, no graph protocol, no tunnel, no daemon lifecycle.
 - **Event reactions** — `ON` clauses map events (push, PR, tag) to `BUILD`,
   `DO` (run scheduled tasks), and side effects.
-- **Idempotent** — if a target's `<name>:<tagHash>` already exists, basil
+- **Idempotent** — if a target's `<name>:basil-<tagHash>` already exists, basil
   skips the rebuild (and still runs `OUTPUT`/promotion by pulling the image).
 - **Reverse `COPY`** — `OUTPUT` extracts files out of the built image onto the
   host.

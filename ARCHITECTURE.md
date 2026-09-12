@@ -8,7 +8,7 @@
 - Single binary, no daemon, no graph protocol — *one* process, `buildah` as a subprocess
 - Identity is **derived, not declared** — every `tagHash` is computed from the exact files a target reads, its instruction program, its bases, and its args; basil owns the identity, buildah just executes it
 - Event-triggered reactions — a delivered GitHub Actions payload (stdin or `--event`) selects which targets build, which tasks run, and which version tags are promoted
-- Idempotent — a build is skipped when every deliverable's `<push-ref>:<tagHash>` content tag already exists in its registry (`--force` bypasses); `OUTPUT` and promotion still run on the skip by pulling the published image
+- Idempotent — a build is skipped when every deliverable's `<push-ref>:basil-<tagHash>` content tag already exists in its registry (`--force` bypasses); `OUTPUT` and promotion still run on the skip by pulling the published image
 - Offline-capable — the closure is fully offline when every external `FROM` is pinned (`@sha256`); unpinned bases need one registry metadata read (never a layer fetch)
 - Determinism is a correctness requirement — pinned by a checked-in conformance fixture (`tests/conformance/expected.json`) that the test suite recomputes
 
@@ -93,7 +93,7 @@
 
 **GC** (`basil gc`):
 1. `parse_age` converts `30d`/`1w`/`8h`/`1y` to seconds — `src/solver/gc.rs`
-2. `gc_repo` lists each target repo's tags (from the file's qualified `AS` targets or `--repo`) and prunes only basil-owned ephemeral tags: `cache-<YYYYMMDD|MM|Y>` by embedded date, `cache-<tagHash>` and content `<tagHash>` tags by the OCI config `created` time; `v*` version tags and foreign tags are never pruned (`--dry-run` lists without deleting) — `src/solver/gc.rs` + `src/solver/registry.rs`
+2. `gc_repo` lists each target repo's tags (from the file's qualified `AS` targets or `--repo`) and prunes only basil-owned ephemeral tags: `cache-<YYYYMMDD|MM|Y>` by embedded date, `basil-cache-<tagHash>` and content `<tagHash>` tags by the OCI config `created` time; `v*` version tags and foreign tags are never pruned (`--dry-run` lists without deleting) — `src/solver/gc.rs` + `src/solver/registry.rs`
 
 ## Key Abstractions
 
@@ -158,7 +158,7 @@
 **`basil gc <AGE> [FILE] [--repo FQ] [--dry-run]`:**
 - Location: `src/main.rs` → `src/solver/gc.rs::gc_repo`
 - Triggers: manual invocation
-- Responsibilities: prune basil-owned registry tags (`cache-*`, content tags) older than `<age>` from the file's fully-qualified `AS` targets or an explicit `--repo`; never prune version tags
+- Responsibilities: prune basil-owned registry tags (`basil-cache-*`, `basil-<tagHash>` content tags) older than `<age>` from the file's fully-qualified `AS` targets or an explicit `--repo`; never prune version tags
 
 ## Error Handling
 
@@ -168,7 +168,7 @@
 
 **Logging:** `tracing` + `tracing-subscriber` fmt with `EnvFilter` from `RUST_LOG` (default `info`), initialized once in `src/main.rs`; `basil: ...` status lines on stdout mark each build phase (parse, resolve, identity, build, push, output); `with_filename`/`fs_err` attach `filename=`/`op=` fields to every file error.
 
-**Caching:** `buildah build --layers` reuses the operator's local containers/storage layer cache. The registry content tag (`<push-ref>:<tagHash>`) is the idempotency key that skips rebuilds; `cache-<tagHash>`, `cache-<YYYYMMDD>`, `cache-<YYYYMM>`, `cache-<YYYY>` tags namespace regenerable cache refs so cache accumulates and ages out on a retention schedule (`basil gc`).
+**Caching:** `buildah build --layers` reuses the operator's local containers/storage layer cache. The registry content tag (`<push-ref>:basil-<tagHash>`) is the idempotency key that skips rebuilds; `basil-cache-<tagHash>`, `basil-cache-<YYYYMMDD>`, `basil-cache-<YYYYMM>`, `basil-cache-<YYYY>` tags namespace regenerable cache refs so cache accumulates and ages out on a retention schedule (`basil gc`).
 
 **Storage:** containers/storage owned by rootless buildah for layer/build state; the registry v2 HTTP API via `reqwest` (rustls) for manifest HEADs, tag listing, deletes, config-blob reads, and immutable manifest PUTs. Redirects are followed only with a bounded policy; wrong-host redirects surface the final URL and content-type instead of being silently believed.
 

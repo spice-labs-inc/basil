@@ -47,7 +47,7 @@ REGISTER ghcr.io/mycompany/fennel        # pushed here; addressed as `fennel`
 - A **deliverable** is a target whose `AS` name is a fully-qualified image
   reference (contains a `/`), e.g. `ghcr.io/mycompany/app`, OR a target with a
   `REGISTER` ref (short name + where it is published). Deliverables are pushed
-  under `<push-ref>:<tagHash>`.
+  under `<push-ref>:basil-<tagHash>`.
 - **`REGISTER <fullname>`** — gives a short-named target its fully-qualified
   push location. The target is *addressed* by its `AS` name (`-t fennel`,
   `BUILD fennel`, `COPY --from=fennel`); the image is *published* to the
@@ -156,8 +156,8 @@ importer's stage alias for `COPY --from=<alias>`.
 
 The module is a separate identity domain: its deliverable's `tagHash` is
 folded into the importer (`base.module.<alias>`), and its build is
-use-or-build — if `<module-push-ref>:<tagHash>` already exists in the module's
-registry the importer's `FROM <ref>:<tagHash>` just pulls it, otherwise the
+use-or-build — if `<module-push-ref>:basil-<tagHash>` already exists in the module's
+registry the importer's `FROM <ref>:basil-<tagHash>` just pulls it, otherwise the
 module is built and pushed first (recursively; module cycles are an error). A
 module inside the importer's context is *not* excluded from the importer's
 `derivedData` — dockerignore it there if `COPY .` would grab it (sibling
@@ -280,7 +280,7 @@ C(T) = derivedData(T)                          # context files the target reads
      ∪ {basil-version}
 ```
 
-The content tag is `<deliverable-AS-name>:<tagHash>` — stable and immutable.
+The content tag is `<deliverable-AS-name>:basil-<tagHash>` — stable and immutable.
 Whether an image is rebuilt is decided by whether that tag already exists (the
 **idempotent check**).
 
@@ -306,7 +306,7 @@ files — pin each module file directly; `gc` stays per-file too.
   rewrites the file in place. Internal stage refs (`FROM <stage>`), `scratch`,
   and already-pinned bases are left untouched; each distinct base is resolved
   once. Idempotent — re-running it reports "no unpinned bases".
-- **`gc`** prunes only basil's own ephemeral tags (`cache-*`, content tags);
+- **`gc`** prunes only basil's own ephemeral tags (`basil-cache-*`, `basil-<tagHash>` content tags);
   version tags (`vX.Y.Z`) are never pruned. `--dry-run` lists without deleting.
 - `AGE` uses an integer plus unit: `h`, `d`, `w`, `y` (`30d`, `4w`, `1y`).
 
