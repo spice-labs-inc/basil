@@ -97,6 +97,12 @@ pub fn content_tag(hash: &str) -> String {
     format!("{BASIL_TAG_PREFIX}{hash}")
 }
 
+/// Convert a bare content hash to the cache-namespace tag: `basil-cache-<hash>`
+/// (used for exported intermediate stages).
+pub fn cache_tag(hash: &str) -> String {
+    format!("{BASIL_CACHE_PREFIX}{hash}")
+}
+
 pub fn parse_ref(name: &str, default_tag: &str) -> Result<ImageRef, String> {
     let s = name;
     let (host, path) = match s.find('/') {

@@ -84,7 +84,7 @@ basil/
 
 **Directories:** `src/<layer>/` mirrors the public library modules; fixture directories are lowercase (`testdata/`, `tests/conformance/ctx/`).
 
-**Language/DSL:** DSL keywords are uppercase (`FROM`, `ARG`, `ENV`, `COPY`, `ADD`, `RUN`, `CMD`, `ENTRYPOINT`, `USER`, `WORKDIR`, `LABEL`, `EXPOSE`, `VOLUME`, `OUTPUT`, `TASK`, `REGISTER`, `GIVEN`, `PLATFORM`, `ON`, `BUILD`, `DO`). Event tokens are kebab-case with selectors in parens (`pr-opened`, `pr-synchronized`, `pr-merged`, `push(main)`, `tag`, `release(published)`). Content tags are `<push-ref>:basil-<tagHash>` where `tagHash` is a 64-hex SHA-256; cache tags are `basil-cache-<tagHash>` and `cache-<YYYYMMDD|YYYYMM|YYYY>`; version tags are `v<semver>` (promoted from `tag`/`release` events).
+**Language/DSL:** DSL keywords are uppercase (`FROM`, `ARG`, `ENV`, `COPY`, `ADD`, `RUN`, `CMD`, `ENTRYPOINT`, `USER`, `WORKDIR`, `LABEL`, `EXPOSE`, `VOLUME`, `OUTPUT`, `TASK`, `REGISTER`, `GIVEN`, `PLATFORM`, `ON`, `BUILD`, `DO`). Event tokens are kebab-case with selectors in parens (`pr-opened`, `pr-synchronized`, `pr-merged`, `push(main)`, `tag`, `release(published)`). Content tags are `<push-ref>:basil-<tagHash>` where `tagHash` is a 64-hex SHA-256; cache tags are `basil-cache-<tagHash>` (one per non-deliverable stage, reconciled by existence) and version tags are `v<semver>` (promoted from `tag`/`release` events).
 
 ## Where to Add New Code
 

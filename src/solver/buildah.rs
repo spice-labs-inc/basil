@@ -13,6 +13,11 @@ use crate::dsl::ast::{Arg, Base, Command, Instruction, Mount, Target};
 static EMPTY_MODULES: std::collections::BTreeMap<std::string::String, std::string::String> =
     std::collections::BTreeMap::new();
 
+/// Empty stage-cache refs for render tests (cache-free files).
+#[cfg(test)]
+static EMPTY_STAGE_CACHE: std::collections::BTreeMap<std::string::String, std::string::String> =
+    std::collections::BTreeMap::new();
+
 /// The parsed stage graph handed to the buildah backend: the targets in scope
 /// plus the file's global-scope `ARG`s. They travel together — the graph is
 /// what gets rendered to a Containerfile (a targeted build passes a
@@ -28,6 +33,11 @@ pub struct Graph<'a> {
     pub file_dir: &'a std::path::Path,
     /// Module key -> `FROM`-ready ref (`<push-ref>:<tagHash>`).
     pub modules: &'a std::collections::BTreeMap<String, String>,
+    /// Stage name -> `<cache-repo>:basil-cache-<stageHash>` for every
+    /// non-deliverable stage in scope. Internal `FROM <stage>` bases render as
+    /// this ref (the stage's published cache image) so the deliverable build
+    /// pulls its intermediates instead of rebuilding them.
+    pub stage_cache: &'a std::collections::BTreeMap<String, String>,
 }
 
 impl<'a> Graph<'a> {
@@ -36,8 +46,9 @@ impl<'a> Graph<'a> {
         global_args: &'a [Arg],
         file_dir: &'a std::path::Path,
         modules: &'a std::collections::BTreeMap<String, String>,
+        stage_cache: &'a std::collections::BTreeMap<String, String>,
     ) -> Self {
-        Graph { targets, global_args, file_dir, modules }
+        Graph { targets, global_args, file_dir, modules, stage_cache }
     }
 }
 
@@ -67,6 +78,9 @@ pub fn render_containerfile(g: Graph, deliverable: &str) -> String {
     let mut out = render_global_args(g.global_args);
     // Emit every stage (multi-stage deps like COPY --from must resolve), with
     // the deliverable forced to be the last stage (that's what buildah tags).
+    // Internal stage deps (FROM <stage>) render as the stage's published cache
+    // ref — ensure_stages_cached has already probed/built/pushed it, so the
+    // deliverable build pulls its intermediates instead of rebuilding them.
     let mut order: Vec<&Target> = g.targets.iter().collect();
     if let Some(pos) = order.iter().position(|t| t.name == deliverable) {
         let d = order.remove(pos);
@@ -81,13 +95,37 @@ pub fn render_containerfile(g: Graph, deliverable: &str) -> String {
         } else {
             format!(" AS {}", t.name)
         };
-        out.push_str(&format!("FROM {}{}\n", render_base(&t.base, g.file_dir, g.modules), alias));
+        let base = render_base_for(&t.base, g.file_dir, g.modules, g.stage_cache);
+        out.push_str(&format!("FROM {}{}\n", base, alias));
         for instr in &t.instructions {
             out.push_str(&render_instruction(instr));
             out.push('\n');
         }
     }
     out
+}
+
+/// Render a base for the deliverable's Containerfile: an internal `FROM
+/// <stage>` becomes the stage's cache ref (when cached), so the build pulls it.
+/// `render_containerfile_all` keeps the original bare-name form for `--target`
+/// stage builds, where buildah must resolve the stage graph internally.
+fn render_base_for(
+    base: &Base,
+    file_dir: &std::path::Path,
+    modules: &std::collections::BTreeMap<String, String>,
+    stage_cache: &std::collections::BTreeMap<String, String>,
+) -> String {
+    match base {
+        Base::Module(_) => render_base(base, file_dir, modules),
+        Base::Image(b) => {
+            if let Some(cached) = stage_cache.get(&b.raw) {
+                if b.platform.is_none() && b.tag.is_none() && b.digest.is_none() {
+                    return cached.clone();
+                }
+            }
+            render_base(base, file_dir, modules)
+        }
+    }
 }
 
 /// Render the file-level global `ARG`s (before the first `FROM`). Empty when
@@ -431,7 +469,7 @@ async fn local_image_exists(tag_ref: &str) -> bool {
 }
 
 /// Push an already-tagged local image to `<push_ref>:<tag>`.
-async fn push_tagged(
+pub(crate) async fn push_tagged(
     deliverable: &str,
     push_ref: &str,
     tag: &str,
@@ -511,38 +549,32 @@ async fn extract_outputs(
         }
     }
     for (stage, outs) in by_stage {
-        // A stage that isn't the deliverable has no pushed image to extract
-        // from, so build it locally via `--target`. No tag is involved: the
-        // build writes its image ID to an `--iidfile`, and that untagged image
-        // is referenced by ID for the extraction and removed again after. A tag
-        // would put these throwaway images in a name namespace the registry
-        // never sees, and two OUTPUT stages would collide on it.
-        let temp = if stage == deliverable {
-            None
+        // The deliverable extracts from its pushed image; an intermediate stage
+        // extracts from its published cache image (`basil-cache-<stageHash>`),
+        // which ensure_stages_cached has probed/built/pushed before extraction
+        // on every path. buildah_from pulls it into local storage, so this is a
+        // pull, never a rebuild — and the pulled image is the cache, not a
+        // throwaway.
+        let image = if stage == deliverable {
+            image_ref.to_string()
         } else {
-            Some(build_output_stage(g, stage, context).await?)
+            g.stage_cache.get(stage).cloned().unwrap_or_else(|| {
+                // A stage with OUTPUT that isn't cached would rebuild on every
+                // run: surface it rather than silently rebuilding.
+                format!("basil-stage-cache-missing:{stage}")
+            })
         };
-
-        let image = temp.as_deref().unwrap_or(image_ref);
-        let result = extract_into(image, stage, &outs, context).await;
-        if let Some(image_id) = &temp {
-            // The extraction result is what matters; a failed cleanup must not
-            // mask it, but it must be reported rather than left silent.
-            if let Err(e) = remove_local_image(image_id).await {
-                tracing::warn!("removing OUTPUT temp image `{image_id}`: {e}");
-            }
-        }
-        result?;
+        extract_into(&image, stage, &outs, context).await?;
     }
     Ok(())
 }
 
-/// Build one OUTPUT-declaring intermediate stage as a local, untagged image and
-/// return its image ID (`sha256:…`). The Containerfile is rendered all-stages
-/// (so every `AS` alias and `--from` resolves) and fed on stdin; `--target`
-/// selects the stage, and `--iidfile` reports the committed image without
-/// giving it a tag.
-async fn build_output_stage(
+/// Build one stage as a local, untagged image and return its image ID
+/// (`sha256:…`). Used by the cache pass: build `--target <stage>` once, push it
+/// as `basil-cache-<stageHash>`, then remove the local image. The Containerfile
+/// is rendered all-stages (so every `AS` alias and `--from` resolves) and fed
+/// on stdin; `--iidfile` reports the committed image without giving it a tag.
+pub(crate) async fn build_stage_image(
     g: Graph<'_>,
     stage: &str,
     context: &std::path::Path,
@@ -597,12 +629,11 @@ async fn build_output_stage(
     Ok(id)
 }
 
-/// Remove a locally-built, untagged image by ID. Used for the per-stage OUTPUT
-/// temp images, which exist only to back an extraction container. `-f` because
-/// the image ID may carry leftover tags from earlier runs (identical cached
-/// content), and the image is throwaway — refusing on "more than one tag"
-/// would leak it.
-async fn remove_local_image(image: &str) -> anyhow::Result<()> {
+/// Remove a locally-built, untagged image by ID. Used when pushing an
+/// intermediate stage to its cache ref. `-f` because the image ID may carry
+/// leftover tags from earlier runs (identical cached content), and the image is
+/// throwaway — refusing on "more than one tag" would leak it.
+pub(crate) async fn remove_local_image(image: &str) -> anyhow::Result<()> {
     let out = tokio::process::Command::new("buildah")
         .args(["rmi", "-f", image])
         .output()
@@ -716,8 +747,17 @@ pub async fn run_task(image: &str, cmd: &Command, env: &[String]) -> anyhow::Res
 }
 
 async fn buildah_from(image: &str) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("buildah")
-        .args(["from", image])
+    let mut cmd = tokio::process::Command::new("buildah");
+    cmd.arg("from");
+    // buildah autodetects localhost as insecure for `build`, but `from`/`pull`
+    // needs the explicit flag or it tries HTTPS on the local test registry.
+    if let Ok(ir) = crate::solver::registry::parse_ref(image, "latest") {
+        if ir.is_local() {
+            cmd.arg("--tls-verify=false");
+        }
+    }
+    let out = cmd
+        .arg(image)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("buildah from: {e}"))?;
@@ -742,7 +782,7 @@ ENV FOO=bar\n\
 CMD [\"/app\"]\n\
 ON push(main) BUILD 127.0.0.1:5001/app\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE), "127.0.0.1:5001/app");
         assert!(cf.starts_with("FROM golang AS build\n"));
         // The deliverable is the final stage, tagged (no AS alias needed).
         assert!(cf.contains("FROM scratch\n"));
@@ -760,7 +800,7 @@ RUN go build -o /bin/app\n\
 FROM scratch AS app\n\
 COPY --from=build /bin/app /app\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile_all(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES));
+        let cf = render_containerfile_all(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE));
         assert!(cf.contains("FROM golang AS build\n"), "{cf}");
         assert!(cf.contains("FROM scratch AS app\n"), "{cf}");
         assert!(cf.contains("COPY --from=build /bin/app /app"), "{cf}");
@@ -771,7 +811,7 @@ COPY --from=build /bin/app /app\n";
         let src = "FROM alpine AS 127.0.0.1:5001/app\n\
 RUN --mount=type=cache,target=/cache --network=none echo hi\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE), "127.0.0.1:5001/app");
         assert!(cf.contains("RUN --mount=type=cache,target=/cache --network=none echo hi"), "{cf}");
     }
 
@@ -787,7 +827,7 @@ RUN --mount=type=cache,target=/cache --network=none echo hi\n";
         let src = "FROM alpine AS 127.0.0.1:5001/app\n\
 ADD --chown=1000:1000 --chmod=0755 a.txt /x\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE), "127.0.0.1:5001/app");
         assert!(cf.contains("ADD --chown=1000:1000 --chmod=0755 a.txt /x"), "{cf}");
     }
 
@@ -796,7 +836,7 @@ ADD --chown=1000:1000 --chmod=0755 a.txt /x\n";
         let src = "FROM --platform=$BUILDPLATFORM alpine AS 127.0.0.1:5001/app\n\
 RUN echo hi\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE), "127.0.0.1:5001/app");
         assert!(
             cf.starts_with("FROM --platform=$BUILDPLATFORM alpine\n"),
             "expected platform selector in FROM:\n{cf}"
@@ -816,7 +856,7 @@ FROM scratch AS 127.0.0.1:5001/app\n\
 COPY --from=build /x /x\n";
         let f = parse(src).unwrap();
         assert_eq!(f.global_args.len(), 1);
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE), "127.0.0.1:5001/app");
         assert!(cf.starts_with("ARG VERSION=\"\"\n"), "global ARG must be topmost:\n{cf}");
         // The stage's own redeclaration is preserved as written.
         assert!(cf.contains("FROM alpine AS build\nARG VERSION\n"), "{cf}");
@@ -824,7 +864,7 @@ COPY --from=build /x /x\n";
         assert_eq!(cf.matches("ARG VERSION=\"\"").count(), 1, "{cf}");
         // No global args -> nothing prepended.
         let plain = parse("FROM alpine AS 127.0.0.1:5001/app\nRUN echo hi\n").unwrap();
-        let cf2 = render_containerfile(Graph::new(&plain.targets, &plain.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
+        let cf2 = render_containerfile(Graph::new(&plain.targets, &plain.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE), "127.0.0.1:5001/app");
         assert!(cf2.starts_with("FROM alpine\n"), "{cf2}");
     }
 
@@ -832,10 +872,10 @@ COPY --from=build /x /x\n";
     fn renders_bare_global_arg() {
         let src = "ARG VERSION\nFROM alpine AS 127.0.0.1:5001/app\n";
         let f = parse(src).unwrap();
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE), "127.0.0.1:5001/app");
         assert!(cf.starts_with("ARG VERSION\nFROM alpine\n"), "{cf}");
         // The all-stages renderer (--target builds) gets them too.
-        let all = render_containerfile_all(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES));
+        let all = render_containerfile_all(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE));
         assert!(all.starts_with("ARG VERSION\nFROM alpine AS 127.0.0.1:5001/app\n"), "{all}");
     }
 
@@ -852,7 +892,7 @@ ON push(main) BUILD 127.0.0.1:5001/app\n";
         let app = f.targets.iter().find(|t| t.name == "127.0.0.1:5001/app").unwrap();
         assert!(app.task.is_some(), "task should parse onto the target");
 
-        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES), "127.0.0.1:5001/app");
+        let cf = render_containerfile(Graph::new(&f.targets, &f.global_args, std::path::Path::new("."), &EMPTY_MODULES, &EMPTY_STAGE_CACHE), "127.0.0.1:5001/app");
         assert!(
             !cf.contains("task-ran"),
             "TASK command leaked into the Containerfile:\n{cf}"

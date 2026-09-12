@@ -52,6 +52,10 @@ pub struct BuildArgs {
     /// registry (bypasses the idempotent check).
     #[arg(long)]
     pub force: bool,
+    /// Where intermediate stages are cached (`basil-cache-*` tags); defaults to
+    /// `BASIL_CACHE_REF`, then the deliverable's own repo.
+    #[arg(long, value_name = "REPO")]
+    pub cache_repo: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -70,6 +74,10 @@ pub struct HandleArgs {
     /// registry (bypasses the idempotent check).
     #[arg(long)]
     pub force: bool,
+    /// Where intermediate stages are cached (`basil-cache-*` tags); defaults to
+    /// `BASIL_CACHE_REF`, then the deliverable's own repo.
+    #[arg(long, value_name = "REPO")]
+    pub cache_repo: Option<String>,
 }
 
 #[derive(clap::Args)]

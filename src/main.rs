@@ -98,6 +98,7 @@ fn main() -> anyhow::Result<()> {
                     event_json: None,
                     target_filter: args.target.as_ref(),
                     force: args.force,
+                    cache_repo: args.cache_repo.as_deref(),
                 };
                 let results = basil::solver::orchestrate::build_targets(inp).await?;
                 for (k, v) in &results {
@@ -126,6 +127,7 @@ fn main() -> anyhow::Result<()> {
                     event_json: Some(&event_json),
                     target_filter: None,
                     force: args.force,
+                    cache_repo: args.cache_repo.as_deref(),
                 };
                 let results = basil::solver::orchestrate::handle_event(inp).await?;
                 for (k, v) in &results {

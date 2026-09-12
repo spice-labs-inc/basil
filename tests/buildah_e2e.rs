@@ -56,6 +56,7 @@ async fn buildah_e2e_build_and_config() {
         event_json: Some(event),
         target_filter: None,
         force: false,
+        cache_repo: None,
     };
     let results = handle_event(inp.clone()).await.unwrap();
     let digest = results
@@ -228,6 +229,7 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
         event_json: Some(event),
         target_filter: None,
         force: false,
+        cache_repo: None,
     };
 
     let images_before = local_image_count().await;
@@ -242,17 +244,17 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
     assert_eq!(std::fs::read_to_string(dir.join("out/two.txt")).unwrap().trim(), "TWO");
     // No leak: the per-stage temp images must be removed again (their absence
     // shows as no growth in untagged images) and nothing may be minted under a
-    // temp tag. At most one new image may appear (the deliverable, already
-    // present if a previous run built the same content).
+    // temp tag. New images = the deliverable + the cached intermediate stages
+    // pulled as its `FROM` bases (warm cache, like a pulled base image).
     let images_after = local_image_count().await;
     assert!(
-        images_after <= images_before + 1,
-        "at most the deliverable image may be added (was {images_before}, now {images_after})"
+        images_after <= images_before + 4,
+        "at most the deliverable + cached stages may be added (was {images_before}, now {images_after})"
     );
     assert_eq!(
         local_untagged_image_count().await,
         untagged_before,
-        "per-stage OUTPUT images must be removed (untagged image count grew)"
+        "per-stage cache builds must be pushed, not left untagged (untagged count grew)"
     );
     assert_eq!(
         local_container_count().await,
@@ -271,17 +273,19 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
     let minted: Vec<String> = local_image_names()
         .await
         .into_iter()
-        .filter(|n| !names_before.contains(n))
+        .filter(|n| !names_before.contains(n) && !n.starts_with("basil-cache-"))
         .collect();
     assert!(
         minted.len() <= 1,
-        "at most one new image name (the deliverable): {minted:?}"
+        "at most one new non-cache image name (the deliverable): {minted:?}"
     );
 
-    // Same guarantees on the idempotent-skip path, which also extracts.
+    // Same guarantees on the idempotent-skip path, which also extracts (from
+    // the cached stage images — pulled, never rebuilt).
     std::fs::remove_dir_all(dir.join("out")).unwrap();
     let untagged_before2 = local_untagged_image_count().await;
     let containers_before2 = local_container_count().await;
+    let names_before2 = local_image_names().await;
     let results = handle_event(inp.clone()).await.unwrap();
     assert_eq!(
         results.iter().find(|(k, _)| k == "result").map(|(_, v)| v.as_str()),
@@ -343,6 +347,7 @@ async fn buildah_e2e_module_dependency() {
         event_json: Some(event),
         target_filter: None,
         force: false,
+        cache_repo: None,
     };
     // First delivery: builds the module (not yet registered), then the importer.
     let results = handle_event(inp.clone()).await.unwrap();

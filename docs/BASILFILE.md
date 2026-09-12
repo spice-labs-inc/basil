@@ -288,8 +288,8 @@ Whether an image is rebuilt is decided by whether that tag already exists (the
 
 ```
 basil closure [CONTEXT] [TARGET] [-f FILE]   # report each target's tagHash
-basil build [CONTEXT] [-f FILE] [-t TARGET] [--force]  # build a deliverable directly (no event); --force rebuilds even when the content tag already exists
-basil handle [CONTEXT] [-f FILE] [--event F] # read an event (stdin or --event) and react
+basil build [CONTEXT] [-f FILE] [-t TARGET] [--force] [--cache-repo REPO]  # build a deliverable directly (no event); --force rebuilds even when the content tag already exists; --cache-repo overrides where intermediate stages are cached
+basil handle [CONTEXT] [-f FILE] [--event F] [--cache-repo REPO] # read an event (stdin or --event) and react
 basil pin [FILE]                            # resolve unpinned bases to @sha256 in place
 basil gc <AGE> [FILE] [--repo FQ] [--dry-run]   # prune basil-owned tags older than <AGE>
 ```

@@ -203,17 +203,17 @@ checked-in golden inputs whose expected digest the test suite recomputes.
    foreign 64-hex tag is never mistaken for basil's.
    **Deliverable targets only.** One platform → a single image; several → an OCI
     index. Checked first; on hit, the idempotent check skips the rebuild.
-2. **Cache refs** — exported under the deliverable's repo with four tags:
-   `basil-cache-<tagHash>` (exact closure), `basil-cache-<YYYYMMDD>`,
-   `basil-cache-<YYYYMM>`, `basil-cache-<YYYY>` (build date). The exact tag
-   reattaches the identical closure; the date tags are shared by every build in
-   that period, so cache accumulates across content changes, and each period
-   ages out on a retention schedule. Imports read `basil-cache-<tagHash>` plus
-   the current day/month/year tags.
-
-Only the exact-closure cache tag (`basil-cache-<tagHash>`) is keyed on
-`tagHash`; the date tags are shared, best-effort cache and do not affect
-identity.
+2. **Intermediate cache** — every non-deliverable stage in the build graph is
+   exported as `<repo>:basil-cache-<stageHash>`, where `<repo>` is the
+   deliverable's repo by default (the `--cache-repo` flag or `BASIL_CACHE_REF`
+   override it). Reconcile-by-existence: a missing cache image for a stage is
+   built (`--target <stage>`) and pushed on any build path *including the
+   idempotent skip*; stages are regenerable, so `basil gc` may reap them by
+   age. The deliverable's Containerfile renders `FROM
+   <repo>:basil-cache-<stageHash>` for internal bases, so the final build pulls
+   its intermediates instead of rebuilding them — cross-run and cross-machine
+   reuse. `OUTPUT` extraction reads the same cache refs (a pull, never a
+   rebuild).
 
 **`FROM` — three cases.**
 
@@ -418,16 +418,16 @@ so it never matches today.)
   operation (pushing content tags, exporting/importing cache) is the operator's
   existing Docker/Podman credentials (`$DOCKER_CONFIG` `auths`/`credHelpers`,
   Podman `auth.json`).
-- **`BASIL_CACHE_REF`** — overrides the cache repo (default: the deliverable's
-  fully-qualified name); basil appends the `cache-…` tags and uses the same
-  operator credentials, never a separate set.
+- **`--cache-repo` / `BASIL_CACHE_REF`** — where intermediate-stage cache images
+  are pushed (default: the deliverable's fully-qualified repo); basil appends
+  the `basil-cache-…` tags and uses the same operator credentials, never a
+  separate set.
 - **Build layer cache**: `buildah build --layers` reuses the operator's local
-  `containers/storage` layer cache; `--cache-from` can point at published cache
-  refs. The idempotent check (content tag exists) already skips the entire build,
-  so layer reattach is a secondary optimization.
-- **Cache refs**: basil names exported intermediate cache under
-  `basil-cache-<tagHash>`, `basil-cache-<YYYYMMDD>`, `basil-cache-<YYYYMM>`,
-  `basil-cache-<YYYY>` for cross-run reuse.
+  `containers/storage` layer cache. The idempotent check (content tag exists)
+  already skips the entire build.
+- **Intermediate cache**: every non-deliverable stage is exported under
+  `basil-cache-<stageHash>` (one tag per stage), reconciled by existence on both
+  build and idempotent-skip paths — a missing stage cache is rebuilt and pushed.
 - **Multiple deliverables** = one rendered multi-stage Containerfile; each
   deliverable is built and pushed under its content tag.
 

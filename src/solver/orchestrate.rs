@@ -107,6 +107,9 @@ pub struct BuildInput<'a> {
     pub target_filter: Option<&'a String>,
     /// Bypass the idempotent check: always rebuild and re-push.
     pub force: bool,
+    /// Where intermediate-stage cache images are pushed (`basil-cache-*` refs);
+    /// `None` defaults to each deliverable's own repo.
+    pub cache_repo: Option<&'a str>,
 }
 async fn promote_on_tag(
     matched: &[&crate::dsl::ast::Reaction],
@@ -300,6 +303,12 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
 
     let mut out: Vec<(String, String)> = Vec::new();
 
+    // Every non-deliverable stage in scope gets a cache image
+    // (`<repo>:basil-cache-<stageHash>`). The cache repo is `--cache-repo`, else
+    // `BASIL_CACHE_REF`, else the first deliverable's repo (D1).
+    let cache_repo = effective_cache_repo(inp.cache_repo, &deliverables);
+    let stage_cache = stage_cache_refs(&subset, &deliverables, &closures, &cache_repo);
+
     // If every content tag already exists in its registry, the exact images
     // are already published — don't rebuild (parity with handle_event's
     // idempotent check). The probes confirmed registration; the noop path
@@ -314,7 +323,11 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             // them by existence even on the noop path, so a deleted module is
             // re-registered (same tagHash — the importer image stays valid).
             ensure_modules_built(&index, &module_refs).await?;
-            let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs);
+            // Stages are reconciled by existence too: a missing cache image is
+            // rebuilt and pushed even on the noop path (D2).
+            let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache);
+            ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
+            let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache);
             for (name, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
                 // OUTPUT still runs: pull the published image and extract.
@@ -337,6 +350,10 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     // module when missing (recursive; the module's own modules were already
     // ensured when its digest was computed? No — ensure here, bottom-up).
     ensure_modules_built(&index, &module_refs).await?;
+    // Every intermediate stage must exist as its cache image before the
+    // deliverable's Containerfile references it (reconcile by existence).
+    let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache);
+    ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
 
     for (name, push_ref) in &deliverables {
         let tag = digest_of(name, &closures)?;
@@ -344,7 +361,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs),
+            crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache),
             name,
             push_ref,
             &tag,
@@ -579,6 +596,12 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     }
     println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
+    // Every non-deliverable stage in scope gets a cache image
+    // (`<repo>:basil-cache-<stageHash>`). The cache repo is `--cache-repo`, else
+    // `BASIL_CACHE_REF`, else the first deliverable's repo (D1).
+    let cache_repo = effective_cache_repo(inp.cache_repo, &deliverables);
+    let stage_cache = stage_cache_refs(&parsed.targets, &deliverables, &closures, &cache_repo);
+
     // Idempotent check: skip when every deliverable's content tag exists, and
     // state each registered image on the noop path. `--force` bypasses the
     // check entirely — no probe, always rebuild and re-push.
@@ -590,7 +613,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             // by existence even on the noop path, so a deleted module is
             // re-registered (same tagHash — the importer image stays valid).
             ensure_modules_built(&index, &module_refs).await?;
-            let g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs);
+            // Stages are reconciled by existence too (D2).
+            let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache);
+            ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
+            let g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache);
             for (_, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
             }
@@ -618,6 +644,9 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     // module when missing (recursive). `--force` never propagates: modules are
     // still reconciled by existence, only the importer is force-built.
     ensure_modules_built(&index, &module_refs).await?;
+    // Every intermediate stage must exist as its cache image first (D2).
+    let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache);
+    ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
 
     // Build each deliverable with buildah.
     for (name, push_ref) in &deliverables {
@@ -626,7 +655,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs),
+            crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache),
             name,
             push_ref,
             &tag,
@@ -683,11 +712,13 @@ async fn ensure_modules_built(
         // The module's own graph: its file's targets + global args, its own
         // file dir for ITS module deps, and the full refs map (nested modules
         // included) for rendering.
+        let no_stage_cache = std::collections::BTreeMap::new();
         let g = crate::solver::buildah::Graph::new(
             &e.parsed.targets,
             &e.parsed.global_args,
             &e.context,
             module_refs,
+            &no_stage_cache,
         );
         crate::solver::buildah::build_deliverable(
             g,
@@ -701,6 +732,95 @@ async fn ensure_modules_built(
             false,
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// The cache repo for intermediate-stage images: `--cache-repo`, else
+/// `BASIL_CACHE_REF`, else the first deliverable's repo (the D1 default).
+fn effective_cache_repo(
+    flag: Option<&str>,
+    deliverables: &[(String, String)],
+) -> String {
+    if let Some(f) = flag {
+        return f.to_string();
+    }
+    if let Ok(env) = std::env::var("BASIL_CACHE_REF") {
+        if !env.trim().is_empty() {
+            return env;
+        }
+    }
+    deliverables
+        .first()
+        .map(|(_, push_ref)| push_ref.clone())
+        .unwrap_or_else(|| "127.0.0.1:5001/basil-cache".to_string())
+}
+
+/// Stage name -> `<cache-repo>:basil-cache-<stageHash>` for every in-scope
+/// target that is not a deliverable (the deliverable is published under its
+/// content tag instead).
+fn stage_cache_refs(
+    targets: &[crate::dsl::ast::Target],
+    deliverables: &[(String, String)],
+    closures: &std::collections::HashMap<String, [u8; 32]>,
+    cache_repo: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let deliv: std::collections::BTreeSet<&str> =
+        deliverables.iter().map(|(name, _)| name.as_str()).collect();
+    let mut out = std::collections::BTreeMap::new();
+    for t in targets {
+        if deliv.contains(t.name.as_str()) {
+            continue;
+        }
+        let Some(hash) = closures.get(&t.name) else { continue };
+        let tag = crate::solver::registry::cache_tag(&crate::identity::closure::hex(hash));
+        out.insert(t.name.clone(), format!("{cache_repo}:{tag}"));
+    }
+    out
+}
+
+/// Ensure every intermediate stage exists as its cache image in the registry:
+/// probe `<cache-repo>:basil-cache-<stageHash>`; on miss, build `--target
+/// <stage>`, push it, and remove the local image. Iterates in subset order
+/// (dependencies first). `--force` never propagates here — stages are
+/// reconciled by existence, always (D2).
+async fn ensure_stages_cached(
+    g: crate::solver::buildah::Graph<'_>,
+    context: &std::path::Path,
+    deliverables: &[(String, String)],
+) -> anyhow::Result<()> {
+    let deliv: std::collections::BTreeSet<&str> =
+        deliverables.iter().map(|(name, _)| name.as_str()).collect();
+    for t in g.targets {
+        if deliv.contains(t.name.as_str()) {
+            continue;
+        }
+        let Some(ref_str) = g.stage_cache.get(&t.name) else { continue };
+        // `<cache-repo>:basil-cache-<hash>` -> repo + tag.
+        let (repo, tag) = ref_str
+            .rsplit_once(':')
+            .map(|(r, t)| (r.to_string(), t.to_string()))
+            .unwrap_or_else(|| (ref_str.clone(), String::new()));
+        let ir = crate::solver::registry::parse_ref(&repo, &tag)
+            .map_err(|e| anyhow::anyhow!("stage `{}` cache ref `{ref_str}`: {e}", t.name))?;
+        let exists = match ir.client().manifest_exists(&ir.repo, &tag).await {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!("stage `{}` cache probe failed ({err}); will build", t.name);
+                false
+            }
+        };
+        if exists {
+            println!("basil: stage {} -> {ref_str} (cached)", t.name);
+            continue;
+        }
+        println!("basil: stage {} -> building cache {ref_str}", t.name);
+        let image_id = crate::solver::buildah::build_stage_image(g, &t.name, context).await?;
+        let insecure = ir.is_local();
+        // buildah push needs the full `<host>/<repo>` ref, not the repo path.
+        crate::solver::buildah::push_tagged(&t.name, &repo, &tag, &image_id, insecure).await?;
+        crate::solver::buildah::remove_local_image(&image_id).await?;
+        println!("basil: stage {} cached at {ref_str}", t.name);
     }
     Ok(())
 }
