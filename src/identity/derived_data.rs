@@ -778,7 +778,10 @@ fn make_repo(dir: &std::path::Path, files: &[(&str, &str)], exec: &[&str], links
     git_run(dir, &["config", "user.email", "t@t"]);
     git_run(dir, &["config", "user.name", "t"]);
     git_run(dir, &["add", "-A"]);
-    git_run(dir, &["commit", "-qm", "init"]);
+    // Disable commit signing for the fixture: the ambient config may enable
+    // SSH signing with an agent socket that isn't reachable from the test
+    // process, which would fail the fixture's own git commit.
+    git_run(dir, &["-c", "commit.gpgsign=false", "commit", "-qm", "init"]);
 }
 
 #[cfg(test)]

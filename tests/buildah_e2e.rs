@@ -102,7 +102,7 @@ async fn buildah_e2e_build_and_config() {
     // --force bypasses the idempotent check: the same event rebuilds and
     // re-pushes even though the content tag is registered (no idempotent-skip
     // result is emitted — the build path has no `result` key at all).
-    let mut forced = inp;
+    let mut forced = inp.clone();
     forced.force = true;
     let results3 = handle_event(forced).await.unwrap();
     let result3 = results3.iter().find(|(k, _)| k == "result");
@@ -115,6 +115,16 @@ async fn buildah_e2e_build_and_config() {
     assert_eq!(digest3, digest, "forced rebuild re-derives the same content tag");
     let (_, manifest3) = c.get_manifest("bah_e2e_probe", &digest3).await.unwrap();
     assert!(!manifest3.is_empty(), "re-pushed image must be pullable");
+
+    // Idempotence invariant: if the image does not exist it must be built (and
+    // pushed). Delete the registered content tag and re-run — the next delivery
+    // must take the build path, restoring the artifact, not report a skip.
+    c.delete_tag("bah_e2e_probe", &digest).await.unwrap();
+    let results4 = handle_event(inp.clone()).await.unwrap();
+    let result4 = results4.iter().find(|(k, _)| k == "result");
+    assert!(result4.is_none(), "deleted artifact must rebuild, got {result4:?}");
+    let (_, manifest4) = c.get_manifest("bah_e2e_probe", &digest).await.unwrap();
+    assert!(!manifest4.is_empty(), "deleted artifact must be re-pushed");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

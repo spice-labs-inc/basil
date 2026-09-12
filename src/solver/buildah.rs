@@ -322,10 +322,24 @@ pub async fn build_deliverable(
     context: &std::path::Path,
     build_args: &std::collections::HashMap<String, String>,
     insecure: bool,
+    force: bool,
 ) -> anyhow::Result<()> {
-    let containerfile = render_containerfile(g, deliverable);
-
     let tag_ref = format!("{push_ref}:{tag}");
+
+    // If the exact content-tagged image already exists in local
+    // containers/storage, push it instead of replaying the Containerfile:
+    // every step would hit cache and re-commit a byte-identical image, which is
+    // pure waste when the artifact itself is already present. The content tag
+    // IS the identity, so a local image at this ref is by definition the image
+    // this build would produce. `--force` skips this and rebuilds.
+    if !force && local_image_exists(&tag_ref).await {
+        println!("basil: image {tag_ref} already built locally -- pushing (no rebuild)");
+        push_tagged(deliverable, push_ref, tag, &tag_ref, insecure).await?;
+        extract_outputs(g, deliverable, &tag_ref, context).await?;
+        return Ok(());
+    }
+
+    let containerfile = render_containerfile(g, deliverable);
 
     // Buildah's own output is streamed live to the terminal so the user sees
     // STEP n/n progress; status lines give the phase context. The Containerfile
@@ -387,6 +401,40 @@ pub async fn build_deliverable(
     }
     println!("basil: built {deliverable}:{tag}");
 
+    push_tagged(deliverable, push_ref, tag, &tag_ref, insecure).await?;
+
+    // Reverse COPY: extract any OUTPUT files (from the stage that declares
+    // them) to the host. No-op if there are none.
+    extract_outputs(g, deliverable, &tag_ref, context).await?;
+    Ok(())
+}
+
+/// Is the exact `<push-ref>:<tag>` image present in local containers/storage?
+/// `buildah inspect --type image` resolves a local ref and never pulls, so a
+/// non-zero exit is "not present locally".
+async fn local_image_exists(tag_ref: &str) -> bool {
+    tokio::process::Command::new("buildah")
+        .arg("inspect")
+        .arg("--type")
+        .arg("image")
+        .arg(tag_ref)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Push an already-tagged local image to `<push_ref>:<tag>`.
+async fn push_tagged(
+    deliverable: &str,
+    push_ref: &str,
+    tag: &str,
+    tag_ref: &str,
+    insecure: bool,
+) -> anyhow::Result<()> {
     // Push the tagged image to the deliverable's registry.
     println!("basil: push {push_ref}:{tag}");
     let mut push = tokio::process::Command::new("buildah");
@@ -400,7 +448,7 @@ pub async fn build_deliverable(
     if let Some(authfile) = push_authfile() {
         push.arg("--authfile").arg(&authfile);
     }
-    push.arg(&tag_ref)
+    push.arg(tag_ref)
         .arg(format!("docker://{push_ref}:{tag}"))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -413,10 +461,6 @@ pub async fn build_deliverable(
         anyhow::bail!("buildah push failed (exit {pstatus})");
     }
     println!("basil: pushed {deliverable}:{tag}");
-
-    // Reverse COPY: extract any OUTPUT files (from the stage that declares
-    // them) to the host. No-op if there are none.
-    extract_outputs(g, deliverable, &tag_ref, context).await?;
     Ok(())
 }
 

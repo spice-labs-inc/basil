@@ -346,6 +346,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             inp.context,
             &HashMap::new(),
             insecure,
+            inp.force,
         )
         .await?;
         out.push((name.clone(), tag));
@@ -624,6 +625,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             inp.context,
             &build_args,
             insecure,
+            inp.force,
         )
         .await?;
     }
@@ -681,6 +683,8 @@ async fn ensure_modules_built(
             &e.context,
             &std::collections::HashMap::new(),
             insecure,
+            // Modules are reconciled by existence, always: never force-built.
+            false,
         )
         .await?;
     }
