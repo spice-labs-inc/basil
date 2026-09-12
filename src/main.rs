@@ -75,7 +75,7 @@ fn main() -> anyhow::Result<()> {
                 &build_file,
                 &HashMap::new(),
                 &mut CliResolver,
-                &module_digests,
+                &module_digests.deliverable,
             )
             .map_err(anyhow::Error::msg)?;
             println!("{} target(s), {} reaction(s)\n", parsed.targets.len(), parsed.reactions.len());

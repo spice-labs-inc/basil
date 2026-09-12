@@ -51,7 +51,7 @@ fn compute() -> BTreeMap<String, String> {
         &build_file,
         &overrides,
         &mut PinnedResolver,
-        &module_digests,
+        &module_digests.deliverable,
     )
     .unwrap();
     tags.iter()

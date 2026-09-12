@@ -279,7 +279,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         &build_file,
         &HashMap::new(),
         &mut resolver,
-        &module_digests,
+        &module_digests.deliverable,
     )
     .map_err(anyhow::Error::msg)?;
     // Module key -> `FROM <push-ref>:<tagHash>` for the importer's Containerfile.
@@ -287,7 +287,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         std::collections::BTreeMap::new();
     for key in &index.order {
         let e = &index.entries[key];
-        let tag = crate::identity::closure::hex(&module_digests[key]);
+        let tag = crate::identity::closure::hex(&module_digests.deliverable[key]);
         module_refs.insert(
             key.clone(),
             format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
@@ -322,7 +322,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             // The modules are part of the declared artifact set too: reconcile
             // them by existence even on the noop path, so a deleted module is
             // re-registered (same tagHash — the importer image stays valid).
-            ensure_modules_built(&index, &module_refs).await?;
+            ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
             // Stages are reconciled by existence too: a missing cache image is
             // rebuilt and pushed even on the noop path (D2).
             let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache);
@@ -349,7 +349,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     // image before the importer renders FROM it — probe; build + push the
     // module when missing (recursive; the module's own modules were already
     // ensured when its digest was computed? No — ensure here, bottom-up).
-    ensure_modules_built(&index, &module_refs).await?;
+    ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
     // Every intermediate stage must exist as its cache image before the
     // deliverable's Containerfile references it (reconcile by existence).
     let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache);
@@ -580,7 +580,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         &build_file,
         &build_args,
         &mut resolver,
-        &module_digests,
+        &module_digests.deliverable,
     )
     .map_err(anyhow::Error::msg)?;
     // Module key -> `FROM <push-ref>:<tagHash>` for the importer's Containerfile.
@@ -588,7 +588,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         std::collections::BTreeMap::new();
     for key in &index.order {
         let e = &index.entries[key];
-        let tag = crate::identity::closure::hex(&module_digests[key]);
+        let tag = crate::identity::closure::hex(&module_digests.deliverable[key]);
         module_refs.insert(
             key.clone(),
             format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
@@ -612,7 +612,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             // Modules are part of the declared artifact set too: reconcile them
             // by existence even on the noop path, so a deleted module is
             // re-registered (same tagHash — the importer image stays valid).
-            ensure_modules_built(&index, &module_refs).await?;
+            ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
             // Stages are reconciled by existence too (D2).
             let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache);
             ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
@@ -643,7 +643,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     // image before the importer renders FROM it — probe; build + push the
     // module when missing (recursive). `--force` never propagates: modules are
     // still reconciled by existence, only the importer is force-built.
-    ensure_modules_built(&index, &module_refs).await?;
+    ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
     // Every intermediate stage must exist as its cache image first (D2).
     let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache);
     ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
@@ -683,6 +683,8 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
 async fn ensure_modules_built(
     index: &crate::identity::modules::ModuleIndex,
     module_refs: &std::collections::BTreeMap<String, String>,
+    module_closures: &crate::identity::modules::ModuleClosures,
+    cache_to: Option<&str>,
 ) -> anyhow::Result<()> {
     for key in &index.order {
         let e = &index.entries[key];
@@ -703,6 +705,25 @@ async fn ensure_modules_built(
                 false
             }
         };
+        // The module's own intermediate stages are cached under its repo too
+        // (cache-to override, else the module's push_ref), reconciled by
+        // existence exactly like the importer's stages.
+        let module_repo = cache_to.unwrap_or(&e.push_ref);
+        let deliv = [(e.deliverable.clone(), e.push_ref.clone())];
+        let stage_cache = stage_cache_refs(
+            &e.parsed.targets,
+            &deliv,
+            &module_closures.tables[key],
+            module_repo,
+        );
+        let g_for_cache = crate::solver::buildah::Graph::new(
+            &e.parsed.targets,
+            &e.parsed.global_args,
+            &e.context,
+            module_refs,
+            &stage_cache,
+        );
+        ensure_stages_cached(g_for_cache, &e.context, &deliv).await?;
         if exists {
             println!("basil: module {key} -> {from_ref} (using existing image)");
             continue;
@@ -710,15 +731,14 @@ async fn ensure_modules_built(
         println!("basil: module {key} -> building {from_ref}");
         let insecure = ir.is_local();
         // The module's own graph: its file's targets + global args, its own
-        // file dir for ITS module deps, and the full refs map (nested modules
-        // included) for rendering.
-        let no_stage_cache = std::collections::BTreeMap::new();
+        // file dir for ITS module deps, the full refs map (nested modules
+        // included), and its own stage-cache refs for rendering.
         let g = crate::solver::buildah::Graph::new(
             &e.parsed.targets,
             &e.parsed.global_args,
             &e.context,
             module_refs,
-            &no_stage_cache,
+            &stage_cache,
         );
         crate::solver::buildah::build_deliverable(
             g,

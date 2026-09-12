@@ -186,14 +186,28 @@ pub fn discover_module_index(targets: &[Target], file_dir: &Path) -> Result<Modu
     Ok(index)
 }
 
-/// Compute each discovered module's full closure table (its targets, its own
-/// module deps already folded) and return the deliverable `tagHash` per module
-/// key. `order` is dependency-first, so every module's deps resolve before it.
+/// Module closure tables: per module key, the deliverable `tagHash` plus the
+/// module's full closure table (every in-scope target, so its intermediate
+/// stages can be cached). `order` is dependency-first, so every module's deps
+/// resolve before it.
+#[derive(Debug)]
+pub struct ModuleClosures {
+    /// Module key -> deliverable `tagHash` (folds into the importer and names
+    /// the module's content tag).
+    pub deliverable: BTreeMap<String, [u8; 32]>,
+    /// Module key -> full closure table of that module's targets.
+    pub tables: BTreeMap<String, std::collections::HashMap<String, [u8; 32]>>,
+}
+
+/// Compute every module's closure table bottom-up (its targets, its own module
+/// deps already folded).
 pub fn compute_module_digests(
     index: &ModuleIndex,
     resolver: &mut dyn super::closure::BaseResolver,
-) -> Result<BTreeMap<String, [u8; 32]>, String> {
-    let mut digests: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+) -> Result<ModuleClosures, String> {
+    let mut deliverable: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    let mut tables: BTreeMap<String, std::collections::HashMap<String, [u8; 32]>> =
+        BTreeMap::new();
     for key in &index.order {
         let e = &index.entries[key];
         let closures = super::closure::compute_closure(
@@ -204,14 +218,15 @@ pub fn compute_module_digests(
             &e.file,
             &std::collections::HashMap::new(),
             resolver,
-            &digests,
+            &deliverable,
         )?;
         let hash = closures.get(&e.deliverable).ok_or_else(|| {
             format!("module `{}`: deliverable `{}` has no closure", key, e.deliverable)
         })?;
-        digests.insert(key.clone(), *hash);
+        deliverable.insert(key.clone(), *hash);
+        tables.insert(key.clone(), closures);
     }
-    Ok(digests)
+    Ok(ModuleClosures { deliverable, tables })
 }
 
 #[cfg(test)]
@@ -342,7 +357,7 @@ mod tests {
             &app_file,
             &HashMap::new(),
             &mut crate::identity::closure::OfflineResolver,
-            &module_digests,
+            &module_digests.deliverable,
         )
         .unwrap();
         let app_tag1 = closures["app"];
@@ -361,7 +376,7 @@ mod tests {
             &app_file,
             &HashMap::new(),
             &mut crate::identity::closure::OfflineResolver,
-            &module_digests2,
+            &module_digests2.deliverable,
         )
         .unwrap();
         assert_ne!(app_tag1, closures2["app"], "module edit must fold through to the importer");
