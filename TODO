@@ -1,3 +1,3 @@
 # TODO
 
-- Support args in AS clauses, like "FROM x AS ${registry}/image"
+- Make a default prefix for content hash tags, like basil-<hash> instead of just <hash>

@@ -6,6 +6,11 @@
 use basil::solver::orchestrate::{BuildInput, handle_event};
 use serde_json::Value;
 
+/// All buildah-backed tests share one global containers/storage, and the OUTPUT
+/// test asserts exact local image/container counts. Serialize them so a
+/// concurrent test's own image creation cannot perturb those counts.
+static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn buildah_present() -> bool {
     std::process::Command::new("buildah")
         .arg("--version")
@@ -37,6 +42,7 @@ async fn buildah_e2e_build_and_config() {
         eprintln!("skipping: buildah or registry unavailable");
         return;
     }
+    let _guard = E2E_LOCK.lock().await;
     let dir = tempfile();
     std::fs::write(dir.join("basil.Basilfile"), BASILFILE).unwrap();
     std::fs::write(dir.join("src.txt"), "hello buildah\n").unwrap();
@@ -140,6 +146,161 @@ fn tempfile() -> std::path::PathBuf {
     p
 }
 
+/// Local image count (`buildah images -q`) and working-container count
+/// (`buildah containers -a -q`). Used to prove the OUTPUT path leaves nothing
+/// behind in containers/storage.
+async fn local_image_count() -> usize {
+    let out = tokio::process::Command::new("buildah")
+        .args(["images", "-q"])
+        .output()
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+async fn local_container_count() -> usize {
+    let out = tokio::process::Command::new("buildah")
+        .args(["containers", "-a", "-q"])
+        .output()
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+/// Count locally untagged (`<none>`) images. The OUTPUT temp images are
+/// untagged, so any leak shows up here as a permanent growth in untagged
+/// images regardless of what was already in storage.
+async fn local_untagged_image_count() -> usize {
+    local_image_names()
+        .await
+        .into_iter()
+        .filter(|n| n.starts_with("<none>") || n.is_empty())
+        .count()
+}
+
+/// All local image names (`buildah images --format {{.Name}}`), for asserting
+/// no temp tag was minted.
+async fn local_image_names() -> Vec<String> {
+    let out = tokio::process::Command::new("buildah")
+        .args(["images", "--format", "{{.Name}}"])
+        .output()
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string()).collect()
+}
+
+/// OUTPUT on two *intermediate* (non-deliverable) stages: each needs its own
+/// locally-built image to extract from. The stages' `--target` builds must not
+/// mint a tag (an image name namespace the registry never sees, where two
+/// stages would collide) and must not leave the image or the extraction
+/// container behind — both runs (build and idempotent skip) are asserted
+/// leak-free.
+const OUTPUT_STAGES_BASILFILE: &str = "FROM alpine AS one\n\
+RUN echo ONE > /one.txt\n\
+OUTPUT /one.txt out/one.txt\n\
+\n\
+FROM alpine AS two\n\
+RUN echo TWO > /two.txt\n\
+OUTPUT /two.txt out/two.txt\n\
+\n\
+FROM scratch AS 127.0.0.1:5001/bah_e2e_out\n\
+COPY --from=one /one.txt /a.txt\n\
+COPY --from=two /two.txt /b.txt\n\
+ON push(main) BUILD 127.0.0.1:5001/bah_e2e_out\n";
+
+#[tokio::test]
+async fn buildah_e2e_output_stages_extract_without_leaking() {
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    let dir = tempfile();
+    std::fs::write(dir.join("Basilfile"), OUTPUT_STAGES_BASILFILE).unwrap();
+    let file_path = dir.join("Basilfile");
+    let file_str = file_path.to_str().unwrap();
+    let event = r#"{"ref":"refs/heads/main","before":"0","after":"1"}"#;
+    let inp = BuildInput {
+        file: file_str,
+        context: &dir,
+        event_json: Some(event),
+        target_filter: None,
+        force: false,
+    };
+
+    let images_before = local_image_count().await;
+    let untagged_before = local_untagged_image_count().await;
+    let containers_before = local_container_count().await;
+    let names_before = local_image_names().await;
+
+    handle_event(inp.clone()).await.unwrap();
+    // Both stages' files land on the host — neither target build clobbered the
+    // other.
+    assert_eq!(std::fs::read_to_string(dir.join("out/one.txt")).unwrap().trim(), "ONE");
+    assert_eq!(std::fs::read_to_string(dir.join("out/two.txt")).unwrap().trim(), "TWO");
+    // No leak: the per-stage temp images must be removed again (their absence
+    // shows as no growth in untagged images) and nothing may be minted under a
+    // temp tag. At most one new image may appear (the deliverable, already
+    // present if a previous run built the same content).
+    let images_after = local_image_count().await;
+    assert!(
+        images_after <= images_before + 1,
+        "at most the deliverable image may be added (was {images_before}, now {images_after})"
+    );
+    assert_eq!(
+        local_untagged_image_count().await,
+        untagged_before,
+        "per-stage OUTPUT images must be removed (untagged image count grew)"
+    );
+    assert_eq!(
+        local_container_count().await,
+        containers_before,
+        "extraction containers must be removed"
+    );
+    let leaked: Vec<String> = local_image_names()
+        .await
+        .into_iter()
+        .filter(|n| n.starts_with("localhost/basil-output") && !names_before.contains(n))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "OUTPUT must not mint a temp tag (pre-existing entries are ignored): {leaked:?}"
+    );
+    let minted: Vec<String> = local_image_names()
+        .await
+        .into_iter()
+        .filter(|n| !names_before.contains(n))
+        .collect();
+    assert!(
+        minted.len() <= 1,
+        "at most one new image name (the deliverable): {minted:?}"
+    );
+
+    // Same guarantees on the idempotent-skip path, which also extracts.
+    std::fs::remove_dir_all(dir.join("out")).unwrap();
+    let untagged_before2 = local_untagged_image_count().await;
+    let containers_before2 = local_container_count().await;
+    let results = handle_event(inp.clone()).await.unwrap();
+    assert_eq!(
+        results.iter().find(|(k, _)| k == "result").map(|(_, v)| v.as_str()),
+        Some("idempotent-skip")
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("out/one.txt")).unwrap().trim(), "ONE");
+    assert_eq!(std::fs::read_to_string(dir.join("out/two.txt")).unwrap().trim(), "TWO");
+    assert_eq!(
+        local_untagged_image_count().await,
+        untagged_before2,
+        "noop extraction must not leave a temp image behind"
+    );
+    assert_eq!(
+        local_container_count().await,
+        containers_before2,
+        "noop extraction must not leave a container behind"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A sibling module (its own context + Basilfile): the importer FROMs its
 /// image, so the module is built+published once, then the importer pulls it.
 /// The second delivery of the same event must not rebuild the module (its
@@ -159,6 +320,7 @@ async fn buildah_e2e_module_dependency() {
         eprintln!("skipping: buildah or registry unavailable");
         return;
     }
+    let _guard = E2E_LOCK.lock().await;
     let root = tempfile();
     // Importer context `app/` with the module as a SIBLING (`./mod` resolved
     // file-relative against app/Basilfile -> <root>/mod).

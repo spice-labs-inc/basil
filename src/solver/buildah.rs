@@ -508,48 +508,105 @@ async fn extract_outputs(
         }
     }
     for (stage, outs) in by_stage {
-        // Get an image for the OUTPUT-declaring stage.
-        let image = if stage == deliverable {
-            image_ref.to_string()
+        // A stage that isn't the deliverable has no pushed image to extract
+        // from, so build it locally via `--target`. No tag is involved: the
+        // build writes its image ID to an `--iidfile`, and that untagged image
+        // is referenced by ID for the extraction and removed again after. A tag
+        // would put these throwaway images in a name namespace the registry
+        // never sees, and two OUTPUT stages would collide on it.
+        let temp = if stage == deliverable {
+            None
         } else {
-            // Intermediate stage: build it as its own image via --target. The
-            // Containerfile is fed on stdin (`-f -`); no temp file is written.
-            let containerfile = render_containerfile_all(g);
-            let local_img = format!("basil-output-{}", std::process::id());
-            let mut build = tokio::process::Command::new("buildah");
-            build.arg("build")
-                .arg("--layers")
-                .arg("--target")
-                .arg(stage)
-                .arg("-t")
-                .arg(&local_img)
-                .arg("-f")
-                .arg("-")
-                .arg(context)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit());
-            let mut child = build
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("spawning buildah build (OUTPUT {stage}): {e}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                stdin
-                    .write_all(containerfile.as_bytes())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("writing Containerfile to stdin (OUTPUT {stage}): {e}"))?;
-                drop(stdin);
-            }
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| anyhow::anyhow!("buildah build (OUTPUT {stage}): {e}"))?;
-            if !status.success() {
-                anyhow::bail!("buildah build for OUTPUT stage `{stage}` failed (exit {status})");
-            }
-            local_img
+            Some(build_output_stage(g, stage, context).await?)
         };
-        extract_into(&image, stage, &outs, context).await?;
+
+        let image = temp.as_deref().unwrap_or(image_ref);
+        let result = extract_into(image, stage, &outs, context).await;
+        if let Some(image_id) = &temp {
+            // The extraction result is what matters; a failed cleanup must not
+            // mask it, but it must be reported rather than left silent.
+            if let Err(e) = remove_local_image(image_id).await {
+                tracing::warn!("removing OUTPUT temp image `{image_id}`: {e}");
+            }
+        }
+        result?;
+    }
+    Ok(())
+}
+
+/// Build one OUTPUT-declaring intermediate stage as a local, untagged image and
+/// return its image ID (`sha256:…`). The Containerfile is rendered all-stages
+/// (so every `AS` alias and `--from` resolves) and fed on stdin; `--target`
+/// selects the stage, and `--iidfile` reports the committed image without
+/// giving it a tag.
+async fn build_output_stage(
+    g: Graph<'_>,
+    stage: &str,
+    context: &std::path::Path,
+) -> anyhow::Result<String> {
+    let containerfile = render_containerfile_all(g);
+    let iidfile = std::env::temp_dir().join(format!(
+        "basil-iid-{}-{}",
+        std::process::id(),
+        stage.replace(['/', ':', '@'], "_")
+    ));
+    let _ = std::fs::remove_file(&iidfile);
+
+    let mut build = tokio::process::Command::new("buildah");
+    build
+        .arg("build")
+        .arg("--layers")
+        .arg("--target")
+        .arg(stage)
+        .arg("--iidfile")
+        .arg(&iidfile)
+        .arg("-f")
+        .arg("-")
+        .arg(context)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = build
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawning buildah build (OUTPUT {stage}): {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(containerfile.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("writing Containerfile to stdin (OUTPUT {stage}): {e}"))?;
+        drop(stdin);
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| anyhow::anyhow!("buildah build (OUTPUT {stage}): {e}"))?;
+    if !status.success() {
+        anyhow::bail!("buildah build for OUTPUT stage `{stage}` failed (exit {status})");
+    }
+    let id = crate::fsctx::fs_err(std::fs::read_to_string(&iidfile), &iidfile, "read")
+        .map_err(|e| anyhow::anyhow!("reading image ID for OUTPUT stage `{stage}`: {e}"))?;
+    let _ = std::fs::remove_file(&iidfile);
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        anyhow::bail!("buildah reported no image ID for OUTPUT stage `{stage}`");
+    }
+    Ok(id)
+}
+
+/// Remove a locally-built, untagged image by ID. Used for the per-stage OUTPUT
+/// temp images, which exist only to back an extraction container.
+async fn remove_local_image(image: &str) -> anyhow::Result<()> {
+    let out = tokio::process::Command::new("buildah")
+        .args(["rmi", image])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("buildah rmi: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "buildah rmi {image} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -604,10 +661,21 @@ async fn extract_into(
     }
     .await;
 
-    let _ = tokio::process::Command::new("buildah")
+    let rm = tokio::process::Command::new("buildah")
         .args(["rm", &working])
         .output()
         .await;
+    match rm {
+        Ok(o) if o.status.success() => {}
+        // Report a failed working-container removal instead of silently
+        // leaking it; the extraction result still wins so the real failure is
+        // what surfaces.
+        Ok(o) => tracing::warn!(
+            "removing OUTPUT container `{working}`: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("removing OUTPUT container `{working}`: {e}"),
+    }
     result
 }
 
