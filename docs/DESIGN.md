@@ -205,7 +205,7 @@ checked-in golden inputs whose expected digest the test suite recomputes.
     index. Checked first; on hit, the idempotent check skips the rebuild.
 2. **Intermediate cache** — every non-deliverable stage in the build graph is
    exported as `<repo>:basil-cache-<stageHash>`, where `<repo>` is the
-   deliverable's repo by default (the `--cache-repo` flag or `BASIL_CACHE_REF`
+   deliverable's repo by default (the `--cache-to` flag or `BASIL_CACHE_REF`
    override it). Reconcile-by-existence: a missing cache image for a stage is
    built (`--target <stage>`) and pushed on any build path *including the
    idempotent skip*; stages are regenerable, so `basil gc` may reap them by
@@ -418,7 +418,7 @@ so it never matches today.)
   operation (pushing content tags, exporting/importing cache) is the operator's
   existing Docker/Podman credentials (`$DOCKER_CONFIG` `auths`/`credHelpers`,
   Podman `auth.json`).
-- **`--cache-repo` / `BASIL_CACHE_REF`** — where intermediate-stage cache images
+- **`--cache-to` / `BASIL_CACHE_REF`** — where intermediate-stage cache images
   are pushed (default: the deliverable's fully-qualified repo); basil appends
   the `basil-cache-…` tags and uses the same operator credentials, never a
   separate set.

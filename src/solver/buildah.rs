@@ -33,7 +33,7 @@ pub struct Graph<'a> {
     pub file_dir: &'a std::path::Path,
     /// Module key -> `FROM`-ready ref (`<push-ref>:<tagHash>`).
     pub modules: &'a std::collections::BTreeMap<String, String>,
-    /// Stage name -> `<cache-repo>:basil-cache-<stageHash>` for every
+    /// Stage name -> `<cache-to>:basil-cache-<stageHash>` for every
     /// non-deliverable stage in scope. Internal `FROM <stage>` bases render as
     /// this ref (the stage's published cache image) so the deliverable build
     /// pulls its intermediates instead of rebuilding them.

@@ -55,7 +55,7 @@ pub struct BuildArgs {
     /// Where intermediate stages are cached (`basil-cache-*` tags); defaults to
     /// `BASIL_CACHE_REF`, then the deliverable's own repo.
     #[arg(long, value_name = "REPO")]
-    pub cache_repo: Option<String>,
+    pub cache_to: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -77,7 +77,7 @@ pub struct HandleArgs {
     /// Where intermediate stages are cached (`basil-cache-*` tags); defaults to
     /// `BASIL_CACHE_REF`, then the deliverable's own repo.
     #[arg(long, value_name = "REPO")]
-    pub cache_repo: Option<String>,
+    pub cache_to: Option<String>,
 }
 
 #[derive(clap::Args)]

@@ -56,7 +56,7 @@ async fn buildah_e2e_build_and_config() {
         event_json: Some(event),
         target_filter: None,
         force: false,
-        cache_repo: None,
+        cache_to: None,
     };
     let results = handle_event(inp.clone()).await.unwrap();
     let digest = results
@@ -229,7 +229,7 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
         event_json: Some(event),
         target_filter: None,
         force: false,
-        cache_repo: None,
+        cache_to: None,
     };
 
     let images_before = local_image_count().await;
@@ -347,7 +347,7 @@ async fn buildah_e2e_module_dependency() {
         event_json: Some(event),
         target_filter: None,
         force: false,
-        cache_repo: None,
+        cache_to: None,
     };
     // First delivery: builds the module (not yet registered), then the importer.
     let results = handle_event(inp.clone()).await.unwrap();

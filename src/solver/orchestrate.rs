@@ -109,7 +109,7 @@ pub struct BuildInput<'a> {
     pub force: bool,
     /// Where intermediate-stage cache images are pushed (`basil-cache-*` refs);
     /// `None` defaults to each deliverable's own repo.
-    pub cache_repo: Option<&'a str>,
+    pub cache_to: Option<&'a str>,
 }
 async fn promote_on_tag(
     matched: &[&crate::dsl::ast::Reaction],
@@ -304,10 +304,10 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     let mut out: Vec<(String, String)> = Vec::new();
 
     // Every non-deliverable stage in scope gets a cache image
-    // (`<repo>:basil-cache-<stageHash>`). The cache repo is `--cache-repo`, else
+    // (`<repo>:basil-cache-<stageHash>`). The cache repo is `--cache-to`, else
     // `BASIL_CACHE_REF`, else the first deliverable's repo (D1).
-    let cache_repo = effective_cache_repo(inp.cache_repo, &deliverables);
-    let stage_cache = stage_cache_refs(&subset, &deliverables, &closures, &cache_repo);
+    let cache_to = effective_cache_to(inp.cache_to, &deliverables);
+    let stage_cache = stage_cache_refs(&subset, &deliverables, &closures, &cache_to);
 
     // If every content tag already exists in its registry, the exact images
     // are already published — don't rebuild (parity with handle_event's
@@ -597,10 +597,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
     // Every non-deliverable stage in scope gets a cache image
-    // (`<repo>:basil-cache-<stageHash>`). The cache repo is `--cache-repo`, else
+    // (`<repo>:basil-cache-<stageHash>`). The cache repo is `--cache-to`, else
     // `BASIL_CACHE_REF`, else the first deliverable's repo (D1).
-    let cache_repo = effective_cache_repo(inp.cache_repo, &deliverables);
-    let stage_cache = stage_cache_refs(&parsed.targets, &deliverables, &closures, &cache_repo);
+    let cache_to = effective_cache_to(inp.cache_to, &deliverables);
+    let stage_cache = stage_cache_refs(&parsed.targets, &deliverables, &closures, &cache_to);
 
     // Idempotent check: skip when every deliverable's content tag exists, and
     // state each registered image on the noop path. `--force` bypasses the
@@ -736,9 +736,9 @@ async fn ensure_modules_built(
     Ok(())
 }
 
-/// The cache repo for intermediate-stage images: `--cache-repo`, else
+/// The cache repo for intermediate-stage images: `--cache-to`, else
 /// `BASIL_CACHE_REF`, else the first deliverable's repo (the D1 default).
-fn effective_cache_repo(
+fn effective_cache_to(
     flag: Option<&str>,
     deliverables: &[(String, String)],
 ) -> String {
@@ -756,14 +756,14 @@ fn effective_cache_repo(
         .unwrap_or_else(|| "127.0.0.1:5001/basil-cache".to_string())
 }
 
-/// Stage name -> `<cache-repo>:basil-cache-<stageHash>` for every in-scope
+/// Stage name -> `<cache-to>:basil-cache-<stageHash>` for every in-scope
 /// target that is not a deliverable (the deliverable is published under its
 /// content tag instead).
 fn stage_cache_refs(
     targets: &[crate::dsl::ast::Target],
     deliverables: &[(String, String)],
     closures: &std::collections::HashMap<String, [u8; 32]>,
-    cache_repo: &str,
+    cache_to: &str,
 ) -> std::collections::BTreeMap<String, String> {
     let deliv: std::collections::BTreeSet<&str> =
         deliverables.iter().map(|(name, _)| name.as_str()).collect();
@@ -774,13 +774,13 @@ fn stage_cache_refs(
         }
         let Some(hash) = closures.get(&t.name) else { continue };
         let tag = crate::solver::registry::cache_tag(&crate::identity::closure::hex(hash));
-        out.insert(t.name.clone(), format!("{cache_repo}:{tag}"));
+        out.insert(t.name.clone(), format!("{cache_to}:{tag}"));
     }
     out
 }
 
 /// Ensure every intermediate stage exists as its cache image in the registry:
-/// probe `<cache-repo>:basil-cache-<stageHash>`; on miss, build `--target
+/// probe `<cache-to>:basil-cache-<stageHash>`; on miss, build `--target
 /// <stage>`, push it, and remove the local image. Iterates in subset order
 /// (dependencies first). `--force` never propagates here — stages are
 /// reconciled by existence, always (D2).
@@ -796,7 +796,7 @@ async fn ensure_stages_cached(
             continue;
         }
         let Some(ref_str) = g.stage_cache.get(&t.name) else { continue };
-        // `<cache-repo>:basil-cache-<hash>` -> repo + tag.
+        // `<cache-to>:basil-cache-<hash>` -> repo + tag.
         let (repo, tag) = ref_str
             .rsplit_once(':')
             .map(|(r, t)| (r.to_string(), t.to_string()))
