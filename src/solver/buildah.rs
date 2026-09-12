@@ -598,10 +598,13 @@ async fn build_output_stage(
 }
 
 /// Remove a locally-built, untagged image by ID. Used for the per-stage OUTPUT
-/// temp images, which exist only to back an extraction container.
+/// temp images, which exist only to back an extraction container. `-f` because
+/// the image ID may carry leftover tags from earlier runs (identical cached
+/// content), and the image is throwaway — refusing on "more than one tag"
+/// would leak it.
 async fn remove_local_image(image: &str) -> anyhow::Result<()> {
     let out = tokio::process::Command::new("buildah")
-        .args(["rmi", image])
+        .args(["rmi", "-f", image])
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("buildah rmi: {e}"))?;
