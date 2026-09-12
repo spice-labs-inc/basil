@@ -198,12 +198,36 @@ async fn buildah_e2e_module_dependency() {
     // Second delivery: module already registered -> importer noops; the module
     // must NOT be rebuilt (its content tag exists) — the noop path only runs
     // OUTPUT extraction, which this fixture has none of.
-    let results2 = handle_event(inp).await.unwrap();
+    let results2 = handle_event(inp.clone()).await.unwrap();
     let (_, result2) = results2
         .iter()
         .find(|(k, _)| k == "result")
         .map(|(k, v)| (k.clone(), v.clone()))
         .unwrap();
     assert_eq!(result2, "idempotent-skip", "second delivery must noop");
+
+    // Delete the module's content tag from the registry. The importer has
+    // already nooped, but the module is part of the declared artifact set: the
+    // next run must re-register it (same tagHash — the importer image stays
+    // valid) even though the importer itself still skips.
+    let mod_tags_before = c.list_tags("bah_e2e_mod").await.unwrap();
+    let content_tag = mod_tags_before
+        .iter()
+        .find(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("module content tag present")
+        .clone();
+    c.delete_tag("bah_e2e_mod", &content_tag).await.unwrap();
+    let results3 = handle_event(inp.clone()).await.unwrap();
+    let (_, result3) = results3
+        .iter()
+        .find(|(k, _)| k == "result")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .unwrap();
+    assert_eq!(result3, "idempotent-skip", "importer still skips after module deletion");
+    let mod_tags_after = c.list_tags("bah_e2e_mod").await.unwrap();
+    assert!(
+        mod_tags_after.iter().any(|t| t == &content_tag),
+        "deleted module must be re-registered at its content tag, got {mod_tags_after:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

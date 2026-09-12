@@ -305,6 +305,10 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         let published = idempotent_published(&deliverables, &closures).await?;
         if !published.is_empty() {
             println!("basil: content tags already published -- no build (idempotent check)");
+            // The modules are part of the declared artifact set too: reconcile
+            // them by existence even on the noop path, so a deleted module is
+            // re-registered (same tagHash — the importer image stays valid).
+            ensure_modules_built(&index, &module_refs).await?;
             let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs);
             for (name, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
@@ -573,6 +577,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         let published = idempotent_published(&deliverables, &closures).await?;
         if !published.is_empty() {
             println!("basil: content tags already published -- no build (idempotent check)");
+            // Modules are part of the declared artifact set too: reconcile them
+            // by existence even on the noop path, so a deleted module is
+            // re-registered (same tagHash — the importer image stays valid).
+            ensure_modules_built(&index, &module_refs).await?;
             let g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs);
             for (_, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
