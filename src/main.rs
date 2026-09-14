@@ -137,6 +137,24 @@ fn main() -> anyhow::Result<()> {
             })?;
             Ok(())
         }
+        Command::Promote(args) => {
+            let file = resolve_build_file(&args.file, &args.context);
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                let promoted = basil::solver::orchestrate::promote_version(
+                    &file,
+                    std::path::Path::new(&args.context),
+                    args.target.as_deref(),
+                    &args.version,
+                )
+                .await?;
+                for (k, v) in &promoted {
+                    println!("{k} = {v}");
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        }
         Command::Pin(args) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {

@@ -17,6 +17,8 @@ pub enum Command {
     Build(BuildArgs),
     /// Read an event from stdin (or --event) and run the matching reactions.
     Handle(HandleArgs),
+    /// Set the immutable `v<version>` tags on the deliverables' published images.
+    Promote(PromoteArgs),
     /// Resolve unpinned image bases to @sha256 and rewrite the file to pin them.
     Pin(PinArgs),
     /// Prune basil-owned registry tags older than a given age.
@@ -78,6 +80,25 @@ pub struct HandleArgs {
     /// `BASIL_CACHE_REF`, then the deliverable's own repo.
     #[arg(long, value_name = "REPO")]
     pub cache_to: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct PromoteArgs {
+    /// The version to tag (e.g. `1.2.3` or `v1.2.3`); each qualifified
+    /// deliverable gets an immutable `v<version>` tag pointing at its current
+    /// content tag.
+    pub version: String,
+    /// Build context root (where COPY/ADD and `.dockerignore` resolve).
+    #[arg(default_value = ".")]
+    pub context: String,
+    /// DSL file to parse; defaults to `<context>/Basilfile` (docker-style).
+    /// A relative `-f` path resolves against the current directory.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<String>,
+    /// Promote only this deliverable (its AS name or the REGISTER ref);
+    /// default is every qualified deliverable target.
+    #[arg(short = 't', long)]
+    pub target: Option<String>,
 }
 
 #[derive(clap::Args)]

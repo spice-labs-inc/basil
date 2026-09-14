@@ -351,7 +351,10 @@ require it:
 
 A version event (`v1.5.8`, `target-v1.2.3`) assigns a human version tag to
 a target's image. Promotion is not a new verb: it is `ON tag BUILD <target>…`
-(or `ON release …`) plus one extra tag on the result.
+(or `ON release …`) plus one extra tag on the result. Manual promotion is the
+explicit CLI verb `basil promote <VERSION>`, which applies the same immutable
+`v<version>` retag to each selected deliverable (`-t` filter, else every
+qualified deliverable) without building — the content tag must already exist.
 
 - **Version extraction** — the version comes from the event: a `tag` event
   parses its git tag ref; a `release` event uses the release's `tag_name`. The

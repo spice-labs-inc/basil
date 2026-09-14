@@ -175,13 +175,32 @@ async fn promote_on_tag(
 
 /// Build one or more deliverable targets directly (no event): the `-t`
 /// target, or every qualified deliverable target when none is given. Computes
-/// Build one or more deliverable targets directly (no event). This path must
-/// never execute TASK clauses: tasks are event-triggered (DO reactions in
-/// `handle_event`), so a plain build of an image has no side-effects. Here we
-/// only compute the closure and run `build_deliverable`.
-pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
-    let src = crate::fsctx::fs_err(std::fs::read_to_string(inp.file), inp.file, "read")?;
-    println!("basil: parsed {}", inp.file);
+/// Everything a build/promote entry point needs after parsing + identity:
+/// the file AST, the selected deliverables, the in-scope target subset, module
+/// discovery/closure tables, and the importer's closures.
+pub struct SolveContext {
+    pub parsed: crate::dsl::ast::File,
+    pub deliverables: Vec<(String, String)>,
+    pub names: Vec<String>,
+    pub subset: Vec<crate::dsl::ast::Target>,
+    pub build_file: std::path::PathBuf,
+    pub file_dir: std::path::PathBuf,
+    pub index: crate::identity::modules::ModuleIndex,
+    pub module_digests: crate::identity::modules::ModuleClosures,
+    pub module_refs: std::collections::BTreeMap<String, String>,
+    pub closures: std::collections::HashMap<String, [u8; 32]>,
+}
+
+/// Parse the file, select deliverables (`-t` filter, else every qualified
+/// deliverable), resolve module deps and unpinned bases, and compute closures
+/// — the shared preamble of `build_targets` and `promote_version`.
+async fn solve(
+    file: &str,
+    context: &std::path::Path,
+    target_filter: Option<&str>,
+) -> anyhow::Result<SolveContext> {
+    let src = crate::fsctx::fs_err(std::fs::read_to_string(file), file, "read")?;
+    println!("basil: parsed {file}");
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
 
     // A target is a deliverable if it names a registry ref directly (qualified
@@ -195,17 +214,16 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         .map(|t| (t.name.clone(), t.push_ref().to_string()))
         .collect();
     // With -t <key>, find the target by its AS name OR its REGISTER ref, so both
-    // `-t fennel` and `-t 127.0.0.1:5001/fennel` build the same deliverable.
-    let deliverables: Vec<(String, String)> = match &inp.target_filter {
+    // `-t fennel` and `-t 127.0.0.1:5001/fennel` address the same deliverable.
+    let deliverables: Vec<(String, String)> = match target_filter {
         Some(key) => {
             let t = parsed
                 .targets
                 .iter()
-                .find(|x| x.name.as_str() == key.as_str() || x.register.as_deref() == Some(key.as_str()))
+                .find(|x| x.name.as_str() == key || x.register.as_deref() == Some(key))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "target `{key}` not found in {} (known: {})",
-                        inp.file,
+                        "target `{key}` not found in {file} (known: {})",
                         parsed
                             .targets
                             .iter()
@@ -238,11 +256,11 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
 
     // The build file's own path/context; module paths resolve against its
     // directory (D4: file-relative).
-    let build_file = std::path::absolute(inp.file).unwrap_or_else(|_| inp.file.into());
-    let file_dir = build_file.parent().unwrap_or(std::path::Path::new("."));
+    let build_file = std::path::absolute(file).unwrap_or_else(|_| file.into());
+    let build_file_owned = build_file.clone();
 
     // Discover module dependencies (recursive, cycle-checked, pure file walk).
-    let index = crate::identity::modules::discover_module_index(&subset, file_dir)
+    let index = crate::identity::modules::discover_module_index(&subset, build_file_owned.parent().unwrap_or(std::path::Path::new(".")))
         .map_err(anyhow::Error::msg)?;
     if !index.order.is_empty() {
         println!("basil: {} module(s) discovered", index.order.len());
@@ -275,8 +293,8 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         &subset,
         &parsed.default_platforms,
         &parsed.global_args,
-        inp.context,
-        &build_file,
+        context,
+        &build_file_owned,
         &HashMap::new(),
         &mut resolver,
         &module_digests.deliverable,
@@ -300,6 +318,42 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             digest_of(name, &closures)?
         );
     }
+
+    Ok(SolveContext {
+        parsed,
+        deliverables,
+        names,
+        subset,
+        build_file: build_file_owned.clone(),
+        file_dir: build_file_owned
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf(),
+        index,
+        module_digests,
+        module_refs,
+        closures,
+    })
+}
+
+/// Build one or more deliverable targets directly (no event). This path must
+/// never execute TASK clauses: tasks are event-triggered (DO reactions in
+/// `handle_event`), so a plain build of an image has no side-effects. Here we
+/// only compute the closure and run `build_deliverable`.
+pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
+    let solved = solve(inp.file, inp.context, inp.target_filter.map(String::as_str)).await?;
+    let SolveContext {
+        parsed,
+        deliverables,
+        names,
+        subset,
+        index,
+        module_digests,
+        module_refs,
+        closures,
+        file_dir,
+        ..
+    } = solved;
 
     let mut out: Vec<(String, String)> = Vec::new();
 
@@ -325,9 +379,9 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
             // Stages are reconciled by existence too: a missing cache image is
             // rebuilt and pushed even on the noop path (D2).
-            let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache);
+            let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache);
             ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
-            let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache);
+            let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache);
             for (name, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
                 // OUTPUT still runs: pull the published image and extract.
@@ -352,7 +406,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
     // Every intermediate stage must exist as its cache image before the
     // deliverable's Containerfile references it (reconcile by existence).
-    let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache);
+    let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache);
     ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
 
     for (name, push_ref) in &deliverables {
@@ -361,7 +415,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&subset, &parsed.global_args, file_dir, &module_refs, &stage_cache),
+            crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache),
             name,
             push_ref,
             &tag,
@@ -379,6 +433,58 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         if out.len() == 1 { "" } else { "s" }
     );
     Ok(out)
+}
+
+/// Manual promotion: set the immutable `v<version>` tag on each selected
+/// deliverable, pointing at its current content tag (`basil-<tagHash>`).
+/// Mirrors `promote_on_tag`'s semantics (immutable retag — refuses to
+/// overwrite a version tag that points at a different manifest, no-op when it
+/// already points at this one) but is driven by an explicit CLI version, not an
+/// event. No image is built or pushed: the content tag must already exist.
+pub async fn promote_version(
+    file: &str,
+    context: &std::path::Path,
+    target_filter: Option<&str>,
+    version: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let solved = solve(file, context, target_filter).await?;
+    let SolveContext { deliverables, closures, .. } = solved;
+    let version = version.trim_start_matches('v').to_string();
+    if version.split('.').any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+        anyhow::bail!("invalid version `{version}` (expected e.g. 1.2.3)");
+    }
+
+    let mut promoted: Vec<(String, String)> = Vec::new();
+    for (name, push_ref) in &deliverables {
+        let ir = crate::solver::registry::parse_ref(push_ref, "")
+            .map_err(|e| anyhow::anyhow!("promote `{push_ref}`: {e}"))?;
+        let client = ir.client();
+        let tag_hash = digest_of(name, &closures)?;
+        let content = crate::solver::registry::content_tag(&tag_hash);
+        // The promoted tag must already be published (the content tag must
+        // exist) — promotion never builds.
+        match client.manifest_exists(&ir.repo, &content).await {
+            Ok(true) => {}
+            Ok(false) => {
+                anyhow::bail!(
+                    "cannot promote `{push_ref}:v{version}`: content tag `{push_ref}:{content}` is not published — build it first"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("promote probe for `{push_ref}:{content}` failed ({e}); will attempt retag");
+            }
+        }
+        let dest = format!("v{version}");
+        client
+            .retag(&ir.repo, &content, &dest)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("promotion immutability/retag failure for `{push_ref}:v{version}`: {e}")
+            })?;
+        println!("basil: promoted {push_ref}:{dest} -> {content}");
+        promoted.push((push_ref.clone(), dest));
+    }
+    Ok(promoted)
 }
 
 /// The subset of targets reachable from `roots`: each root plus every stage it
