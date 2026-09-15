@@ -172,6 +172,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Gc(args) => {
             // gc is registry-only; it needs no builder connection.
+            let file = resolve_build_file(&args.file, &args.context);
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 let age_secs = basil::solver::gc::parse_age(&args.age).map_err(anyhow::Error::msg)?;
@@ -181,18 +182,22 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or(0);
 
                 // Resolve the repos to prune: explicit --repo, else the file's
-                // fully-qualified `AS` targets.
+                // deliverable targets (qualified AS names AND REGISTER refs).
                 let mut repos: Vec<(String, String)> = Vec::new(); // (host, repo)
                 if let Some(fq) = &args.repo {
                     let r = basil::solver::registry::parse_ref(fq, "latest")
                         .map_err(anyhow::Error::msg)?;
                     repos.push((r.host, r.repo));
                 } else {
-                    let src = basil::fsctx::fs_err(std::fs::read_to_string(&args.file), &args.file, "read")?;
+                    let src = basil::fsctx::fs_err(std::fs::read_to_string(&file), &file, "read")?;
                     let parsed = basil::dsl::parser::parse(&src).map_err(anyhow::Error::msg)?;
                     for t in &parsed.targets {
-                        if t.name.contains('/') {
-                            let r = basil::solver::registry::parse_ref(&t.name, "latest")
+                        // push_ref() = the REGISTER ref, else the AS name — a
+                        // bare-AS stage with a REGISTER therefore prunes where
+                        // it publishes, exactly like a qualified AS deliverable.
+                        let push_ref = t.push_ref();
+                        if push_ref.contains('/') {
+                            let r = basil::solver::registry::parse_ref(push_ref, "latest")
                                 .map_err(anyhow::Error::msg)?;
                             if !repos.iter().any(|(h, rp)| h == &r.host && rp == &r.repo) {
                                 repos.push((r.host, r.repo));
@@ -202,7 +207,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 if repos.is_empty() {
                     return Err(anyhow::anyhow!(
-                        "no repos to prune: pass --repo or a Basilfile with qualified AS targets"
+                        "no repos to prune: pass --repo or a Basilfile with qualified AS targets or REGISTER refs"
                     ));
                 }
 

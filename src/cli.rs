@@ -112,9 +112,13 @@ pub struct PinArgs {
 pub struct GcArgs {
     /// Age with unit (e.g. `30d`, `4w`, `1y`).
     pub age: String,
-    /// The DSL file whose qualified AS targets are pruned (ignored with --repo).
-    #[arg(default_value = "Basilfile")]
-    pub file: String,
+    /// Build context root (where `.dockerignore` resolves).
+    #[arg(default_value = ".")]
+    pub context: String,
+    /// DSL file to parse; defaults to `<context>/Basilfile` (docker-style).
+    /// A relative `-f` path resolves against the current directory.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<String>,
     /// Restrict pruning to one repo.
     #[arg(long)]
     pub repo: Option<String>,

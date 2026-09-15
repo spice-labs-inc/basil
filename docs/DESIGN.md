@@ -439,9 +439,10 @@ so it never matches today.)
 `basil gc <age>` deletes basil-owned registry tags older than `<age>`.
 
 - **Age syntax** — an integer with a unit: `h`, `d`, `w`, `y` (`basil gc 30d`).
-- **Scope** — the deliverable repos named by the file's fully-qualified `AS`
-  names, or one repo via `--repo <fq>`. Credentials are the operator's
-  Docker/Podman config, as everywhere else.
+- **Scope** — the deliverable repos named by the file's qualified `AS`
+  names **and their `REGISTER` refs** (each target's `push_ref`), or one repo
+  via `--repo <fq>`. The file defaults to `<context>/Basilfile`, docker-style.
+  Credentials are the operator's Docker/Podman config, as everywhere else.
 - **What it prunes** — only basil's own ephemeral tags (the `basil-`
   namespace), never a foreign tag:
   - `basil-cache-*` refs: the date-encoded ones (`basil-cache-<YYYYMMDD>`,
