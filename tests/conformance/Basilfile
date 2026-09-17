@@ -1,4 +1,5 @@
 FROM golang:1.23@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef AS build
+IMPORT busybox:1.36@sha256:2222222222222222222222222222222222222222222222222222222222222222
 COPY greeting.txt /src/greeting.txt
 RUN cat /src/greeting.txt > /src/out.txt
 

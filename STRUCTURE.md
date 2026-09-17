@@ -48,8 +48,8 @@ basil/
 - Contains: `mod.rs` with `reaction_matches` and `matching_reactions` (push/tag/release/PR matching, selectors)
 
 **`src/solver/`:**
-- Purpose: Solve builds: orchestrate the pipeline, render to buildah, talk to registries, pin/promote/gc
-- Contains: `orchestrate.rs` (`BuildInput`, `build_targets`, `handle_event`, `dependency_subset`, module use-or-build, intermediate-stage cache reconciliation, idempotent check), `buildah.rs` (Containerfile renderer + buildah subprocess driver + stage-cache build/push/removal + OUTPUT extraction + task runner), `registry.rs` (registry v2 client, ref parsing, bearer-token auth), `pin.rs`, `promote.rs`, `gc.rs`
+- Purpose: Solve builds: orchestrate the pipeline, drive buildah per-instruction, talk to registries, pin/promote/gc
+- Contains: `orchestrate.rs` (`BuildInput`, `build_targets`, `handle_event`, `dependency_subset`, module use-or-build, intermediate-stage cache reconciliation, idempotent check), `buildah.rs` (Graph + base resolution + buildah subprocess driver + stage-cache build/push/removal + OUTPUT extraction + task runner + the deliverable driver), `imperative.rs` (the per-instruction executor — the only execution model, no Containerfile: from/config/copy/run/add/commit, dockerignore-honest per-file COPY with dest reconstruction, secrets via file bind-mount, cache/bind mounts via `--mount`), `registry.rs` (registry v2 client, ref parsing, bearer-token auth), `pin.rs`, `promote.rs`, `gc.rs`
 
 **`docs/`:**
 - Purpose: Human documentation for the project — design rationale, DSL reference, event payload samples
@@ -70,11 +70,11 @@ basil/
 
 ## Key File Locations
 
-**Entry Points:** `src/main.rs`: binary entry — parses the clap `Cli`, sets up tracing, builds a tokio runtime per async command, and dispatches `closure`/`build`/`handle`/`pin`/`gc`. `src/lib.rs`: library root exporting `dsl`, `event`, `fsctx`, `identity`, `solver`. `src/cli.rs`: all subcommand arg structs (`ClosureArgs`, `BuildArgs`, `HandleArgs`, `PinArgs`, `GcArgs`).
+**Entry Points:** `src/main.rs`: binary entry — parses the clap `Cli`, sets up tracing, builds a tokio runtime per async command, and dispatches `closure`/`build`/`handle`/`run`/`promote`/`pin`/`gc`. `src/lib.rs`: library root exporting `dsl`, `event`, `fsctx`, `identity`, `solver`. `src/cli.rs`: all subcommand arg structs (`ClosureArgs`, `BuildArgs`, `HandleArgs`, `RunArgs`, `PromoteArgs`, `PinArgs`, `GcArgs`).
 
 **Configuration:** `Cargo.toml`: dependencies (tokio `full`, clap derive, serde/serde_json, anyhow + anyhow-tracing, sha2 + sha1, glob, tracing + tracing-subscriber `env-filter`, reqwest `json` + `rustls`). `Basilfile`: the project's own dogfood build — a static-musl `rust:1.88-alpine` builder stage, `OUTPUT` of the release binary, a `scratch` deliverable with `REGISTER 127.0.0.1:5001/basil`, and `ON push(main) BUILD basil`. There is no config file of its own: behavior is driven by argv and environment variables (`RUST_LOG`, `REGISTRY_AUTH_FILE`, `BASIL_INSECURE_REGISTRY`, `BASIL_SECRET_<ID>`, `DOCKER_CONFIG`, `XDG_RUNTIME_DIR`); the `--cache-to` flag on `build`/`handle` and the `BASIL_CACHE_REF` env var (cache-to override) choose where intermediate-stage cache images are published, defaulting to the deliverable's own repo.
 
-**Core Logic:** `src/dsl/parser.rs` (DSL grammar), `src/identity/closure.rs` (identity formula + `tagHash`), `src/solver/orchestrate.rs` (build/event orchestration), `src/solver/buildah.rs` (Containerfile rendering + buildah subprocess), `src/solver/registry.rs` (registry v2 + auth).
+**Core Logic:** `src/dsl/parser.rs` (DSL grammar), `src/identity/closure.rs` (identity formula + `tagHash`), `src/solver/orchestrate.rs` (build/event orchestration), `src/solver/imperative.rs` (the per-instruction buildah executor — the only execution model), `src/solver/buildah.rs` (base resolution + buildah subprocess driver), `src/solver/registry.rs` (registry v2 + auth).
 
 **Tests:** `tests/conformance.rs` — golden digest fixture recomputed against `tests/conformance/expected.json` (`REGENERATE=1` refreshes); its `Basilfile` imports a `MODULE` so the module fold is pinned too. `tests/event.rs` — reaction matching, including the requirement that the `docs/events/` payloads match their documented tokens; `tests/buildah_e2e.rs` — gated live end-to-end (skips when buildah or the local registry is unavailable) asserting the pushed image config + content digest, the idempotent-skip / `--force` paths, per-stage cache-image build/push/cleanup, and module use-or-build. Unit tests are co-located in each module as `#[cfg(test)] mod tests`.
 
@@ -88,7 +88,7 @@ basil/
 
 ## Where to Add New Code
 
-**New DSL instruction:** add an `Instruction` variant in `src/dsl/ast.rs`, parse it in `src/dsl/parser.rs`, render it in `src/identity/program_hash.rs` (identity) and `src/solver/buildah.rs` (Containerfile), and account for any context files it reads in `src/identity/derived_data.rs::context_sources`. Deferred constructs belong in `is_known_or_deferred` with a parse-time error.
+**New DSL instruction:** add an `Instruction` variant in `src/dsl/ast.rs`, parse it in `src/dsl/parser.rs`, render it in `src/identity/program_hash.rs` (identity) and execute it in `src/solver/imperative.rs::execute_instructions` (the per-instruction executor — the only execution model), and account for any context files it reads in `src/identity/derived_data.rs::context_sources`. Cache-policy directives that change no image content (`COMMIT`, `OUTPUT`) are skipped in `program_hash` and excluded from identity. Deferred constructs belong in `is_known_or_deferred` with a parse-time error.
 
 **New module behavior:** `MODULE` bases are a separate identity domain — discovery + per-module closure tables live in `src/identity/modules.rs` (`discover_module_index`, `compute_module_digests`), the importer folds the module's deliverable digest in `src/identity/closure.rs` (`base.module.<alias>`), and build-time use-or-build runs in `src/solver/orchestrate.rs::ensure_modules_built` (the module's own intermediate stages cache under its repo via `ensure_stages_cached`).
 
@@ -98,7 +98,7 @@ basil/
 
 **New registry operation:** add a method on `ImageRef`/`RegistryClient` in `src/solver/registry.rs` — auth (`authed`/`token`), redirect policy, and ref normalization are already centralized there.
 
-**New build/event orchestration step:** extend `src/solver/orchestrate.rs` — `build_targets` for the direct-build path, `handle_event` for the event path (both share `resolve_unpinned_bases`, `compute_closure`, `idempotent_published`, module use-or-build, `ensure_stages_cached`/`stage_cache_refs`, and the buildah driver).
+**New build/event orchestration step:** extend `src/solver/orchestrate.rs` — `build_targets` for the direct-build path, `handle_event` for the event path (both share `resolve_unpinned_bases`, `compute_closure`, `idempotent_published`, module use-or-build, `ensure_stages_cached`/`stage_cache_refs`, and the per-instruction executor in `src/solver/imperative.rs`).
 
 **New tests:** co-locate unit tests as `#[cfg(test)] mod tests` inside the module; add integration tests at `tests/<name>.rs` exercising the public `basil` library API; add manual-run Basilfile fixtures to `testdata/`; digest changes to the conformance fixture regenerate via `REGENERATE=1 cargo test --test conformance`.
 

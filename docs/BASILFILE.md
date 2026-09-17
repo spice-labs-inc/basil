@@ -137,9 +137,11 @@ FROM [--platform=<sel>] <base> [AS <name>]
 ```
 The target's base image and optional stage name. `--platform=<sel>` picks the
 base's platform: `$BUILDPLATFORM` (build host's native platform) or
-`$TARGETPLATFORM` (the target platform), both build-staged vars buildah expands
-at build time; a literal `linux/arm64` selects that platform directly. A
-build stage that must run natively uses `FROM --platform=$BUILDPLATFORM …`.
+`$TARGETPLATFORM` (the target platform, defaulting to the host when no explicit
+target is selected) — both expand to the host platform under basil's
+per-instruction model — or a literal `linux/arm64` selects that platform
+directly. A build stage that must run natively uses
+`FROM --platform=$BUILDPLATFORM …`.
 See [Targets](#targets).
 
 ### `MODULE`
@@ -182,6 +184,31 @@ ENV <K>=<V> [<K>=<V>…]
 ```
 Sets image environment variables (and config). Accumulates for later `RUN`
 steps and the image's `Env`.
+
+### `IMPORT`
+```
+IMPORT <image>[:tag][@digest]
+```
+Inlines the root filesystem content of another image into the build **at that
+point**: the import image's files are copied over the working rootfs (imported
+files overwrite existing paths — layer-append semantics), and everything after
+sees the merged rootfs. Only the import's **content** is inlined; its config
+(`ENV`/`CMD`/…) is not transferred. Subsequent instructions continue on the
+merged rootfs.
+
+`IMPORT` cannot be expressed in a Containerfile, so a stage containing one is
+built imperatively (`buildah from`/`config`/`copy`/`run`/`add` + `commit`)
+instead of rendered to `buildah bud`. The image may be pinned (`@sha256`) for
+a hermetic build; unpinned refs are resolved per build (like `FROM`) and the
+resolved digest folds into the `tagHash` — `basil pin` pins them too.
+
+- Only **external** images (a ref naming a local stage is an error).
+- An import lands as a new image layer carrying the import's flattened content.
+- `RUN --mount=type=secret` works via a file bind mount; `type=ssh` is
+  **not** supported in an IMPORT stage (parse-time build error).
+
+Known gaps: `IMPORT` of a local stage (use `COPY --from=<stage>` instead),
+`FROM --platform=$BUILDPLATFORM` inside an IMPORT stage.
 
 ### `COPY`
 ```
@@ -227,6 +254,30 @@ root filesystem to the host at `host-dest` (relative to the build context;
 **including an idempotent-skip** (basil pulls the published image and extracts).
 Never fed to the builder; folded into the target's identity.
 
+### `COMMIT`
+```
+COMMIT
+```
+Checkpoints the build so far into the **local buildah layer cache**: the
+working container is committed into rootless containers/storage as a
+`basil-checkpoint-<hash>` image (`<hash>` = the closure of the instruction
+prefix it seals) — **never pushed to any registry**, exactly like docker's
+per-instruction layer cache but at a coarser granularity (a whole group of
+instructions). On a later build, the stage **resumes from the deepest
+checkpoint present in local storage** — the sealed instruction prefix is not
+re-executed — and any `COMMIT` whose image is missing seals it on the way.
+A pure cache-policy directive: it never changes image content (the final
+image is identical with or without it, so `tagHash` is unaffected).
+
+- The checkpoint ref is derived from the exact instruction prefix it seals:
+  any change to the prefix changes the hash and makes the old checkpoint
+  inert.
+- `COMMIT` can appear multiple times per stage; resume always uses the deepest
+  existing one (e.g. after a new `RUN` is added below the last `COMMIT`, a
+  later run resumes from that last checkpoint and only the tail re-runs).
+- Checkpoints are machine-local cache: `basil gc` (registry-only) never sees
+  them; clean them with `buildah rmi` like any other cached image.
+
 ### Image-config instructions
 ```
 CMD <command>            # shell form: CMD echo hi
@@ -253,9 +304,22 @@ TASK <command>          # shell form
 TASK ["prog", "arg"]    # exec form
 ```
 
-Tasks run only when a matching reaction's `DO` names the target. Exit 0 =
-success; a non-zero exit fails the invocation. The side-effect environment
-includes `BASIL_EVENT` (the raw event).
+Tasks run when a matching reaction's `DO` names the target — or manually with
+`basil run <target>`. `basil run` excludes registered targets: a target with a
+`REGISTER` clause is a published deliverable, so it is refused as a run target
+(the manual `DO` is for non-published targets). `basil run` builds everything
+the task depends on the **standard way** first: an internal `FROM <stage>`
+base (and its transitive stage deps) is reconciled as a
+`basil-cache-<stageHash>` cache image in the cache repo (`--cache-to`,
+`BASIL_CACHE_REF`, else the target's own repo when it is a qualified ref), and
+a module base is built use-or-build; only the run target itself is never
+published. REGISTERed stages in the dependency subset follow the same caching
+as the build path: they resolve to their published `<register>:basil-<hash>`
+artifact (use-or-build), never an intermediate cache image. The task then runs
+on the resolved base image. Exit 0 = success; a non-zero exit fails the
+invocation. The side-effect environment includes
+`BASIL_EVENT` (the raw event) on the event path, and `BASIL_TARGET` (the
+target name) on the manual `run` path.
 
 ## `PLATFORM` clause
 ```
@@ -266,6 +330,11 @@ list; before the first `FROM` it sets the file-wide default. Multiple platforms
 make the content tag an OCI index.
 
 ## Identity (`tagHash`)
+`COMMIT` is transparent to identity: it never enters `programHash` (like
+`OUTPUT`), and the stage's `tagHash` is unchanged by adding or removing one
+(the final image is the same). Each checkpoint point gets its own derived
+closure — `C(prefix)` — computed from the exact instructions before it, which
+is what names its local `basil-checkpoint-<hash>` image.
 
 Every target's `tagHash` is **derived**, not declared:
 
@@ -274,6 +343,7 @@ C(T) = derivedData(T)                          # context files the target reads
      ∪ C(B)  for every depended stage B         # FROM <stage>, COPY --from=<stage>
      ∪ {resolved-digest}  for external bases    # FROM <image>
      ∪ C(M)  for every module base             # MODULE <path> — the module's deliverable tagHash
+     ∪ {resolved-digest}  for every IMPORT      # IMPORT <image> — occurrence-ordered
      ∪ args(T)                                  # resolved ARG / --build-arg
      ∪ platforms(T)
      ∪ programHash(T)                          # ordered, arg-expanded instructions

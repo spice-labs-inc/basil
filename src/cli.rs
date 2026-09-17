@@ -17,6 +17,11 @@ pub enum Command {
     Build(BuildArgs),
     /// Read an event from stdin (or --event) and run the matching reactions.
     Handle(HandleArgs),
+    /// Run a non-published target's `TASK` clause in a one-shot container,
+    /// without an event and without publishing anything (a manual `DO` for
+    /// non-published targets). Registered (REGISTER-clause) targets are
+    /// excluded.
+    Run(RunArgs),
     /// Set the immutable `v<version>` tags on the deliverables' published images.
     Promote(PromoteArgs),
     /// Resolve unpinned image bases to @sha256 and rewrite the file to pin them.
@@ -78,6 +83,24 @@ pub struct HandleArgs {
     pub force: bool,
     /// Where intermediate stages are cached (`basil-cache-*` tags); defaults to
     /// `BASIL_CACHE_REF`, then the deliverable's own repo.
+    #[arg(long, value_name = "REPO")]
+    pub cache_to: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct RunArgs {
+    /// The non-published target to run (its AS name; REGISTERed targets are
+    /// excluded).
+    pub target: String,
+    /// Build context root (where COPY/ADD and `.dockerignore` resolve).
+    #[arg(default_value = ".")]
+    pub context: String,
+    /// DSL file to parse; defaults to `<context>/Basilfile` (docker-style).
+    /// A relative `-f` path resolves against the current directory.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<String>,
+    /// Where dependency stage cache images go (`basil-cache-*` tags); defaults
+    /// to `BASIL_CACHE_REF`, then the target's own repo when it is qualified.
     #[arg(long, value_name = "REPO")]
     pub cache_to: Option<String>,
 }

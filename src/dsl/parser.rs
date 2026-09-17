@@ -330,6 +330,13 @@ impl Parser {
             }
             "VOLUME" => self.parse_volume(rest, line)?,
             "OUTPUT" => self.parse_output(rest, line)?,
+            "IMPORT" => self.parse_import(rest, line)?,
+            "COMMIT" => {
+                if !rest.trim().is_empty() {
+                    return self.err(line, "COMMIT takes no arguments");
+                }
+                Instruction::Commit
+            }
             _ => {
                 return self.err(line, format!("unknown instruction `{kw}`"))
             }
@@ -419,6 +426,31 @@ impl Parser {
             i += 1;
         }
         Ok(out)
+    }
+
+    /// Parse `IMPORT <image>[:tag][@digest]` — inline the rootfs content of an
+    /// external image at this point in the build. Exactly one ref, no flags.
+    /// `IMPORT scratch` is rejected (a no-op with confusing semantics); a ref
+    /// naming a local stage is rejected later, at closure computation (the
+    /// whole file is known there).
+    fn parse_import(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
+        let (flags, args) = parse_flags(rest).map_err(|m| self.err_at(line, m))?;
+        if !flags.is_empty() {
+            return self.err(line, "IMPORT does not take flags");
+        }
+        if args.len() != 1 {
+            return self.err(line, "IMPORT requires exactly one image reference");
+        }
+        let tok = &args[0];
+        if tok == "scratch" {
+            return self.err(line, "IMPORT scratch is a no-op — nothing to inline");
+        }
+        let (raw, digest) = split_digest(tok);
+        let (raw, tag) = split_tag(&raw);
+        if raw.is_empty() {
+            return self.err(line, "IMPORT requires an image reference");
+        }
+        Ok(Instruction::Import(ImportImage { raw, tag, digest, line }))
     }
 
     fn parse_arg(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
@@ -714,6 +746,8 @@ fn is_known_or_deferred(kw: &str) -> bool {
             | "EXPOSE"
             | "VOLUME"
             | "OUTPUT"
+            | "IMPORT"
+            | "COMMIT"
             | "TASK"
             | "REGISTER"
             | "GIVEN"
@@ -1040,6 +1074,58 @@ mod tests {
         assert_eq!(f.targets.len(), 1);
         assert_eq!(f.targets[0].name, "alpine");
         assert_eq!(f.targets[0].base_image().unwrap().raw, "alpine");
+    }
+
+    #[test]
+    fn parses_import_with_tag_and_digest() {
+        let f = parse("FROM alpine AS app\nIMPORT busybox:1.36@sha256:abc123\n").unwrap();
+        let Instruction::Import(im) = &f.targets[0].instructions[0] else {
+            panic!("expected an IMPORT instruction");
+        };
+        assert_eq!(im.raw, "busybox");
+        assert_eq!(im.tag.as_deref(), Some("1.36"));
+        assert_eq!(im.digest.as_deref(), Some("sha256:abc123"));
+    }
+
+    #[test]
+    fn parses_import_bare_and_qualified() {
+        let f = parse("FROM alpine AS app\nIMPORT alpine\nIMPORT ghcr.io/a/b:v1\n").unwrap();
+        let instrs = &f.targets[0].instructions;
+        let Instruction::Import(a) = &instrs[0] else { panic!() };
+        assert_eq!(a.raw, "alpine");
+        assert_eq!(a.tag, None);
+        let Instruction::Import(b) = &instrs[1] else { panic!() };
+        assert_eq!(b.raw, "ghcr.io/a/b");
+        assert_eq!(b.tag.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn import_errors() {
+        let e = parse("IMPORT alpine\n").unwrap_err();
+        assert!(e.message.contains("outside any target"), "{}", e.message);
+        let e = parse("FROM alpine\nIMPORT\n").unwrap_err();
+        assert!(e.message.contains("exactly one image reference"), "{}", e.message);
+        let e = parse("FROM alpine\nIMPORT a b\n").unwrap_err();
+        assert!(e.message.contains("exactly one image reference"), "{}", e.message);
+        let e = parse("FROM alpine\nIMPORT scratch\n").unwrap_err();
+        assert!(e.message.contains("no-op"), "{}", e.message);
+        let e = parse("FROM alpine\nIMPORT --platform=linux/amd64 alpine\n").unwrap_err();
+        assert!(e.message.contains("does not take flags"), "{}", e.message);
+    }
+
+    #[test]
+    fn parses_commit_checkpoint() {
+        let f = parse("FROM alpine AS app\nRUN echo one\nCOMMIT\nRUN echo two\n").unwrap();
+        assert_eq!(f.targets[0].instructions.len(), 3);
+        assert!(matches!(f.targets[0].instructions[1], Instruction::Commit));
+    }
+
+    #[test]
+    fn commit_errors() {
+        let e = parse("COMMIT\n").unwrap_err();
+        assert!(e.message.contains("outside any target"), "{}", e.message);
+        let e = parse("FROM alpine\nCOMMIT label x\n").unwrap_err();
+        assert!(e.message.contains("takes no arguments"), "{}", e.message);
     }
 
     #[test]

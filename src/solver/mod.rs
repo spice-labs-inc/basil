@@ -2,6 +2,7 @@
 
 pub mod buildah;
 pub mod gc;
+pub mod imperative;
 pub mod orchestrate;
 pub mod pin;
 pub mod promote;

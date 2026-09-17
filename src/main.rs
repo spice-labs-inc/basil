@@ -137,6 +137,22 @@ fn main() -> anyhow::Result<()> {
             })?;
             Ok(())
         }
+        Command::Run(args) => {
+            let file = resolve_build_file(&args.file, &args.context);
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async move {
+                let code = basil::solver::orchestrate::run_target(
+                    &file,
+                    std::path::Path::new(&args.context),
+                    &args.target,
+                    args.cache_to.as_deref(),
+                )
+                .await?;
+                println!("basil: done ({})", args.target);
+                Ok::<_, anyhow::Error>(code)
+            })?;
+            Ok(())
+        }
         Command::Promote(args) => {
             let file = resolve_build_file(&args.file, &args.context);
             let rt = tokio::runtime::Runtime::new()?;

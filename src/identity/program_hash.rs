@@ -66,6 +66,21 @@ pub fn render_instruction(instr: &Instruction) -> String {
         Expose(ps) => format!("EXPOSE {}", ps.join(" ")),
         Volume(ps) => format!("VOLUME {}", ps.join(" ")),
         Output(o) => format!("OUTPUT {} {}", o.source, o.dest),
+        Import(i) => {
+            let mut s = format!("IMPORT {}", i.raw);
+            if let Some(t) = &i.tag {
+                s.push(':');
+                s.push_str(t);
+            }
+            if let Some(d) = &i.digest {
+                s.push('@');
+                s.push_str(d);
+            }
+            s
+        }
+        // COMMIT is skipped before rendering (cache policy, not content);
+        // this arm is only for exhaustiveness.
+        Commit => String::new(),
     }
 }
 
@@ -173,7 +188,11 @@ pub fn program_hash(
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for instr in instructions {
-        if matches!(instr, Instruction::Arg(_)) {
+        // `ARG` and `COMMIT` never enter identity: an ARG only reaches it
+        // through the substituted form at a use site, and a COMMIT is a
+        // cache-policy directive (check-pointing) that changes no image
+        // content — the final image is identical with or without it.
+        if matches!(instr, Instruction::Arg(_) | Instruction::Commit) {
             continue;
         }
         let rendered = render_instruction(instr);
@@ -226,6 +245,18 @@ mod tests {
         let nover = program_hash(&instrs, &empty_resolve);
         let v1 = program_hash(&instrs, &|k| (k == "VERSION").then(|| "1.2.3".to_string()));
         assert_ne!(nover, v1);
+    }
+
+    #[test]
+    fn commit_never_changes_the_program() {
+        use crate::dsl::parser::parse;
+        // COMMIT is a cache-policy directive: the final image is identical
+        // with or without it, so it must not enter programHash (like OUTPUT).
+        let without = parse("FROM alpine\nRUN echo a\nRUN echo b\n").unwrap();
+        let with = parse("FROM alpine\nRUN echo a\nCOMMIT\nRUN echo b\n").unwrap();
+        let h1 = program_hash(&without.targets[0].instructions, &empty_resolve);
+        let h2 = program_hash(&with.targets[0].instructions, &empty_resolve);
+        assert_eq!(h1, h2, "COMMIT must not affect the program hash");
     }
 
     #[test]

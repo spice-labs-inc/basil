@@ -94,6 +94,44 @@ async fn resolve_unpinned_bases(
             }
         }
     }
+    // IMPORT instructions inline an external image mid-build: resolve their
+    // refs to manifest digests exactly like unpinned bases, so closure can
+    // fold the digest into identity. Pinned imports resolve textually; a ref
+    // naming a local stage is left alone (closure rejects it with a clear
+    // message). Dedup is shared with base pulls — same ref, one resolution.
+    for t in targets {
+        for instr in &t.instructions {
+            let crate::dsl::ast::Instruction::Import(im) = instr else { continue };
+            if im.digest.is_some() {
+                continue;
+            }
+            if by_name.contains(im.raw.as_str()) && im.raw != t.name {
+                continue; // local stage ref — closure errors with context
+            }
+            let tag = im.tag.clone().unwrap_or_else(|| "latest".to_string());
+            let ir = match crate::solver::registry::parse_ref(&im.raw, &tag) {
+                Ok(ir) => ir,
+                Err(e) => return Err(format!("IMPORT `{raw}`: {e}", raw = im.raw)),
+            };
+            if !seen.insert(ir.dedup_key(&tag)) {
+                continue;
+            }
+            let raw = &im.raw;
+            match ir.resolve_digest().await {
+                Ok(digest) => {
+                    tracing::info!("resolved IMPORT `{raw}` -> {digest}");
+                    resolved.insert(raw.clone(), digest.clone());
+                    resolved.insert(format!("{raw}:{tag}"), digest);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "could not resolve IMPORT `{raw}` ({}): {e}",
+                        ir.dedup_key(&tag)
+                    ));
+                }
+            }
+        }
+    }
     Ok(resolved)
 }
 
@@ -189,6 +227,9 @@ pub struct SolveContext {
     pub module_digests: crate::identity::modules::ModuleClosures,
     pub module_refs: std::collections::BTreeMap<String, String>,
     pub closures: std::collections::HashMap<String, [u8; 32]>,
+    /// (stage, commit seq) -> checkpoint closure for every `COMMIT` in the
+    /// in-scope targets — the identity of each sealed instruction prefix.
+    pub checkpoint_closures: std::collections::BTreeMap<(String, usize), [u8; 32]>,
 }
 
 /// Parse the file, select deliverables (`-t` filter, else every qualified
@@ -311,6 +352,21 @@ async fn solve(
             format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
         );
     }
+    // Checkpoint identities (`COMMIT`): the closure of each sealed prefix,
+    // derived with the same resolver (external bases/imports) and the full
+    // stage closures (stage deps).
+    let checkpoint_closures = crate::identity::closure::compute_checkpoint_closures(
+        &subset,
+        &closures,
+        &parsed.default_platforms,
+        &parsed.global_args,
+        context,
+        &build_file_owned,
+        &HashMap::new(),
+        &mut resolver,
+        &module_digests.deliverable,
+    )
+    .map_err(anyhow::Error::msg)?;
     println!("basil: identity computed in {:.1}s", t0.elapsed().as_secs_f64());
     for name in &names {
         println!(
@@ -333,7 +389,231 @@ async fn solve(
         module_digests,
         module_refs,
         closures,
+        checkpoint_closures,
     })
+}
+
+/// Run a non-published target's `TASK` clause in a one-shot container via
+/// buildah, without an event: the manual form of the event path's `DO`.
+/// Registered (REGISTER-clause) targets are excluded as run targets — they
+/// are published deliverables. The run target is never published. Everything
+/// the task runs on is built the standard way first — an internal `FROM
+/// <stage>` base (and its transitive stage deps) is reconciled as a
+/// `basil-cache-<stageHash>` cache image in the cache repo (`--cache-to`,
+/// `BASIL_CACHE_REF`, the target's own repo when it is a qualified ref), and a
+/// module base is built use-or-build. REGISTERed stages in the subset follow
+/// the same rule as the build path: they resolve to their published
+/// content-tagged artifact (`<register>:basil-<hash>`, use-or-build) instead
+/// of being cache-reconciled — the only difference between build and `run` is
+/// that deliverables are not run targets. The task then runs on the resolved
+/// base image. A failing task fails the invocation. Returns the task's exit
+/// code.
+pub async fn run_target(
+    file: &str,
+    context: &std::path::Path,
+    target_filter: &str,
+    cache_to: Option<&str>,
+) -> anyhow::Result<i32> {
+    let src = crate::fsctx::fs_err(std::fs::read_to_string(file), file, "read")?;
+    println!("basil: parsed {file}");
+    let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
+    let (name, target, task) = resolve_task_target(&parsed, target_filter)
+        .map_err(|e| anyhow::anyhow!("`{target_filter}`: {e}"))?;
+
+    // The required dependency set: for an internal `FROM <stage>` base, the
+    // base and its transitive stage deps; for a module base, the module (and
+    // any stage deps of the target); for an external base, nothing.
+    let subset = match &target.base {
+        crate::dsl::ast::Base::Module(_) => dependency_subset(&parsed.targets, &[name.to_string()]),
+        crate::dsl::ast::Base::Image(_) => match base_stage_name(&parsed, target) {
+            Some(bs) => dependency_subset(&parsed.targets, &[bs]),
+            None => Vec::new(),
+        },
+    };
+    let build_file = std::path::absolute(file).unwrap_or_else(|_| file.into());
+    let file_dir = build_file.parent().unwrap_or(std::path::Path::new("."));
+
+    let task_image = if subset.is_empty() {
+        // External base: nothing to build; the task runs on the image as
+        // written (buildah from pulls it).
+        resolved_image(target.base_image().expect("base is an image"))
+    } else {
+        // Identity preamble, exactly like the build path.
+        let mut resolved = resolve_unpinned_bases(&subset)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let index = crate::identity::modules::discover_module_index(&subset, file_dir)
+            .map_err(anyhow::Error::msg)?;
+        for key in &index.order {
+            let e = &index.entries[key];
+            let module_resolved = resolve_unpinned_bases(&e.parsed.targets)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            resolved.extend(module_resolved);
+        }
+        let mut resolver = RegistryResolver { resolved };
+        let module_digests =
+            crate::identity::modules::compute_module_digests(&index, &mut resolver)
+                .map_err(anyhow::Error::msg)?;
+        let closures = compute_closure(
+            &subset,
+            &parsed.default_platforms,
+            &parsed.global_args,
+            context,
+            &build_file,
+            &HashMap::new(),
+            &mut resolver,
+            &module_digests.deliverable,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut module_refs: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for key in &index.order {
+            let e = &index.entries[key];
+            let tag = crate::identity::closure::hex(&module_digests.deliverable[key]);
+            module_refs.insert(
+                key.clone(),
+                format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
+            );
+        }
+        // Checkpoint identities (`COMMIT`) — the closure of each sealed prefix.
+        let checkpoint_closures = crate::identity::closure::compute_checkpoint_closures(
+            &subset,
+            &closures,
+            &parsed.default_platforms,
+            &parsed.global_args,
+            context,
+            &build_file,
+            &HashMap::new(),
+            &mut resolver,
+            &module_digests.deliverable,
+        )
+        .map_err(anyhow::Error::msg)?;
+        // Module dependencies: use-or-build (they are published artifacts).
+        ensure_modules_built(&index, &module_refs, &module_digests, cache_to).await?;
+        // Stage dependencies: the standard cache-image reconciliation. The
+        // run target itself is never published — it is only excluded from
+        // cache building when a module base puts it in the subset.
+        let cache_to = effective_run_cache_to(cache_to, target);
+        let run_deliverable = [(name.to_string(), target.push_ref().to_string())];
+        let stage_cache = stage_cache_refs(&subset, &run_deliverable, &closures, &cache_to);
+        let checkpoint_refs = checkpoint_refs(&checkpoint_closures);
+        let g = crate::solver::buildah::Graph::new(
+            &subset,
+            &parsed.global_args,
+            file_dir,
+            &module_refs,
+            &stage_cache,
+            &checkpoint_refs,
+        );
+        println!(
+            "basil: reconciling {} dependency stage(s) as cache images in {cache_to}...",
+            subset.len()
+        );
+        ensure_stages_cached(g, context, &build_file, &run_deliverable).await?;
+        // The image the task runs on: the resolved base.
+        match &target.base {
+            crate::dsl::ast::Base::Module(m) => {
+                let key = crate::identity::modules::module_key(file_dir, m)
+                    .map_err(anyhow::Error::msg)?;
+                module_refs.get(&key).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("module `{}`: no computed image for the task", m.path)
+                })?
+            }
+            crate::dsl::ast::Base::Image(b) => {
+                let bs = base_stage_name(&parsed, target).expect("subset implies internal base");
+                stage_cache
+                    .get(&bs)
+                    .cloned()
+                    .unwrap_or_else(|| resolved_image(b))
+            }
+        }
+    };
+
+    // No delivered event; the target itself is the only task context.
+    let env = vec![format!("BASIL_TARGET={name}")];
+    println!("basil: run {name} from {task_image}");
+    let code = crate::solver::buildah::run_task(&task_image, &task.command, &env).await?;
+    if code != 0 {
+        anyhow::bail!("task `{name}` failed with exit {code}");
+    }
+    println!("basil: task {name} completed (exit 0)");
+    Ok(code)
+}
+
+/// The cache repo for a `run`'s stage images: `--cache-to`, else
+/// `BASIL_CACHE_REF`, else the run target's own repo when it is a qualified
+/// ref; a bare non-qualified target has no natural repo, so the operator must
+/// say where its dependent stage cache images go.
+fn effective_run_cache_to(flag: Option<&str>, target: &crate::dsl::ast::Target) -> String {
+    if let Some(f) = flag {
+        return f.to_string();
+    }
+    if let Ok(env) = std::env::var("BASIL_CACHE_REF") {
+        if !env.trim().is_empty() {
+            return env;
+        }
+    }
+    // A qualified target names its own repo (mirrors the deliverable-repo
+    // default in the build path).
+    let push_ref = target.push_ref();
+    if push_ref.contains('/') {
+        return push_ref.to_string();
+    }
+    "127.0.0.1:5001/basil-cache".to_string()
+}
+
+/// Select a `run` target by AS name or REGISTER ref and require its `TASK`
+/// clause. Module-base targets are runnable too (the module is built
+/// use-or-build and the task runs on its image). Pure — unit-tested without
+/// buildah.
+fn resolve_task_target<'a>(
+    parsed: &'a crate::dsl::ast::File,
+    filter: &str,
+) -> Result<(&'a str, &'a crate::dsl::ast::Target, &'a crate::dsl::ast::TaskCmd), String> {
+    let target = parsed
+        .targets
+        .iter()
+        .find(|t| t.name == filter || t.register.as_deref() == Some(filter))
+        .ok_or_else(|| {
+            format!(
+                "target `{filter}` not found in file (known: {})",
+                parsed.targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        })?;
+    // A REGISTERed target is a published deliverable; `run` is the manual DO
+    // for non-published targets, so it is excluded regardless of a TASK.
+    if target.register.is_some() {
+        return Err(format!(
+            "target `{}` is REGISTERed (`{}`) — a published deliverable; \
+             `basil run` excludes registered targets (run a non-registered \
+             stage with a TASK clause)",
+            target.name,
+            target.register.as_deref().unwrap_or(&target.name),
+        ));
+    }
+    let task = target
+        .task
+        .as_ref()
+        .ok_or_else(|| format!("target has no TASK clause to run"))?;
+    Ok((target.name.as_str(), target, task))
+}
+
+/// The stage a target's `FROM` base names (an internal-stage base, applying
+/// the self-name rule: a base naming its own target stays external). `None`
+/// for external images and module bases.
+fn base_stage_name<'a>(
+    parsed: &'a crate::dsl::ast::File,
+    target: &crate::dsl::ast::Target,
+) -> Option<String> {
+    let crate::dsl::ast::Base::Image(b) = &target.base else {
+        return None;
+    };
+    parsed
+        .targets
+        .iter()
+        .find(|t| t.name == b.raw && t.name != target.name)
+        .map(|t| t.name.clone())
 }
 
 /// Build one or more deliverable targets directly (no event). This path must
@@ -351,7 +631,9 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
         module_digests,
         module_refs,
         closures,
+        checkpoint_closures,
         file_dir,
+        build_file,
         ..
     } = solved;
 
@@ -362,6 +644,9 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     // `BASIL_CACHE_REF`, else the first deliverable's repo (D1).
     let cache_to = effective_cache_to(inp.cache_to, &deliverables);
     let stage_cache = stage_cache_refs(&subset, &deliverables, &closures, &cache_to);
+    // `COMMIT` checkpoints seal the same namespace: each prefix gets a
+    // `basil-cache-<prefixHash>` ref derived from its checkpoint closure.
+    let checkpoint_refs = checkpoint_refs(&checkpoint_closures);
 
     // If every content tag already exists in its registry, the exact images
     // are already published — don't rebuild (parity with handle_event's
@@ -379,9 +664,9 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
             // Stages are reconciled by existence too: a missing cache image is
             // rebuilt and pushed even on the noop path (D2).
-            let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache);
-            ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
-            let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache);
+            let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+            ensure_stages_cached(cache_g, inp.context, &build_file, &deliverables).await?;
+            let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache, &checkpoint_refs);
             for (name, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
                 // OUTPUT still runs: pull the published image and extract.
@@ -406,8 +691,8 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
     // Every intermediate stage must exist as its cache image before the
     // deliverable's Containerfile references it (reconcile by existence).
-    let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache);
-    ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
+    let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+    ensure_stages_cached(cache_g, inp.context, &build_file, &deliverables).await?;
 
     for (name, push_ref) in &deliverables {
         let tag = digest_of(name, &closures)?;
@@ -415,11 +700,12 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache),
+            crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache, &checkpoint_refs),
             name,
             push_ref,
             &tag,
             inp.context,
+            &build_file,
             &HashMap::new(),
             insecure,
             inp.force,
@@ -563,6 +849,99 @@ RUN echo other
         assert_eq!(sub.len(), 1);
         assert_eq!(sub[0].name, "app");
     }
+
+    #[test]
+    fn resolve_task_target_by_name() {
+        let src = "FROM alpine AS plain\nTASK echo hi\n";
+        let f = parse(src).unwrap();
+        let (name, _, task) = resolve_task_target(&f, "plain").unwrap();
+        assert_eq!(name, "plain");
+        assert!(matches!(&task.command, crate::dsl::ast::Command::Shell(s) if s == "echo hi"));
+    }
+
+    #[test]
+    fn resolve_task_target_refuses_registered() {
+        let src = "FROM alpine AS notify\nTASK echo hi\nREGISTER 127.0.0.1:5001/notify\n";
+        let f = parse(src).unwrap();
+        // By the AS name.
+        let e = resolve_task_target(&f, "notify").unwrap_err();
+        assert!(e.contains("REGISTER") && e.contains("excludes registered"), "{e}");
+        assert!(e.contains("127.0.0.1:5001/notify"), "{e}");
+        // By the REGISTER ref.
+        let e = resolve_task_target(&f, "127.0.0.1:5001/notify").unwrap_err();
+        assert!(e.contains("excludes registered"), "{e}");
+    }
+
+    #[test]
+    fn resolve_task_target_errors() {
+        let src = "FROM alpine AS plain\nRUN echo x\nFROM alpine AS notify\nTASK echo hi\n";
+        let f = parse(src).unwrap();
+        let e = resolve_task_target(&f, "nope").unwrap_err();
+        assert!(e.contains("not found"), "{e}");
+        let e = resolve_task_target(&f, "plain").unwrap_err();
+        assert!(e.contains("no TASK"), "{e}");
+        // Module-base targets resolve too (the module is built use-or-build
+        // and the task runs on its image).
+        let m = parse("MODULE vendor/x AS m\nTASK echo hi\n").unwrap();
+        let (name, _, _) = resolve_task_target(&m, "m").unwrap();
+        assert_eq!(name, "m");
+    }
+
+    #[test]
+    fn stage_cache_refs_registered_uses_published_ref() {
+        let src = "\
+FROM alpine AS base
+RUN echo b
+
+FROM base AS reg
+RUN echo r
+REGISTER 127.0.0.1:5001/reg
+
+FROM reg AS app
+COPY --from=reg /x /x
+";
+        let f = parse(src).unwrap();
+        // Every target gets a fake but deterministic closure hash.
+        let closures: std::collections::HashMap<String, [u8; 32]> = f
+            .targets
+            .iter()
+            .map(|t| (t.name.clone(), [0x11u8; 32]))
+            .collect();
+        let refs = stage_cache_refs(
+            &f.targets,
+            &[("app".to_string(), "127.0.0.1:5001/app".to_string())],
+            &closures,
+            "127.0.0.1:5001/cache",
+        );
+        // A REGISTERed stage resolves to its published content-tagged artifact,
+        // not an intermediate cache ref.
+        let reg = refs.get("reg").expect("reg maps to its published ref");
+        assert!(reg.starts_with("127.0.0.1:5001/reg:basil-"), "{reg}");
+        assert!(
+            !reg.contains("basil-cache-"),
+            "registered stage must not be cache-reconciled: {reg}"
+        );
+        // Non-registered intermediates keep the cache ref.
+        let base = refs.get("base").expect("base maps to a cache ref");
+        assert!(base.starts_with("127.0.0.1:5001/cache:basil-cache-"), "{base}");
+        // The deliverable itself is excluded.
+        assert!(!refs.contains_key("app"), "deliverable must not appear in stage refs");
+    }
+
+    #[test]
+    fn base_stage_name_internal_external_self() {
+        let src = "FROM alpine AS base\nRUN echo b\n\nFROM base AS runner\nTASK echo r\n\nFROM alpine AS alpine\nTASK echo s\n";
+        let f = parse(src).unwrap();
+        let runner = f.targets.iter().find(|t| t.name == "runner").unwrap();
+        assert_eq!(base_stage_name(&f, runner).as_deref(), Some("base"));
+        // A base naming its own target stays external (self-name rule).
+        let alpine = f.targets.iter().find(|t| t.name == "alpine").unwrap();
+        assert_eq!(base_stage_name(&f, alpine), None);
+        // External image base -> no stage.
+        let plain = parse("FROM node:20 AS n\nTASK echo n\n").unwrap();
+        let n = &plain.targets[0];
+        assert_eq!(base_stage_name(&plain, n), None);
+    }
 }
 
 /// Build using the buildah backend (plain subprocess, no daemon), driven by
@@ -700,6 +1079,19 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
         );
     }
+    // Checkpoint identities (`COMMIT`) — the closure of each sealed prefix.
+    let checkpoint_closures = crate::identity::closure::compute_checkpoint_closures(
+        &parsed.targets,
+        &closures,
+        &parsed.default_platforms,
+        &parsed.global_args,
+        inp.context,
+        &build_file,
+        &build_args,
+        &mut resolver,
+        &module_digests.deliverable,
+    )
+    .map_err(anyhow::Error::msg)?;
     println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
 
     // Every non-deliverable stage in scope gets a cache image
@@ -707,6 +1099,9 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     // `BASIL_CACHE_REF`, else the first deliverable's repo (D1).
     let cache_to = effective_cache_to(inp.cache_to, &deliverables);
     let stage_cache = stage_cache_refs(&parsed.targets, &deliverables, &closures, &cache_to);
+    // `COMMIT` checkpoints seal the same namespace: each prefix gets a
+    // `basil-cache-<prefixHash>` ref derived from its checkpoint closure.
+    let checkpoint_refs = checkpoint_refs(&checkpoint_closures);
 
     // Idempotent check: skip when every deliverable's content tag exists, and
     // state each registered image on the noop path. `--force` bypasses the
@@ -720,9 +1115,9 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             // re-registered (same tagHash — the importer image stays valid).
             ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
             // Stages are reconciled by existence too (D2).
-            let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache);
-            ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
-            let g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache);
+            let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+            ensure_stages_cached(cache_g, inp.context, &build_file, &deliverables).await?;
+            let g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache, &checkpoint_refs);
             for (_, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
             }
@@ -751,8 +1146,8 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     // still reconciled by existence, only the importer is force-built.
     ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
     // Every intermediate stage must exist as its cache image first (D2).
-    let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache);
-    ensure_stages_cached(cache_g, inp.context, &deliverables).await?;
+    let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+    ensure_stages_cached(cache_g, inp.context, &build_file, &deliverables).await?;
 
     // Build each deliverable with buildah.
     for (name, push_ref) in &deliverables {
@@ -761,11 +1156,12 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache),
+            crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache, &checkpoint_refs),
             name,
             push_ref,
             &tag,
             inp.context,
+            &build_file,
             &build_args,
             insecure,
             inp.force,
@@ -822,14 +1218,19 @@ async fn ensure_modules_built(
             &module_closures.tables[key],
             module_repo,
         );
+        // `COMMIT` checkpoints inside the module: their refs use the module's
+        // cache repo like its stage caches.
+        let module_checkpoint_refs =
+            checkpoint_refs(&module_closures.checkpoints[key]);
         let g_for_cache = crate::solver::buildah::Graph::new(
             &e.parsed.targets,
             &e.parsed.global_args,
             &e.context,
             module_refs,
             &stage_cache,
+            &module_checkpoint_refs,
         );
-        ensure_stages_cached(g_for_cache, &e.context, &deliv).await?;
+        ensure_stages_cached(g_for_cache, &e.context, &e.file, &deliv).await?;
         if exists {
             println!("basil: module {key} -> {from_ref} (using existing image)");
             continue;
@@ -845,6 +1246,7 @@ async fn ensure_modules_built(
             &e.context,
             module_refs,
             &stage_cache,
+            &module_checkpoint_refs,
         );
         crate::solver::buildah::build_deliverable(
             g,
@@ -852,6 +1254,7 @@ async fn ensure_modules_built(
             &e.push_ref,
             hash,
             &e.context,
+            &e.file,
             &std::collections::HashMap::new(),
             insecure,
             // Modules are reconciled by existence, always: never force-built.
@@ -882,6 +1285,24 @@ fn effective_cache_to(
         .unwrap_or_else(|| "127.0.0.1:5001/basil-cache".to_string())
 }
 
+/// (stage, commit seq) -> local checkpoint ref for every `COMMIT` point, from
+/// the checkpoint closures derived for the in-scope set. `basil-checkpoint-*`
+/// is a local-only namespace (the buildah layer cache): these images are
+/// never pushed to any registry — unlike stage caches — so no repo prefix is
+/// attached and `basil gc` (registry-only) never sees them.
+fn checkpoint_refs(
+    checkpoints: &std::collections::BTreeMap<(String, usize), [u8; 32]>,
+) -> std::collections::BTreeMap<(String, usize), String> {
+    let mut out = std::collections::BTreeMap::new();
+    for ((stage, seq), h) in checkpoints {
+        out.insert(
+            (stage.clone(), *seq),
+            format!("basil-checkpoint-{}", crate::identity::closure::hex(h)),
+        );
+    }
+    out
+}
+
 /// Stage name -> `<cache-to>:basil-cache-<stageHash>` for every in-scope
 /// target that is not a deliverable (the deliverable is published under its
 /// content tag instead).
@@ -899,20 +1320,40 @@ fn stage_cache_refs(
             continue;
         }
         let Some(hash) = closures.get(&t.name) else { continue };
-        let tag = crate::solver::registry::cache_tag(&crate::identity::closure::hex(hash));
-        out.insert(t.name.clone(), format!("{cache_to}:{tag}"));
+        let hex = crate::identity::closure::hex(hash);
+        let ref_str = if t.register.is_some() {
+            // A REGISTERed stage is a published deliverable: dependents use
+            // its content-tagged artifact (`<register>:basil-<hash>`), never
+            // an intermediate cache image. Same rule for build and `run` — the
+            // only difference between the two is that deliverables are not run
+            // targets.
+            format!(
+                "{}:{}",
+                t.push_ref(),
+                crate::solver::registry::content_tag(&hex)
+            )
+        } else {
+            format!("{cache_to}:{}", crate::solver::registry::cache_tag(&hex))
+        };
+        out.insert(t.name.clone(), ref_str);
     }
     out
 }
 
 /// Ensure every intermediate stage exists as its cache image in the registry:
 /// probe `<cache-to>:basil-cache-<stageHash>`; on miss, build `--target
-/// <stage>`, push it, and remove the local image. Iterates in subset order
+/// <stage>`, push it, and remove the local image. REGISTERed stages in scope
+/// are never cache-reconciled: they resolve to their published
+/// `<register>:basil-<hash>` artifact and are use-or-build'd as deliverables
+/// (mirroring module deps). Iterates in subset order
 /// (dependencies first). `--force` never propagates here — stages are
-/// reconciled by existence, always (D2).
+/// reconciled by existence, always (D2). A stage containing `IMPORT` is built
+/// imperatively (committed straight to its cache ref) instead of via
+/// `--target`.
 async fn ensure_stages_cached(
     g: crate::solver::buildah::Graph<'_>,
     context: &std::path::Path,
+    build_file: &std::path::Path,
     deliverables: &[(String, String)],
 ) -> anyhow::Result<()> {
     let deliv: std::collections::BTreeSet<&str> =
@@ -940,12 +1381,46 @@ async fn ensure_stages_cached(
             println!("basil: stage {} -> {ref_str} (cached)", t.name);
             continue;
         }
+        // A REGISTERed stage is a published deliverable, never an intermediate:
+        // build it as the deliverable (use-or-build, mirroring module deps) so
+        // dependents pull the published content-tagged artifact instead of a
+        // basil-cache image.
+        if t.register.is_some() {
+            let hash = tag
+                .strip_prefix(crate::solver::registry::BASIL_TAG_PREFIX)
+                .unwrap_or(&tag);
+            let insecure = ir.is_local();
+            println!("basil: stage {} -> building deliverable {ref_str}", t.name);
+            crate::solver::buildah::build_deliverable(
+                g,
+                &t.name,
+                t.push_ref(),
+                hash,
+                context,
+                build_file,
+                &std::collections::HashMap::new(),
+                insecure,
+                false,
+            )
+            .await?;
+            continue;
+        }
+        // Every stage is built per-instruction (imperative), committed
+        // straight to its cache ref, then pushed + dropped locally — the
+        // reconcile-by-existence contract.
         println!("basil: stage {} -> building cache {ref_str}", t.name);
-        let image_id = crate::solver::buildah::build_stage_image(g, &t.name, context).await?;
+        crate::solver::imperative::build_stage_imperative(
+            g,
+            &t.name,
+            context,
+            build_file,
+            ref_str,
+            &HashMap::new(),
+        )
+        .await?;
         let insecure = ir.is_local();
-        // buildah push needs the full `<host>/<repo>` ref, not the repo path.
-        crate::solver::buildah::push_tagged(&t.name, &repo, &tag, &image_id, insecure).await?;
-        crate::solver::buildah::remove_local_image(&image_id).await?;
+        crate::solver::buildah::push_tagged(&t.name, &repo, &tag, &ref_str, insecure).await?;
+        crate::solver::buildah::remove_local_image(ref_str).await?;
         println!("basil: stage {} cached at {ref_str}", t.name);
     }
     Ok(())

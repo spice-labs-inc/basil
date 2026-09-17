@@ -197,6 +197,9 @@ pub struct ModuleClosures {
     pub deliverable: BTreeMap<String, [u8; 32]>,
     /// Module key -> full closure table of that module's targets.
     pub tables: BTreeMap<String, std::collections::HashMap<String, [u8; 32]>>,
+    /// Module key -> (stage, commit seq) -> checkpoint closure for every
+    /// `COMMIT` inside that module (the identity of each sealed prefix).
+    pub checkpoints: BTreeMap<String, BTreeMap<(String, usize), [u8; 32]>>,
 }
 
 /// Compute every module's closure table bottom-up (its targets, its own module
@@ -208,10 +211,25 @@ pub fn compute_module_digests(
     let mut deliverable: BTreeMap<String, [u8; 32]> = BTreeMap::new();
     let mut tables: BTreeMap<String, std::collections::HashMap<String, [u8; 32]>> =
         BTreeMap::new();
+    let mut checkpoints_by_module: BTreeMap<String, BTreeMap<(String, usize), [u8; 32]>> =
+        BTreeMap::new();
     for key in &index.order {
         let e = &index.entries[key];
+        // `COMMIT` inside a module: derive each sealed prefix's identity with
+        // the same resolver, folded from the module's own closure table.
         let closures = super::closure::compute_closure(
             &e.parsed.targets,
+            &e.parsed.default_platforms,
+            &e.parsed.global_args,
+            &e.context,
+            &e.file,
+            &std::collections::HashMap::new(),
+            resolver,
+            &deliverable,
+        )?;
+        let checkpoints = super::closure::compute_checkpoint_closures(
+            &e.parsed.targets,
+            &closures,
             &e.parsed.default_platforms,
             &e.parsed.global_args,
             &e.context,
@@ -225,8 +243,9 @@ pub fn compute_module_digests(
         })?;
         deliverable.insert(key.clone(), *hash);
         tables.insert(key.clone(), closures);
+        checkpoints_by_module.insert(key.clone(), checkpoints);
     }
-    Ok(ModuleClosures { deliverable, tables })
+    Ok(ModuleClosures { deliverable, tables, checkpoints: checkpoints_by_module })
 }
 
 #[cfg(test)]

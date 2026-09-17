@@ -149,6 +149,19 @@ pub enum Instruction {
     /// `OUTPUT <container-src> <host-dest>` — reverse COPY: copy a file out of
     /// the built image onto the host (relative dest only).
     Output(Output),
+    /// `IMPORT <image>` — inline the rootfs content of another image into the
+    /// build at this point. A basil-only instruction: a Containerfile has no
+    /// such statement, so a stage containing one is built imperatively
+    /// (buildah from/config/copy/run/add) instead of rendered to `buildah bud`.
+    Import(ImportImage),
+    /// `COMMIT` — checkpoint the build so far into the layer cache: the
+    /// working container is sealed as a `basil-cache-<prefixHash>` image (its
+    /// identity is the closure of the instruction prefix up to this point). A
+    /// later build resumes from the deepest matching checkpoint instead of
+    /// re-executing the prefix. A cache-policy directive: it never changes
+    /// image content, contributes nothing to the program hash (like `OUTPUT`),
+    /// and the final committed image is identical with or without it.
+    Commit,
 }
 
 /// `ARG name[=default]`.
@@ -173,6 +186,25 @@ pub struct Copy {
     pub chmod: Option<String>,
     pub sources: Vec<String>,
     pub dest: String,
+}
+
+/// `IMPORT <image>` — the image to inline at this point in the build. The
+/// import image's root filesystem content is copied over the working rootfs
+/// (imported files overwrite existing paths), then the build continues.
+///
+/// Identity folds the import's *resolved manifest digest* (`import.<n>`), so an
+/// unpinned ref (`IMPORT foo:latest`) re-hashes when the tag moves. Only
+/// external images are supported — a ref naming a local stage is an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportImage {
+    /// The image ref as written after `IMPORT` (e.g. `alpine`, `ghcr.io/a/b:1.2`).
+    pub raw: String,
+    /// Explicit tag (`:3.23`), if any.
+    pub tag: Option<String>,
+    /// Pinned digest (`@sha256:...`), if any. Present = hermetic.
+    pub digest: Option<String>,
+    /// 1-based source line (error context).
+    pub line: usize,
 }
 
 /// `OUTPUT <container-src> <host-dest>` — a reverse COPY: after building, copy

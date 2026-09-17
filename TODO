@@ -1,3 +1,25 @@
 # TODO
 
 - Make a default prefix for content hash tags, like basil-<hash> instead of just <hash>
+
+## Known gaps
+
+- `RUN --mount=type=ssh` is a hard error (buildah run has no ssh mount, so the
+  agent cannot be forwarded).
+- Imperative `COPY .` copies per-file (dockerignore-honest, dest-reconstructed):
+  a very large context becomes many `buildah copy` calls. Batching or a
+  filtered tar stream (`buildah add -`) is the future optimization.
+- `IMPORT` of a local stage name (inline another target's own layers) is
+  rejected at closure time with a clear error — `COPY --from=<stage>` is the
+  current way to pull a stage's content into a layer.
+- `FROM --platform=<other $VAR>` (anything but $BUILDPLATFORM/$TARGETPLATFORM):
+  unexpandable selectors are a hard error; the two build-staged vars expand to
+  the host platform.
+- IMPORT inlines the import image's flattened content as one new layer; the
+  import's original layer digests are not re-added, and its config
+  (ENV/CMD/...) is not transferred (`IMPORT` is content-only).
+- `COMMIT` checkpoints are local-only (the buildah layer cache, group
+  granularity): probed with `buildah inspect` and resumed with `buildah from`
+  — one local probe per checkpoint per run; a local-first registry-adjacent
+  store could make them survive `buildah rmi` cleanup, but they are also
+  cheaply re-sealed on demand.

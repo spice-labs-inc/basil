@@ -77,6 +77,44 @@ pub async fn pin_file(src: &str) -> Result<String, String> {
         }
     }
 
+    // IMPORT refs are external images too: pin each unpinned one the same way
+    // (shared `seen` dedup — a ref that already resolved as a FROM base is not
+    // resolved again). Stage-name refs are skipped; compute_closure rejects
+    // them with a clear message.
+    let mut import_pinned: HashMap<String, String> = HashMap::new(); // written ref -> new
+    for t in &file.targets {
+        for instr in &t.instructions {
+            let crate::dsl::ast::Instruction::Import(im) = instr else { continue };
+            if im.digest.is_some() || im.raw == "scratch" {
+                continue;
+            }
+            if by_name.contains(im.raw.as_str()) && im.raw != t.name {
+                continue;
+            }
+            let old = written_ref(&im.raw, im.tag.as_deref());
+            if import_pinned.contains_key(&old) {
+                continue;
+            }
+            let tag = im.tag.clone().unwrap_or_else(|| "latest".to_string());
+            let ir = crate::solver::registry::parse_ref(&im.raw, &tag).map_err(|e| e.to_string())?;
+            if !seen.insert(ir.dedup_key(&tag)) {
+                continue;
+            }
+            let digest = ir
+                .resolve_digest()
+                .await
+                .map_err(|e| format!("could not resolve unpinned IMPORT `{old}`: {e}"))?;
+            let new = match &im.tag {
+                Some(t) => format!("{}:{t}@{digest}", im.raw),
+                None => format!("{}@{digest}", im.raw),
+            };
+            if new != old {
+                import_pinned.insert(old.clone(), new.clone());
+                tracing::info!("pin IMPORT `{old}` -> `{new}`");
+            }
+        }
+    }
+
     // Rewrite each `FROM ...` line in place, replacing the base token. The
     // parser records a target's FROM line number; we locate the base token
     // (after `FROM `, leading `--platform=...` allowed) and swap it.
@@ -94,7 +132,54 @@ pub async fn pin_file(src: &str) -> Result<String, String> {
         }
     }
 
+    // Rewrite each `IMPORT ...` line in place, swapping the ref token.
+    for t in &file.targets {
+        for instr in &t.instructions {
+            let crate::dsl::ast::Instruction::Import(im) = instr else { continue };
+            let old = written_ref(&im.raw, im.tag.as_deref());
+            if let Some(new_ref) = import_pinned.get(&old) {
+                let idx = im.line.saturating_sub(1);
+                if let Some(line) = lines.get_mut(idx) {
+                    if let Some(r) = rewrite_import_line(line, &old, new_ref) {
+                        *line = r;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(lines.join("\n"))
+}
+
+/// `<raw>[:tag]` as written (no digest).
+fn written_ref(raw: &str, tag: Option<&str>) -> String {
+    match tag {
+        Some(t) => format!("{raw}:{t}"),
+        None => raw.to_string(),
+    }
+}
+/// Replace the ref token in a single `IMPORT` line (preserving indentation
+/// and trailing text). Returns the new line, or `None` if the old ref text
+/// isn't found in the expected position.
+fn rewrite_import_line(line: &str, old_ref: &str, new_ref: &str) -> Option<String> {
+    let lead = line.trim_start();
+    if !lead.to_ascii_uppercase().starts_with("IMPORT ") {
+        return None;
+    }
+    let off = line.len() - lead.len();
+    let rest = &lead["IMPORT ".len()..];
+    let ref_end = rest
+        .find(char::is_whitespace)
+        .map(|n| "IMPORT ".len() + n)
+        .unwrap_or(lead.len());
+    if &lead["IMPORT ".len()..ref_end] != old_ref {
+        return None;
+    }
+    Some(format!(
+        "{}{new_ref}{}",
+        &line[..off + "IMPORT ".len()],
+        &line[off + ref_end..]
+    ))
 }
 
 /// Replace the base token in a single `FROM` line (preserving the `AS` name,
@@ -131,6 +216,32 @@ fn rewrite_from_base(line: &str, old_base: &str, new_base: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrites_import_ref() {
+        let line = "IMPORT alpine:3";
+        let out = rewrite_import_line(line, "alpine:3", "alpine:3@sha256:abc").unwrap();
+        assert_eq!(out, "IMPORT alpine:3@sha256:abc");
+    }
+
+    #[test]
+    fn rewrites_import_bare_and_preserves_indent() {
+        let line = "  IMPORT busybox # toolchain";
+        let out = rewrite_import_line(line, "busybox", "busybox@sha256:d").unwrap();
+        assert_eq!(out, "  IMPORT busybox@sha256:d # toolchain");
+    }
+
+    #[test]
+    fn import_line_without_match_is_none() {
+        assert_eq!(rewrite_import_line("FROM alpine", "alpine", "alpine@x"), None);
+        assert_eq!(rewrite_import_line("IMPORT other", "alpine", "alpine@x"), None);
+    }
+
+    #[test]
+    fn written_ref_forms() {
+        assert_eq!(written_ref("busybox", None), "busybox");
+        assert_eq!(written_ref("busybox", Some("1.36")), "busybox:1.36");
+    }
 
     #[test]
     fn pins_plain_base_with_as() {

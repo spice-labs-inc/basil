@@ -652,17 +652,26 @@ fn leaf_digest(
 /// When the target declares `GIVEN <path>…`, that explicit path set replaces
 /// the COPY/ADD-derived set — `derivedData(T)` means exactly the given inputs.
 pub fn derived_file_set(target: &Target, context: &Path, build_file: &Path) -> anyhow::Result<BTreeSet<String>> {
-    let ignore = Dockerignore::from_file_if_present(context);
-    let mut out = BTreeSet::new();
-    // GIVEN overrides the input set: hash exactly those context paths instead
-    // of the build-resolved sources. Still dockerignore-filtered (a GIVEN path
-    // excluded by .dockerignore is a real input mismatch, so it errors via
-    // expand_source's explicit-source rule).
     let sources: Vec<String> = match &target.given {
         Some(given) => given.clone(),
         None => context_sources(target, context),
     };
-    for src in &sources {
+    derived_file_set_for_sources(&sources, context, build_file)
+}
+
+/// Expand an explicit source list (COPY/ADD sources or `GIVEN` paths) to the
+/// dockerignore-filtered set of context files it names, excluding the build
+/// file. This is the exact set `derivedData` hashes; the imperative executor
+/// (IMPORT stages, which cannot be rendered to a Containerfile) copies the
+/// same set so the built image never contains a file identity excluded.
+pub(crate) fn derived_file_set_for_sources(
+    sources: &[String],
+    context: &Path,
+    build_file: &Path,
+) -> anyhow::Result<BTreeSet<String>> {
+    let ignore = Dockerignore::from_file_if_present(context);
+    let mut out = BTreeSet::new();
+    for src in sources {
         expand_source(src, context, &ignore, &mut out)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }

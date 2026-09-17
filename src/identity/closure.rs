@@ -68,7 +68,7 @@ impl BaseResolver for OfflineResolver {
 /// invisible here, exactly like buildah's stage scope.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
-    map: std::collections::BTreeMap<String, Option<String>>,
+    pub(crate) map: std::collections::BTreeMap<String, Option<String>>,
 }
 
 impl Args {
@@ -93,6 +93,12 @@ impl Args {
             }
         }
         Args { map }
+    }
+
+    /// The resolved value of a declared arg, if any (override > default >
+    /// global default). Bare args without a default resolve to `None`.
+    pub(crate) fn resolved(&self, name: &str) -> Option<String> {
+        self.map.get(name).cloned().flatten()
     }
 }
 
@@ -269,43 +275,43 @@ pub fn compute_closure(
             };
             let prog = program_hash::program_hash(&target.instructions, &|k| vctx.resolve(k));
 
-            // Assemble canonical components and compute tagHash. ARG is NOT
-            // folded here: identity reflects the substituted form at `${VAR}`
-            // use sites inside identity-affecting instructions, never the ARG
-            // declaration itself.
-            let mut record = Vec::new();
-            push(
-                &mut record,
-                "derivedData",
-                &hex(&derived),
-            );
-            let platforms = target_platform_list(target, file_default_platforms);
-            for p in platforms {
-                push(&mut record, "platform", &p.to_string());
-            }
-            push(&mut record, "program", &hex(&prog));
-            push(&mut record, "basil", BASIL_VERSION);
-            if let Some(BaseRef::External(digest)) = &base_ref {
-                push(&mut record, "base.external", digest);
-            }
-            if let Some(BaseRef::Stage(hash)) = &base_ref {
-                push(&mut record, &format!("base.stage.{}", stage_clean(name)), hash);
-            }
-            if let Some(BaseRef::Module(hash, _key)) = &base_ref {
-                push(&mut record, &format!("base.module.{}", stage_clean(name)), &hex(hash));
-            }
-            if let Some(p) = &_base_platform {
-                push(&mut record, "base.platform", p);
-            }
-            // Fold every stage dependency's closure hash (incl. COPY --from
-            // sources): changes to a depended stage must change the deliverable.
-            for dep in &stage_deps {
-                if let Some(h) = result.get(dep) {
-                    push(&mut record, &format!("dep.stage.{}", stage_clean(dep)), &hex(h));
+            // IMPORT instructions inline an external image's rootfs mid-build:
+            // fold each import's *resolved manifest digest* as `import.<n>`
+            // (occurrence order), so an unpinned ref re-hashes when its tag
+            // moves even though the ref text is stable. A ref naming a local
+            // stage is an error — v1 supports external images only (a stage's
+            // own content already folds via `dep.stage.*` for COPY --from).
+            let mut imports: Vec<String> = Vec::new();
+            for instr in &target.instructions {
+                if let crate::dsl::ast::Instruction::Import(im) = instr {
+                    if let Some(st) = by_name.get(im.raw.as_str()) {
+                        if st.name != name {
+                            return Err(format!(
+                                "IMPORT `{}` (line {}): naming a local stage (`{}`) is not \
+                                 supported — IMPORT takes an external image",
+                                im.raw, im.line, st.name
+                            ));
+                        }
+                    }
+                    let resolved = resolver
+                        .resolve(im.raw.as_str(), im.tag.as_deref(), im.digest.as_deref())
+                        .map_err(|e| format!("`IMPORT {}` (line {}): {e}", im.raw, im.line))?;
+                    imports.push(resolved);
                 }
             }
 
-            let tag = sha256(record_sorted(record));
+            let platforms = target_platform_list(target, file_default_platforms);
+            let tag = assemble_tag(
+                name,
+                &derived,
+                &platforms,
+                &base_ref,
+                &_base_platform,
+                prog,
+                &stage_deps,
+                &imports,
+                &|dep| result.get(dep).copied(),
+            );
             result.insert(name.to_string(), tag);
             done.insert(name.to_string());
             progressed = true;
@@ -320,7 +326,7 @@ pub fn compute_closure(
 }
 
 /// `ENV` pairs accumulate for later RUN/env resolution in `programHash`.
-fn target_env(target: &Target) -> std::collections::BTreeMap<String, String> {
+pub(crate) fn target_env(target: &Target) -> std::collections::BTreeMap<String, String> {
     let mut env = std::collections::BTreeMap::new();
     for instr in &target.instructions {
         if let crate::dsl::ast::Instruction::Env(e) = instr {
@@ -377,6 +383,171 @@ pub fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// The canonical closure record: sorted, length-prefixed, deterministic; the
+/// shared assembler for full targets and `COMMIT` checkpoint prefixes. ARG is
+/// never folded (identity reflects the substituted form at use sites);
+/// `dep_hash` maps each depended-stage name to its closure, `imports` are the
+/// occurrence-ordered resolved IMPORT digests.
+fn assemble_tag(
+    name: &str,
+    derived: &[u8],
+    platforms: &[Platform],
+    base_ref: &Option<BaseRef>,
+    base_platform: &Option<String>,
+    prog: [u8; 32],
+    stage_deps: &[String],
+    imports: &[String],
+    dep_hash: &dyn Fn(&str) -> Option<[u8; 32]>,
+) -> [u8; 32] {
+    let mut record = Vec::new();
+    push(&mut record, "derivedData", &hex(derived));
+    for p in platforms {
+        push(&mut record, "platform", &p.to_string());
+    }
+    push(&mut record, "program", &hex(&prog));
+    push(&mut record, "basil", BASIL_VERSION);
+    if let Some(BaseRef::External(digest)) = base_ref {
+        push(&mut record, "base.external", digest);
+    }
+    if let Some(BaseRef::Stage(hash)) = base_ref {
+        push(&mut record, &format!("base.stage.{}", stage_clean(name)), hash);
+    }
+    if let Some(BaseRef::Module(hash, _key)) = base_ref {
+        push(&mut record, &format!("base.module.{}", stage_clean(name)), &hex(hash));
+    }
+    if let Some(p) = base_platform {
+        push(&mut record, "base.platform", p);
+    }
+    for dep in stage_deps {
+        if let Some(h) = dep_hash(dep) {
+            push(&mut record, &format!("dep.stage.{}", stage_clean(dep)), &hex(&h));
+        }
+    }
+    for (i, d) in imports.iter().enumerate() {
+        push(&mut record, &format!("import.{}", i + 1), d);
+    }
+    sha256(record_sorted(record))
+}
+
+/// Derive each `COMMIT`'s checkpoint identity: the closure of the instruction
+/// prefix it seals, composed exactly like `compute_closure`'s per-target
+/// record but with the instructions truncated at the commit. The base is
+/// resolved with the target's own name (so the self-name rule — a base naming
+/// its own stage stays external — applies unchanged), stage deps fold from the
+/// already-computed full closures, and external bases/imports fold through the
+/// resolver (a registry pre-pass — never a new fetch). Keyed (stage, seq).
+pub fn compute_checkpoint_closures(
+    targets: &[Target],
+    closures: &std::collections::HashMap<String, [u8; 32]>,
+    file_default_platforms: &[Platform],
+    global_args: &[crate::dsl::ast::Arg],
+    context: &Path,
+    build_file: &Path,
+    overrides: &std::collections::HashMap<String, String>,
+    resolver: &mut dyn BaseResolver,
+    modules: &std::collections::BTreeMap<String, [u8; 32]>,
+) -> Result<std::collections::BTreeMap<(String, usize), [u8; 32]>, String> {
+    let by_name: std::collections::HashMap<&str, &Target> =
+        targets.iter().map(|t| (t.name.as_str(), t)).collect();
+    let repo = derived_data::discover_git(context);
+    let mut out: std::collections::BTreeMap<(String, usize), [u8; 32]> =
+        std::collections::BTreeMap::new();
+    for t in targets {
+        let mut seq = 0usize;
+        for (i, instr) in t.instructions.iter().enumerate() {
+            let crate::dsl::ast::Instruction::Commit = instr else { continue };
+            seq += 1;
+            let mut prefix = t.clone();
+            prefix.instructions.truncate(i); // the COMMIT itself is excluded
+            let (derived, _) = derived_data::derived_data_digest_and_bytes(
+                &prefix,
+                context,
+                build_file,
+                &repo,
+            )
+            .map_err(|e| format!("`COMMIT #{seq}` in `{}`: {e}", t.name))?;
+            let args = Args::from_target(&prefix, global_args, overrides);
+            let vctx = VarCtx { args: args.map.clone(), env: target_env(&prefix) };
+            let prog = program_hash::program_hash(&prefix.instructions, &|k| vctx.resolve(k));
+            let (base_ref, base_platform) = match &t.base {
+                crate::dsl::ast::Base::Image(crate::dsl::ast::BaseImage { raw, tag, digest, platform }) => {
+                    let base_ref = match by_name.get(raw.as_str()).map(|t| t.name.as_str()) {
+                        Some(bs) if bs != t.name.as_str() => {
+                            let h = closures.get(bs).ok_or_else(|| {
+                                format!("`COMMIT #{seq}` in `{}`: stage base `{bs}` has no closure", t.name)
+                            })?;
+                            Some(BaseRef::Stage(hex(h)))
+                        }
+                        _ => Some(BaseRef::External(
+                            resolver
+                                .resolve(raw, tag.as_deref(), digest.as_deref())
+                                .map_err(|e| format!("`{raw}`: {e}"))?,
+                        )),
+                    };
+                    (base_ref, platform.clone())
+                }
+                crate::dsl::ast::Base::Module(m) => {
+                    let key = crate::identity::modules::module_key(
+                        build_file.parent().unwrap_or(std::path::Path::new(".")),
+                        m,
+                    )
+                    .map_err(|e| format!("module base: {e}"))?;
+                    let hash = modules.get(&key).ok_or_else(|| {
+                        format!("`COMMIT #{seq}` in `{}`: module `{}` has no digest", t.name, m.path)
+                    })?;
+                    (Some(BaseRef::Module(*hash, key)), None)
+                }
+            };
+            // Prefix-scoped stage deps: `COPY --from` sources within the prefix
+            // (the FROM base is the base_ref above).
+            let mut deps: Vec<String> = Vec::new();
+            for instr in &prefix.instructions {
+                if let crate::dsl::ast::Instruction::Copy(c) = instr {
+                    if let Some(from) = &c.from {
+                        if by_name.contains_key(from.as_str()) && from.as_str() != t.name.as_str() {
+                            deps.push(from.clone());
+                        }
+                    }
+                }
+            }
+            deps.sort();
+            deps.dedup();
+            // Prefix-scoped imports.
+            let mut imports: Vec<String> = Vec::new();
+            for instr in &prefix.instructions {
+                if let crate::dsl::ast::Instruction::Import(im) = instr {
+                    if let Some(st) = by_name.get(im.raw.as_str()) {
+                        if st.name != t.name.as_str() {
+                            return Err(format!(
+                                "IMPORT `{}` (line {}): naming a local stage (`{}`) is not supported",
+                                im.raw, im.line, st.name
+                            ));
+                        }
+                    }
+                    let resolved = resolver
+                        .resolve(im.raw.as_str(), im.tag.as_deref(), im.digest.as_deref())
+                        .map_err(|e| format!("`IMPORT {}` (line {}): {e}", im.raw, im.line))?;
+                    imports.push(resolved);
+                }
+            }
+            let platforms = target_platform_list(t, file_default_platforms);
+            let tag = assemble_tag(
+                &t.name,
+                &derived,
+                &platforms,
+                &base_ref,
+                &base_platform,
+                prog,
+                &deps,
+                &imports,
+                &|dep| closures.get(dep).copied(),
+            );
+            out.insert((t.name.clone(), seq), tag);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -451,6 +622,209 @@ RUN go build\n";
         let f = parse(dsl).unwrap();
         let err = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline(), &BTreeMap::new()).unwrap_err();
         assert!(err.contains("pinned"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_digest_folds_into_tag() {
+        // IMPORT is an instruction in program order AND its resolved digest
+        // folds as `import.<n>` — an unpinned ref must re-hash when the
+        // digest moves (the "latest moves" case).
+        let dir = tiny_ctx("imp");
+        let a = parse("FROM alpine\nIMPORT busybox:1\nRUN echo x\n").unwrap();
+        let b = parse("FROM alpine\nIMPORT busybox:2\nRUN echo x\n").unwrap();
+        let ra = compute_closure(&a.targets, &[], &a.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        let rb = compute_closure(&b.targets, &[], &b.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        assert_ne!(ra["alpine"], rb["alpine"], "moving import tag must change the tagHash");
+        // A pinned import resolves offline (the base must be pinned too).
+        let pinned = parse("FROM alpine@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\nIMPORT busybox:1.36@sha256:1234123412341234123412341234123412341234123412341234123412341234\n").unwrap();
+        let rp = compute_closure(&pinned.targets, &[], &pinned.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline(), &BTreeMap::new()).unwrap();
+        assert_eq!(hex(&rp["alpine"]).len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unpinned_import_requires_resolver_offline() {
+        let dir = tiny_ctx("imp-off");
+        let f = parse("FROM alpine@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\nIMPORT busybox:1.36\n").unwrap();
+        let err = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut offline(), &BTreeMap::new()).unwrap_err();
+        assert!(err.contains("`IMPORT busybox`"), "{err}");
+        assert!(err.contains("pinned"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_naming_a_local_stage_is_rejected() {
+        let dir = tiny_ctx("imp-stage");
+        let dsl = "\
+FROM golang AS build
+RUN echo build
+
+FROM scratch AS ghcr.io/mycompany/app
+IMPORT build
+";
+        let f = parse(dsl).unwrap();
+        let err = compute_closure(&f.targets, &[], &f.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap_err();
+        assert!(err.contains("IMPORT `build`"), "{err}");
+        assert!(err.contains("local stage"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_position_changes_program() {
+        // The same import at a different point in the instruction list is a
+        // different program (order is identity).
+        let dir = tiny_ctx("imp-pos");
+        let before = parse("FROM alpine\nCOPY marker.txt /x\nIMPORT busybox\n").unwrap();
+        let after = parse("FROM alpine\nIMPORT busybox\nCOPY marker.txt /x\n").unwrap();
+        let r1 = compute_closure(&before.targets, &[], &before.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        let r2 = compute_closure(&after.targets, &[], &after.global_args, &dir, std::path::Path::new("__buildfile__"), &HashMap::new(), &mut FakeResolver, &BTreeMap::new()).unwrap();
+        assert_ne!(r1["alpine"], r2["alpine"], "import position must change the tagHash");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_closures_cover_every_commit() {
+        // Each COMMIT yields a (stage, seq) checkpoint closure; stages without
+        // COMMITs contribute none.
+        let dir = tiny_ctx("ckpt-key");
+        let f = parse("FROM alpine\nRUN echo one\nCOMMIT\nRUN echo two\nCOMMIT\nRUN echo three\nFROM alpine AS plain\nRUN echo x\n").unwrap();
+        let tags = compute_closure(
+            &f.targets,
+            &[],
+            &f.global_args,
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut FakeResolver,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let ck = compute_checkpoint_closures(
+            &f.targets,
+            &tags,
+            &[],
+            &f.global_args,
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut FakeResolver,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(ck.contains_key(&("alpine".to_string(), 1)));
+        assert!(ck.contains_key(&("alpine".to_string(), 2)));
+        assert!(!ck.contains_key(&("plain".to_string(), 1)));
+        // Checkpoint closures differ from each other and from the stage tag.
+        assert_ne!(ck[&("alpine".to_string(), 1)], ck[&("alpine".to_string(), 2)]);
+        assert_ne!(ck[&("alpine".to_string(), 1)], tags["alpine"]);
+        // Sealing the prefix later adds no identity to the stage tagHash: the
+        // final image is identical with or without COMMIT.
+        let without = parse("FROM alpine\nRUN echo one\nRUN echo two\nRUN echo three\n").unwrap();
+        let plain = compute_closure(
+            &without.targets,
+            &[],
+            &without.global_args,
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut FakeResolver,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(tags["alpine"], plain["alpine"], "COMMIT must not change the stage tagHash");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_hash_equals_hand_built_prefix() {
+        // A checkpoint closure must equal the closure of the equivalent
+        // prefix-only target: it IS the identity of the sealed prefix. The
+        // self-name rule applies unchanged (a base naming its own stage stays
+        // external).
+        let dir = tiny_ctx("ckpt");
+        let pinned = "FROM alpine@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let with_commit = parse(&format!("{pinned}\nRUN echo a\nCOMMIT\nRUN echo b\n")).unwrap();
+        let manual_prefix = parse(&format!("{pinned}\nRUN echo a\n")).unwrap();
+        let tags = compute_closure(
+            &with_commit.targets,
+            &[],
+            &with_commit.global_args,
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut offline(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let ck = compute_checkpoint_closures(
+            &with_commit.targets,
+            &tags,
+            &[],
+            &with_commit.global_args,
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut offline(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let manual = compute_closure(
+            &manual_prefix.targets,
+            &[],
+            &manual_prefix.global_args,
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut offline(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            ck[&("alpine".to_string(), 1)], manual["alpine"],
+            "checkpoint closure must equal the explicit prefix closure"
+        );
+        // Self-name rule: `FROM alpine AS alpine` + COMMIT — the checkpoint
+        // stays external (foils the phantom-stage trap of cloned names).
+        let self_named = parse("FROM alpine AS alpine\nRUN echo a\nCOMMIT\nRUN echo b\n").unwrap();
+        let tags2 = compute_closure(
+            &self_named.targets,
+            &[],
+            &self_named.global_args,
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut FakeResolver,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let ck2 = compute_checkpoint_closures(
+            &self_named.targets,
+            &tags2,
+            &[],
+            &self_named.global_args,
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut FakeResolver,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let manual2 = compute_closure(
+            &parse("FROM alpine AS alpine\nRUN echo a\n").unwrap().targets,
+            &[],
+            &[],
+            &dir,
+            std::path::Path::new("__buildfile__"),
+            &HashMap::new(),
+            &mut FakeResolver,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            ck2[&("alpine".to_string(), 1)], manual2["alpine"],
+            "self-named checkpoint must resolve its base as external"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

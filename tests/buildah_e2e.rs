@@ -3,7 +3,7 @@
 //! digest match basil's closure tagHash. Skipped when `buildah` is unavailable
 //! or the local registry is not reachable.
 
-use basil::solver::orchestrate::{BuildInput, handle_event};
+use basil::solver::orchestrate::{BuildInput, build_targets, handle_event};
 use serde_json::Value;
 
 /// All buildah-backed tests share one global containers/storage, and the OUTPUT
@@ -181,6 +181,20 @@ async fn local_untagged_image_count() -> usize {
         .count()
 }
 
+/// All locally untagged (`<none>`) image IDs — to identify what leaked.
+async fn untagged_image_names() -> Vec<String> {
+    let out = tokio::process::Command::new("buildah")
+        .args(["images", "--format", "{{.ID}} {{.Name}}"])
+        .output()
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("<none>"))
+        .map(|l| l.to_string())
+        .collect()
+}
+
 /// All local image names (`buildah images --format {{.Name}}`), for asserting
 /// no temp tag was minted.
 async fn local_image_names() -> Vec<String> {
@@ -254,7 +268,9 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
     assert_eq!(
         local_untagged_image_count().await,
         untagged_before,
-        "per-stage cache builds must be pushed, not left untagged (untagged count grew)"
+        "per-stage cache builds must be pushed, not left untagged (was {untagged_before}, now {}); untagged IDs: {:?}",
+        local_untagged_image_count().await,
+        untagged_image_names().await
     );
     assert_eq!(
         local_container_count().await,
@@ -303,6 +319,523 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
         containers_before2,
         "noop extraction must not leave a container behind"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// IMPORT inlines another image's rootfs at a point in the build. The
+/// deliverable is built imperatively (buildah from/config/copy/run/add), the
+/// import overwrites earlier content (layer-append semantics), a later RUN
+/// sees the merged rootfs, and the idempotent skip stays intact.
+const IMPORT_BASILFILE: &str = "FROM alpine AS 127.0.0.1:5001/bah_e2e_import\n\
+COPY src.txt /out.txt\n\
+COPY pre.txt /imported.txt\n\
+IMPORT 127.0.0.1:5001/importsrc\n\
+RUN sh -c 'cat /out.txt /imported.txt > /merged.txt'\n\
+CMD [\"/bin/cat\",\"/merged.txt\"]\n\
+ON push(main) BUILD 127.0.0.1:5001/bah_e2e_import\n";
+
+/// Seed the import source image in the local registry: an alpine image
+/// carrying `/imported.txt` (the string the e2e assertions look for).
+async fn seed_importsrc() -> anyhow::Result<()> {
+    let marker = std::env::temp_dir().join(format!("basil-importsrc-{}", std::process::id()));
+    std::fs::write(&marker, "from-import\n").unwrap();
+    let c = tokio::process::Command::new("buildah")
+        .args(["from", "alpine"])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("buildah from: {e}"))?;
+    let container = String::from_utf8_lossy(&c.stdout).trim().to_string();
+    let _ = tokio::process::Command::new("buildah")
+        .args(["copy", &container, marker.to_str().unwrap(), "/imported.txt"])
+        .status()
+        .await;
+    let _ = tokio::process::Command::new("buildah")
+        .args(["commit", "--format=oci", &container, "127.0.0.1:5001/importsrc:latest"])
+        .status()
+        .await;
+    let _ = tokio::process::Command::new("buildah").args(["rm", &container]).status().await;
+    let push = tokio::process::Command::new("buildah")
+        .args(["push", "--tls-verify=false", "127.0.0.1:5001/importsrc:latest", "docker://127.0.0.1:5001/importsrc:latest"])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("spawning buildah push: {e}"))?;
+    if !push.status.success() {
+        anyhow::bail!("seed push failed: {}", String::from_utf8_lossy(&push.stderr).trim());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildah_e2e_import_inlines_content() {
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    seed_importsrc().await.unwrap();
+    let dir = tempfile();
+    std::fs::write(dir.join("Basilfile"), IMPORT_BASILFILE).unwrap();
+    std::fs::write(dir.join("src.txt"), "hello import\n").unwrap();
+    std::fs::write(dir.join("pre.txt"), "pre-import\n").unwrap();
+    let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
+    let event = r#"{"ref":"refs/heads/main","before":"0","after":"1"}"#;
+    let inp = BuildInput {
+        file: &file_str,
+        context: &dir,
+        event_json: Some(event),
+        target_filter: None,
+        force: false,
+        cache_to: None,
+    };
+
+    let results = handle_event(inp.clone()).await.unwrap();
+    let digest = results
+        .iter()
+        .find(|(k, _)| k == "digest")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let ref_str = format!("127.0.0.1:5001/bah_e2e_import:basil-{digest}");
+    // Pull the pushed image and inspect its content: the context COPY, the
+    // import (which inlined ON TOP, overwriting the pre-import file), and the
+    // RUN that saw the merged rootfs.
+    let c = tokio::process::Command::new("buildah")
+        .args(["from", "--tls-verify=false", "--pull=true", &ref_str])
+        .output()
+        .await
+        .unwrap();
+    assert!(c.status.success(), "pull failed: {}", String::from_utf8_lossy(&c.stderr));
+    let container = String::from_utf8_lossy(&c.stdout).trim().to_string();
+    let out = tokio::process::Command::new("buildah")
+        .args(["run", &container, "--", "/bin/sh", "-c", "cat /out.txt; echo ---; cat /imported.txt; echo ---; cat /merged.txt"])
+        .output()
+        .await
+        .unwrap();
+    let _ = tokio::process::Command::new("buildah").args(["rm", &container]).status().await;
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("hello import"), "context COPY missing: {text}");
+    assert!(
+        text.contains("from-import"),
+        "IMPORT content missing — the inlined rootfs must be present: {text}"
+    );
+    assert!(
+        !text.contains("pre-import"),
+        "pre-import content must be overwritten by the import (layer-append): {text}"
+    );
+    assert!(
+        text.matches("hello import").count() >= 2 || text.contains("hello import\nfrom-import"),
+        "RUN must see the merged rootfs: {text}"
+    );
+
+    // Idempotent skip: second delivery noops; the content tag stays pullable.
+    let results2 = handle_event(inp.clone()).await.unwrap();
+    assert_eq!(
+        results2.iter().find(|(k, _)| k == "result").map(|(_, v)| v.as_str()),
+        Some("idempotent-skip")
+    );
+
+    // Deleted content tag -> the next delivery must rebuild and re-register
+    // (the invariant: if the image does not exist it must be built).
+    let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
+    c.delete_tag("bah_e2e_import", &format!("basil-{digest}")).await.unwrap();
+    let results3 = handle_event(inp.clone()).await.unwrap();
+    assert!(
+        results3.iter().all(|(k, _)| k != "result"),
+        "deleted artifact must rebuild (no idempotent-skip), got {results3:?}"
+    );
+    let (_, manifest) = c.get_manifest("bah_e2e_import", &format!("basil-{digest}")).await.unwrap();
+    assert!(!manifest.is_empty(), "rebuilt image must be registered again");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An IMPORT in an *intermediate* stage: the stage is built imperatively, its
+/// cache image (`basil-cache-<stageHash>`) is pushed to the registry, the
+/// deliverable's Containerfile skips the stage and remaps `COPY --from` to
+/// the cache ref, and OUTPUT extraction pulls the cache image.
+const IMPORT_STAGE_BASILFILE: &str = "FROM alpine AS builder\n\
+IMPORT 127.0.0.1:5001/importsrc\n\
+RUN sh -c 'echo built > /built.txt'\n\
+OUTPUT /imported.txt out/imported.txt\n\
+OUTPUT /built.txt out/built.txt\n\
+\n\
+FROM scratch AS 127.0.0.1:5001/bah_e2e_imp2\n\
+COPY --from=builder /imported.txt /a.txt\n\
+COPY --from=builder /built.txt /b.txt\n\
+ON push(main) BUILD 127.0.0.1:5001/bah_e2e_imp2\n";
+
+#[tokio::test]
+async fn buildah_e2e_import_intermediate_stage() {
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    seed_importsrc().await.unwrap();
+    let dir = tempfile();
+    std::fs::write(dir.join("Basilfile"), IMPORT_STAGE_BASILFILE).unwrap();
+    let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
+    let event = r#"{"ref":"refs/heads/main","before":"0","after":"1"}"#;
+    let inp = BuildInput {
+        file: &file_str,
+        context: &dir,
+        event_json: Some(event),
+        target_filter: None,
+        force: false,
+        cache_to: None,
+    };
+
+    handle_event(inp.clone()).await.unwrap();
+    // OUTPUT from the import stage extracts out of its published cache image
+    // (a pull, never a rebuild): the files prove the cache image carries the
+    // inlined import content AND the stage's own RUN output.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out/imported.txt")).unwrap().trim(),
+        "from-import"
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("out/built.txt")).unwrap().trim(), "built");
+
+    // The intermediate stage's cache image is published under the basil-cache
+    // namespace (at least one: seed_importsrc rebuilds importsrc with a fresh
+    // config timestamp every run, so a rerun legitimately mints a new stage
+    // hash and a second cache tag).
+    let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
+    let cache_tags: Vec<String> = c
+        .list_tags("bah_e2e_imp2")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.starts_with("basil-cache-"))
+        .collect();
+    assert!(!cache_tags.is_empty(), "builder cache image must be published: {cache_tags:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `basil run` runs a target's `TASK` on the resolved base, building every
+/// dependent thing the standard way: here an internal `FROM <stage>` base is
+/// reconciled as a `basil-cache-<stageHash>` cache image in the cache repo,
+/// the task container shows that stage's built content and the BASIL_TARGET
+/// env, and only the run target itself is never published.
+const RUN_BASILFILE: &str = "FROM alpine AS base\n\
+RUN sh -c 'echo base-content > /b.txt'\n\
+\n\
+FROM base AS runner\n\
+TASK sh -c 'grep -q base-content /b.txt && [ \"$BASIL_TARGET\" = runner ] && echo RUN_OK'\n";
+
+#[tokio::test]
+async fn buildah_e2e_run_builds_dependencies_and_runs_task() {
+    if !buildah_present() {
+        eprintln!("skipping: buildah unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    let dir = tempfile();
+    std::fs::write(dir.join("Basilfile"), RUN_BASILFILE).unwrap();
+    let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
+    let cache_repo = "127.0.0.1:5001/bah_e2e_run_cache";
+
+    // The internal base stage is built and its cache image published to the
+    // cache repo (its /b.txt is visible to the task); the task succeeds.
+    let code = basil::solver::orchestrate::run_target(&file_str, &dir, "runner", Some(cache_repo))
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "task must run against the built base stage");
+    let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
+    let cache_tags: Vec<String> = c
+        .list_tags("bah_e2e_run_cache")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.starts_with("basil-cache-"))
+        .collect();
+    assert!(
+        !cache_tags.is_empty(),
+        "the dependent stage must be published as a cache image: {cache_tags:?}"
+    );
+    // The run target itself is never published.
+    assert!(
+        c.list_tags("runner").await.is_err(),
+        "the run target must not be published"
+    );
+
+    // A failing task fails the invocation.
+    let bad = tempfile();
+    std::fs::write(
+        bad.join("Basilfile"),
+        "FROM alpine AS failing\nTASK sh -c 'exit 7'\n",
+    )
+    .unwrap();
+    let bad_file = bad.join("Basilfile").to_str().unwrap().to_string();
+    let err = basil::solver::orchestrate::run_target(&bad_file, &bad, "failing", None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("exit 7"), "task failure must surface: {err:#}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&bad);
+}
+
+/// `COMMIT` checkpoints the build so far into the layer cache: build 1 seals
+/// the prefix as a `basil-cache-<prefixHash>` image (same namespace as stage
+/// caches); a later build resumes from that checkpoint — the `RUN` before it
+/// (which stamps a nanosecond timestamp into the file) is NOT re-executed, so
+/// the rebuilt content is byte-identical.
+#[tokio::test]
+async fn buildah_e2e_commit_resumes_from_checkpoint() {
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    // The registry outlives test runs; start from a clean repo so the
+    // checkpoint-local / stage-cache-remote assertions are exact.
+    let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
+    if let Ok(tags) = c.list_tags("bah_e2e_commit").await {
+        for t in tags {
+            let _ = c.delete_tag("bah_e2e_commit", &t).await;
+        }
+    }
+    // Pin the alpine base so the stage closure (the stage cache tag) is
+    // computable offline in the test.
+    let alpine_digest = basil::solver::registry::parse_ref("alpine", "latest")
+        .unwrap()
+        .resolve_digest()
+        .await
+        .unwrap();
+    let build_file_txt = format!(
+        "FROM alpine@{alpine_digest} AS build\n\
+RUN sh -c 'echo step1 > /s1.txt && date +%s%N >> /s1.txt'\n\
+COMMIT\n\
+RUN sh -c 'cat /s1.txt > /s2.txt'\n\
+\n\
+FROM scratch AS 127.0.0.1:5001/bah_e2e_commit\n\
+COPY --from=build /s2.txt /out.txt\n\
+ON push(main) BUILD 127.0.0.1:5001/bah_e2e_commit\n"
+    );
+    let dir = tempfile();
+    std::fs::write(dir.join("Basilfile"), &build_file_txt).unwrap();
+    let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
+    let event = r#"{"ref":"refs/heads/main","before":"0","after":"1"}"#;
+    let inp = BuildInput {
+        file: &file_str,
+        context: &dir,
+        event_json: Some(event),
+        target_filter: None,
+        force: false,
+        cache_to: None,
+    };
+
+    // Build 1: full run; the COMMIT checkpoints the prefix into the LOCAL
+    // layer cache (`basil-checkpoint-<prefixHash>` — never pushed). The
+    // registry sees only the stage cache tag + the content tag.
+    let r1 = handle_event(inp.clone()).await.unwrap();
+    let digest = r1
+        .iter()
+        .find(|(k, _)| k == "digest")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let cache_tags: Vec<String> = c
+        .list_tags("bah_e2e_commit")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.starts_with("basil-cache-"))
+        .collect();
+    assert_eq!(cache_tags.len(), 1, "only the stage cache is pushed (checkpoints are local): {cache_tags:?}");
+    assert!(
+        !cache_tags.iter().any(|t| t.starts_with("basil-checkpoint")),
+        "checkpoints must never be pushed: {cache_tags:?}"
+    );
+    let parsed = basil::dsl::parser::parse(&build_file_txt).unwrap();
+    struct Pinned;
+    impl basil::identity::closure::BaseResolver for Pinned {
+        fn resolve(&mut self, raw: &str, _t: Option<&str>, d: Option<&str>) -> Result<String, String> {
+            if raw == "scratch" {
+                return Ok("scratch-empty".to_string());
+            }
+            d.map(|d| d.to_string()).ok_or_else(|| "pinned only".to_string())
+        }
+    }
+    let closures = basil::identity::closure::compute_closure(
+        &parsed.targets,
+        &[],
+        &parsed.global_args,
+        &dir,
+        &dir.join("Basilfile"),
+        &std::collections::HashMap::new(),
+        &mut Pinned,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let stage_tag =
+        format!("basil-cache-{}", basil::identity::closure::hex(&closures["build"]));
+    assert!(cache_tags.contains(&stage_tag), "{stage_tag} not in {cache_tags:?}");
+    // The checkpoint ref is derived from the prefix closure and lives locally.
+    let ck = basil::identity::closure::compute_checkpoint_closures(
+        &parsed.targets,
+        &closures,
+        &[],
+        &parsed.global_args,
+        &dir,
+        &dir.join("Basilfile"),
+        &std::collections::HashMap::new(),
+        &mut Pinned,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let checkpoint_ref = format!(
+        "basil-checkpoint-{}",
+        basil::identity::closure::hex(&ck[&("build".to_string(), 1)])
+    );
+    assert!(
+        local_image_named(&checkpoint_ref).await,
+        "checkpoint must exist in local storage: {checkpoint_ref}"
+    );
+
+    // Save the sealed prefix's content (a nanosecond timestamp). If build 2
+    // re-ran the prefix, this would differ.
+    let marker = run_grep_marker(&checkpoint_ref, "/s1.txt").await;
+    assert!(marker.starts_with("step1"), "{marker}");
+
+    // Force a rebuild: delete the stage cache (so the stage must rebuild) and
+    // the content tag (so the idempotent check does not skip); keep the
+    // checkpoint tag so build 2 resumes from it.
+    c.delete_tag("bah_e2e_commit", &stage_tag).await.unwrap();
+    c.delete_tag("bah_e2e_commit", &format!("basil-{digest}")).await.unwrap();
+
+    let r2 = handle_event(inp.clone()).await.unwrap();
+    let digest2 = r2
+        .iter()
+        .find(|(k, _)| k == "digest")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(digest2, digest, "resumed rebuild must derive the same content tag");
+    let (_, manifest) = c.get_manifest("bah_e2e_commit", &format!("basil-{digest2}")).await.unwrap();
+    assert!(!manifest.is_empty(), "rebuilt deliverable must be registered");
+
+    // The rebuilt stage cache carries the SAME prefix content — proof the
+    // checkpoint was resumed, not re-executed.
+    let marker2 = run_grep_marker(&format!("127.0.0.1:5001/bah_e2e_commit:{stage_tag}"), "/s1.txt").await;
+    assert_eq!(
+        marker2, marker,
+        "prefix must be resumed from the checkpoint, not re-run (timestamps differ)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `buildah from <ref>` (local-first; pulls with the insecure allow for
+/// localhost registries) + `cat <path>`, returning trimmed content.
+async fn run_grep_marker(ref_str: &str, path: &str) -> String {
+    let c = tokio::process::Command::new("buildah")
+        .args(["from", "--tls-verify=false", ref_str])
+        .output()
+        .await
+        .unwrap();
+    assert!(c.status.success(), "from {ref_str}: {}", String::from_utf8_lossy(&c.stderr));
+    let container = String::from_utf8_lossy(&c.stdout).trim().to_string();
+    let out = tokio::process::Command::new("buildah")
+        .args(["run", &container, "--", "/bin/cat", path])
+        .output()
+        .await
+        .unwrap();
+    let _ = tokio::process::Command::new("buildah").args(["rm", &container]).status().await;
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Whether a ref names a locally-stored image (buildah's layer cache). Bare
+/// names normalize to `localhost/<name>` in listings.
+async fn local_image_named(name: &str) -> bool {
+    let out = tokio::process::Command::new("buildah")
+        .args(["images", "--format", "{{.Name}}"])
+        .output()
+        .await
+        .unwrap();
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+    names.iter().any(|n| n == name) || names.iter().any(|n| n == &format!("localhost/{name}"))
+}
+
+/// A REGISTERed stage used as a dependency (COPY --from) is a published
+/// deliverable, never an intermediate cache image: `build -t app` builds it
+/// as the deliverable (published at `<register>:basil-<hash>`), then the
+/// dependent pulls that artifact. `basil run` uses the same caching; the only
+/// difference is that deliverables are not run targets.
+const REGDEP_BASILFILE: &str = "FROM alpine AS app_bin\n\
+RUN sh -c 'echo registered-content > /r.txt'\n\
+\n\
+FROM alpine AS helper\n\
+RUN sh -c 'echo helper-content > /h.txt'\n\
+\n\
+FROM app_bin AS reg\n\
+COPY --from=helper /h.txt /h.txt\n\
+REGISTER 127.0.0.1:5001/bah_e2e_regdep\n\
+\n\
+FROM app_bin AS app\n\
+COPY --from=reg /r.txt /r.txt\n\
+COPY --from=reg /h.txt /h.txt\n\
+REGISTER 127.0.0.1:5001/bah_e2e_regdep_app\n";
+
+#[tokio::test]
+async fn buildah_e2e_registered_stage_dependency_uses_published_ref() {
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    let dir = tempfile();
+    std::fs::write(dir.join("Basilfile"), REGDEP_BASILFILE).unwrap();
+    let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
+    let filter = "app".to_string();
+    let inp = BuildInput {
+        file: &file_str,
+        context: &dir,
+        event_json: None,
+        target_filter: Some(&filter),
+        force: false,
+        cache_to: Some("127.0.0.1:5001/bah_e2e_regdep_cache"),
+    };
+    let results = build_targets(inp).await.unwrap();
+    let app_tag = results
+        .iter()
+        .find(|(k, _)| k == "app")
+        .map(|(_, v)| v.clone())
+        .expect("build_targets reports the app content tag");
+    // The build path returns the bare digest; the idempotent-skip path the
+    // namespaced `basil-<hash>`. Accept both.
+    let app_tag = app_tag.strip_prefix("basil-").unwrap_or(&app_tag).to_string();
+    assert!(
+        app_tag.len() == 64 && app_tag.chars().all(|c| c.is_ascii_hexdigit()),
+        "app content tag malformed: {app_tag}"
+    );
+
+    let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
+    let is_content_tag = |t: &str| {
+        t.strip_prefix("basil-")
+            .is_some_and(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    // The registered stage is published at its content tag under its REGISTER
+    // repo...
+    let reg_tags = c.list_tags("bah_e2e_regdep").await.unwrap();
+    assert!(
+        reg_tags.iter().any(|t| is_content_tag(t)),
+        "registered stage must be published, got {reg_tags:?}"
+    );
+    // ...and never as an intermediate cache image.
+    assert!(
+        !reg_tags.iter().any(|t| t.starts_with("basil-cache-")),
+        "registered stage must not be cache-reconciled: {reg_tags:?}"
+    );
+    // The app image folded the registered stage's content: both files must be
+    // present in the published artifact.
+    let marker = format!("127.0.0.1:5001/bah_e2e_regdep_app:basil-{app_tag}");
+    let r = run_grep_marker(&marker, "/r.txt").await;
+    assert_eq!(r, "registered-content", "app must contain /r.txt from the registered stage: {r}");
+    let h = run_grep_marker(&marker, "/h.txt").await;
+    assert_eq!(h, "helper-content", "app must contain /h.txt from the registered stage: {h}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

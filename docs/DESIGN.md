@@ -114,9 +114,15 @@ a declared allowlist. Per target `T`:
 C(T) = derivedData(T)
        ∪ C(B)   for every depended stage B          // FROM <stage>, COPY --from=<stage>
        ∪ { resolvedDigest(X) }  for external bases  // FROM <image>
+       ∪ { resolvedDigest(X) }  for every IMPORT    // IMPORT <image>, occurrence-ordered
        ∪ platforms(T)                              // declared build platforms
        ∪ programHash(T)                            // ordered, arg-expanded instructions
        ∪ { basil-version }
+
+Each `COMMIT` in a target additionally derives the closure of the instruction
+*prefix* it seals — C(prefix) — computed by the same component formula (the
+sealed content is exactly that prefix's image). `COMMIT` itself never enters
+programHash, so the stage's tagHash is identical with or without it.
 ```
 
 - **`derivedData`** — the exact context files each instruction reads, resolved
@@ -203,17 +209,21 @@ checked-in golden inputs whose expected digest the test suite recomputes.
    foreign 64-hex tag is never mistaken for basil's.
    **Deliverable targets only.** One platform → a single image; several → an OCI
     index. Checked first; on hit, the idempotent check skips the rebuild.
-2. **Intermediate cache** — every non-deliverable stage in the build graph is
+2. **Intermediate cache** — every non-registered stage in the build graph is
    exported as `<repo>:basil-cache-<stageHash>`, where `<repo>` is the
    deliverable's repo by default (the `--cache-to` flag or `BASIL_CACHE_REF`
    override it). Reconcile-by-existence: a missing cache image for a stage is
-   built (`--target <stage>`) and pushed on any build path *including the
+   built per-instruction and pushed on any build path *including the
    idempotent skip*; stages are regenerable, so `basil gc` may reap them by
-   age. The deliverable's Containerfile renders `FROM
-   <repo>:basil-cache-<stageHash>` for internal bases, so the final build pulls
-   its intermediates instead of rebuilding them — cross-run and cross-machine
-   reuse. `OUTPUT` extraction reads the same cache refs (a pull, never a
-   rebuild).
+   age. The deliverable's build starts from `FROM <repo>:basil-cache-<stageHash>`
+   for internal bases, so the final build pulls its intermediates instead of
+   rebuilding them — cross-run and cross-machine reuse. `OUTPUT` extraction
+   reads the same cache refs (a pull, never a rebuild).
+   **REGISTERed stages are never cached as intermediates**: they are published
+   deliverables, so dependents use their `<register>:basil-<hash>` content
+   artifact (use-or-build, mirroring module deps). Same rule on the manual
+   `basil run <target>` path — build and `run` share the caching; the only
+   difference is that deliverables are not run targets.
 
 **`FROM` — three cases.**
 
@@ -235,6 +245,35 @@ fetch. An unpinned base needs its manifest resolved (a metadata read, never a
 layer download) before `tagHash` exists, so Level 1 is not offline for those
 targets. Multi-arch tags fold the index digest (platform-agnostic, still a full
 commitment).
+
+## `IMPORT` — inlining an image mid-build
+
+`IMPORT <image>` inlines the root filesystem content of another image at that
+point in the build: the import's files land on top of the working rootfs
+(imported files overwrite existing paths — layer-append semantics), and every
+instruction after it sees the merged rootfs. It is a **content** operation: the
+import image's config (`ENV`/`CMD`/…) does not transfer. Materialization is a
+new image layer carrying the import's flattened content — the import's original
+layer digests are not re-added individually.
+
+- **Identity**: each import folds its *resolved manifest digest* as
+  `import.<n>` (occurrence order) — an unpinned ref (`IMPORT foo:latest`)
+  re-hashes when the tag moves. Pinned imports resolve offline; unpinned ones
+  need the same registry resolution as `FROM` (the offline `closure` path
+  errors on them). `IMPORT`'s position is in `programHash` (order is
+  identity). Stage-name refs are rejected: inlining a stage's own layers is
+  what `COPY --from=<stage>` already does.
+- **One execution model**: every build is imperative — basil drives buildah
+  per-instruction over a working container (from/config/copy/run/add/commit)
+  with `ARG`/`ENV` substitution identical to `programHash`; no Containerfile is
+  ever rendered, and `IMPORT` is just one instruction among the rest.
+- **Parity with what a Containerfile would do**: `COPY`/`ADD` copy the exact
+  dockerignore-filtered file set identity hashes (per-file, dest placement
+  reconstructed), `RUN` gets the same mounts (`--mount` bind/cache, secrets via
+  a single-file `--volume` — `buildah run` has no `--secret`), declared build
+  args are exposed as run env like `buildah bud`'s build-args, `FROM
+  <stage>`/`COPY --from=<stage>` resolve to the stage's published cache image,
+  and `--force`/idempotent-skip/`OUTPUT`/promotion behave identically.
 
 ## `RUN` and non-hermeticity (tools, not a gate)
 
@@ -281,25 +320,42 @@ require it:
 
 ## Build backend (buildah)
 
-- **Execution**: basil renders the target graph to a multi-stage Containerfile
-  and runs `buildah build --layers` (a plain subprocess over rootless
-  containers/storage + runc/crun), then `buildah push`. No daemon, no graph
-  protocol, no tunnel. **buildah is the only execution backend** — basil no
-  longer depends on buildkit/buildkitd, an LLB emitter, a gateway bridge, or a
-  vendored proto/tonic stack.
+- **Execution**: basil drives `buildah` per-instruction over a working
+  container (plain subprocesses over rootless containers/storage + runc/crun):
+  `buildah from` the resolved base (platform selector and ref as separate
+  argv), `buildah config` for image-config instructions, `buildah copy`/`add`
+  for `COPY`/`ADD`, `buildah run` for `RUN`, `buildah add --from <img> <ctr> /
+  /` for an `IMPORT`, `buildah commit` to the target ref — then `buildah
+  push`. **No Containerfile is ever rendered.** No daemon, no graph protocol,
+  no tunnel. **buildah is the only execution backend** — basil no longer
+  depends on buildkit/buildkitd, an LLB emitter, a gateway bridge, or a
+  vendored proto/tonic stack, and not even on `buildah bud`.
 - **Identity**: basil still computes each target's `tagHash` from `derivedData`
   + `programHash` + bases + args (a derived content hash it owns), and pushes
   under `<name>:<tagHash>`. Config (`ENV`/`CMD`/`ENTRYPOINT`/…) is written
   natively by buildah.
 - **Idempotent check**: before building, if every deliverable's content tag
   already exists in its registry, basil skips the rebuild (and still runs
-  `OUTPUT`/promotion by pulling the published image).
-- **Renderer scope**: the rendered Containerfile covers the in-scope
-  instructions; basil-only directives (`ON`, `TASK`, `PLATFORM`, `OUTPUT`) are
-  stripped from the Containerfile and handled by basil directly. `RUN`
-  `--mount=type=bind|cache|secret|ssh` and `--network=none|host|default` are
-  rendered to buildah (secrets supplied via `BASIL_SECRET_<ID>`, ssh via
-  `--ssh`).
+  `OUTPUT`/promotion by pulling the published image). An image already in
+  local storage at the content ref is pushed without replaying the build.
+- **Instruction fidelity** (imperative mirrors the Containerfile semantics):
+  `ARG`/`ENV` substitution mirrors `programHash` byte-for-byte; context
+  `COPY`/`ADD` copy the exact dockerignore-filtered file set identity hashes,
+  per-file with Docker's dest placement reconstructed; `RUN`
+  `--mount=type=bind|cache` and `--network=none|host|default` pass through,
+  secrets mount via a single-file `--volume` (`buildah run` has no `--secret`;
+  the file exists only during the run and never lands in the image), and
+  `RUN --mount=type=ssh` is a hard error (buildah run has no ssh mount).
+  `FROM --platform` selectors pass to `buildah from`; the build-staged
+  `$BUILDPLATFORM`/`$TARGETPLATFORM` variables expand to the host platform
+  (the value bud would assume without a `--platform` flag).
+- **`IMPORT`**: the same execution model — one instruction among the rest. The
+  import image is pulled when needed (`localhost`/insecure refs get an
+  explicit `--tls-verify=false` pull: `buildah copy/add --from` pull, but
+  their internal pull has no http-localhost autodetect) and its rootfs is
+  inlined via `buildah add --from <img> <ctr> / /`.
+
+**Deferred** (parse-time error)
 
 **Deferred** (parse-time error)
 
@@ -308,9 +364,10 @@ require it:
 
 **Correctness surface**
 
-- Renderer fidelity: multi-stage `COPY --from`, `ARG`/`ENV` expansion, shell-vs-
-  exec command normalization, and that basil-only instructions never leak into
-  the Containerfile.
+- Instruction fidelity: multi-stage `COPY --from` (resolving to published
+  cache images), `ARG`/`ENV` expansion, shell-vs-exec command normalization,
+  dockerignore-honest context copies, and that no Containerfile (or temp
+  artifact) is ever involved.
 
 **Test strategy**
 
@@ -346,6 +403,20 @@ require it:
   the file; the DSL file defaults to `<context>/Basilfile`, docker-style;
   `--force` rebuilds and re-pushes even when every content tag already
   exists).
+- Manual task run = `basil run <target> [-f FILE] [CONTEXT] [--cache-to REPO]`
+  runs a target's `TASK` clause in a one-shot container without an event. The
+  target need not be a deliverable and is never published. Registered targets
+  are excluded: a `REGISTER` clause marks a published deliverable, and `basil
+  run` refuses them (the manual `DO` is for non-published targets). Everything
+  the task depends on is built the standard way: an internal `FROM <stage>`
+  base (and its transitive stage deps) is reconciled as a
+  `basil-cache-<stageHash>` cache image in the cache repo (`--cache-to`, else
+  `BASIL_CACHE_REF`, else the target's own repo when it is a qualified ref),
+  and a module base is built use-or-build. REGISTERed stages in the subset
+  follow the build path's caching: they resolve to their published
+  `<register>:basil-<hash>` artifact (use-or-build), never a cache image. The
+  task then runs on the resolved base image; `BASIL_TARGET=<name>` is set; a
+  non-zero task exit fails the invocation.
 
 ## Promotion (version tags)
 
@@ -425,14 +496,18 @@ so it never matches today.)
   are pushed (default: the deliverable's fully-qualified repo); basil appends
   the `basil-cache-…` tags and uses the same operator credentials, never a
   separate set.
-- **Build layer cache**: `buildah build --layers` reuses the operator's local
-  `containers/storage` layer cache. The idempotent check (content tag exists)
-  already skips the entire build.
+- **Build layer cache**: `COMMIT` provides it — the working container is
+  committed into local containers/storage as a `basil-checkpoint-<hash>`
+  image (never pushed; docker-style caching at group granularity, coarser
+  than per-instruction) and a later build resumes from the deepest existing
+  checkpoint, skipping the sealed prefix. Without checkpoints, caching lives
+  at the stage level: a stage's `basil-cache-<stageHash>` image and the
+  idempotent check (content tag exists) skip the entire rebuild.
 - **Intermediate cache**: every non-deliverable stage is exported under
   `basil-cache-<stageHash>` (one tag per stage), reconciled by existence on both
   build and idempotent-skip paths — a missing stage cache is rebuilt and pushed.
-- **Multiple deliverables** = one rendered multi-stage Containerfile; each
-  deliverable is built and pushed under its content tag.
+- **Multiple deliverables** = one build graph; each deliverable is built and
+  pushed under its content tag.
 
 ## `basil gc` — tag pruning
 

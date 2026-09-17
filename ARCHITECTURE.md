@@ -45,7 +45,7 @@
 **Solver:**
 - Purpose: Orchestrate builds and registry operations: parse → match event → identity → buildah build/push → OUTPUT/tasks → promotion/gc
 - Location: `src/solver/` (`orchestrate.rs`, `buildah.rs`, `registry.rs`, `pin.rs`, `promote.rs`, `gc.rs`)
-- Contains: `BuildInput`, `build_targets`, `handle_event`, dependency subsetting, module use-or-build (`ensure_modules_built`), intermediate-stage cache reconciliation (`ensure_stages_cached`), the Containerfile renderer (`Graph`), the buildah subprocess driver, the registry v2 HTTP client (`RegistryClient`/`ImageRef`), and the pin/promote/gc passes
+- Contains: `BuildInput`, `build_targets`, `handle_event`, dependency subsetting, module use-or-build (`ensure_modules_built`), intermediate-stage cache reconciliation (`ensure_stages_cached`), the per-instruction buildah executor (`imperative.rs`, the only execution model — no Containerfile is ever rendered), the buildah subprocess driver, the registry v2 HTTP client (`RegistryClient`/`ImageRef`), and the pin/promote/gc passes
 - Depends on: `src/dsl/`, `src/identity/`, `src/event/`, `src/fsctx.rs`, tokio, reqwest
 - Used by: `src/main.rs`
 
@@ -69,7 +69,7 @@
 2. `derived_data::derived_data_digest_and_bytes` digests the target's exact context files (`COPY`/`ADD`/bind-mount sources or `GIVEN` paths, dockerignore-filtered) as a synthetic git tree object — `src/identity/derived_data.rs`
 3. `program_hash::program_hash` digests the canonical, ARG/ENV-expanded instruction program — `src/identity/program_hash.rs`
 4. Components are assembled into a sorted, length-prefixed, collision-free record and SHA-256'd → `tagHash` — `src/identity/closure.rs`. The formula:
-   `C(T) = derivedData(T) ∪ C(B)` per depended stage (`FROM <stage>`, `COPY --from=<stage>`) `∪ resolvedDigest(X)` per external base `∪ C(M)` per module base (`MODULE <path>` — the module's deliverable `tagHash`, folded as `base.module.<alias>`) `∪ platforms(T) ∪ programHash(T) ∪ {basil-version}`. ARG declarations are never folded as their own record — only the substituted form at a `$VAR` use site inside an identity-affecting instruction enters identity, so an unreferenced ARG has zero effect.
+   `C(T) = derivedData(T) ∪ C(B)` per depended stage (`FROM <stage>`, `COPY --from=<stage>`) `∪ resolvedDigest(X)` per external base `∪ C(M)` per module base (`MODULE <path>` — the module's deliverable `tagHash`, folded as `base.module.<alias>`) `∪ resolvedDigest(X)` per `IMPORT` (occurrence-ordered `import.<n>`) `∪ platforms(T) ∪ programHash(T) ∪ {basil-version}`. ARG declarations are never folded as their own record — only the substituted form at a `$VAR` use site inside an identity-affecting instruction enters identity, so an unreferenced ARG has zero effect.
 
 **Direct build** (`basil build`):
 1. `build_targets` parses, selects deliverables (qualified `name` or a `REGISTER` ref), and computes the transitive dependency subset when `-t` is given — `src/solver/orchestrate.rs`
@@ -78,7 +78,7 @@
 4. `idempotent_published` HEAD-checks whether every content tag already exists in its registry; if so the build is skipped (`--force` bypasses the probe; modules and intermediate stages are still reconciled by existence on the skip) — `src/solver/orchestrate.rs` + `src/solver/registry.rs`
 5. `ensure_modules_built` probes each `MODULE` dependency's `<push-ref>:basil-<tagHash>` and builds + publishes it when missing (recursive, dependency-first; use-or-build) — `src/solver/orchestrate.rs`
 6. `ensure_stages_cached` probes every non-deliverable stage's `<repo>:basil-cache-<stageHash>`; a missing stage is built `--target <stage>` via `--iidfile` (untagged), pushed to its cache ref, then removed locally — `src/solver/orchestrate.rs` + `src/solver/buildah.rs`
-7. `build_deliverable` renders the stage graph to a multi-stage Containerfile fed on buildah's stdin (`-f -`, no temp file), with internal `FROM <stage>` bases pointing at the published cache refs; if the exact content-tagged image is already in local storage it is pushed without replaying the build, otherwise `buildah build --layers -t <push-ref>:basil-<tag>` then `buildah push` with the operator's auth — `src/solver/buildah.rs`
+7. `build_deliverable` drives the deliverable imperatively — `buildah from` the resolved base (internal `FROM <stage>` bases pointing at the published cache refs), `buildah config`/`copy`/`run`/`add` per instruction, `buildah commit` to the content tag; if the exact content-tagged image is already in local storage it is pushed without replaying the build, then `buildah push` with the operator's auth — `src/solver/buildah.rs` + `src/solver/imperative.rs`
 8. `extract_outputs` runs any `OUTPUT` reverse-copies — the deliverable from its pushed image, intermediate stages from their published cache refs (a pull, never a rebuild) — `src/solver/buildah.rs`
 
 **Event flow** (`basil handle`):
@@ -120,10 +120,10 @@
 - Location: `src/identity/dockerignore.rs`
 - Pattern: Compiled rules (`*`/`?`/`[...]` per component, `**` across separators, `/` anchoring, trailing `/` directories, `!` negation); the last matching rule wins
 
-**`Graph` (Containerfile renderer):**
-- Purpose: Render the in-scope stage graph (targets + file-level global args) to a multi-stage Containerfile, stripping basil-only directives (`ON`, `TASK`, `PLATFORM`, `OUTPUT`, `REGISTER`, `GIVEN`, `MODULE`) that live in basil, not the image
-- Location: `src/solver/buildah.rs`
-- Pattern: Deterministic renderer feeding `buildah build -f -` on stdin; the deliverable is forced last and tagged; internal `FROM <stage>` bases render as the stage's published `basil-cache-<stageHash>` ref (the final build pulls its intermediates), `MODULE` bases as `FROM <module-push-ref>:basil-<tagHash>`; `--target` builds of intermediate stages use the alias-preserving `render_containerfile_all`
+**`Graph` / per-instruction executor:**
+- Purpose: Resolve the in-scope stage graph (targets + file-level global args) to the concrete refs the builder starts from, and drive buildah instruction-by-instruction over a working container — the sole execution model (no Containerfile is rendered)
+- Location: `src/solver/buildah.rs` (`Graph`, `resolve_base_ref`) + `src/solver/imperative.rs` (the executor)
+- Pattern: `buildah from` the resolved base (platform + ref as separate argv; `$BUILDPLATFORM`/`$TARGETPLATFORM` expand to the host platform), `buildah config` for image-config instructions, `buildah copy`/`add` for `COPY`/`ADD` (dockerignore-honest per-file copies with Docker dest placement), `buildah run` for `RUN` (mounts/secrets/network), `buildah add --from <img> <ctr> / /` for `IMPORT`, `buildah commit` to the target ref; internal `FROM <stage>` bases build from the stage's published `basil-cache-<stageHash>` ref, `MODULE` bases from `<module-push-ref>:basil-<tagHash>`
 
 **`ImageRef` / `RegistryClient`:**
 - Purpose: Parse image refs (`[host[:port]/]repo[:tag]`) and speak registry HTTP v2: manifest existence HEAD, tag list/delete, digest resolution, OCI config `created` time, and immutable retag (refuses to overwrite a version tag pointing at a different manifest)
@@ -152,6 +152,11 @@
 - Triggers: a delivered event (stdin or `--event`)
 - Responsibilities: match `ON` reactions, thread `VERSION` for `tag`/`release`, resolve bases, compute closures, run the idempotent check, reconcile module dependencies and intermediate-stage cache images by existence, build/push matched deliverables, run `DO` tasks, promote version tags immutably, extract `OUTPUT`s
 
+**`basil run <TARGET> [CONTEXT] [-f FILE] [--cache-to REPO]`:**
+- Location: `src/main.rs` → `src/solver/orchestrate.rs::run_target`
+- Triggers: manual invocation
+- Responsibilities: run a target's `TASK` clause as a one-shot container without an event — the manual form of the event path's `DO`. The target need not be a deliverable and is never published; everything the task depends on is built the standard way: an internal `FROM <stage>` base (and its transitive stage deps) is reconciled as `basil-cache-<stageHash>` cache images in the cache repo (`--cache-to`, `BASIL_CACHE_REF`, else the target's own repo when qualified), module bases build use-or-build, and the task then runs on the resolved base image. `BASIL_TARGET=<name>` is set; a non-zero task exit fails the invocation
+
 **`basil pin [FILE]`:**
 - Location: `src/main.rs` → `src/solver/pin.rs::pin_file`
 - Triggers: manual invocation
@@ -170,7 +175,7 @@
 
 **Logging:** `tracing` + `tracing-subscriber` fmt with `EnvFilter` from `RUST_LOG` (default `info`), initialized once in `src/main.rs`; `basil: ...` status lines on stdout mark each build phase (parse, resolve, identity, build, push, output); `with_filename`/`fs_err` attach `filename=`/`op=` fields to every file error.
 
-**Caching:** `buildah build --layers` reuses the operator's local containers/storage layer cache. Every non-deliverable stage is exported as `<repo>:basil-cache-<stageHash>` (the stage's own `tagHash`) and reconciled by existence on both the build and idempotent-skip paths — a missing cache image is built (`--target <stage>`, `--iidfile`), pushed, then removed locally. The deliverable's Containerfile renders `FROM <cache ref>` for internal stage bases, so the final build pulls its intermediates instead of rebuilding them, and `OUTPUT` extraction reads the same cache refs (a pull, never a rebuild). A content-tagged image already present in local storage is pushed without replaying the build. The registry content tag (`<push-ref>:basil-<tagHash>`) is the idempotency key that skips rebuilds; cache refs accumulate and age out on a retention schedule (`basil gc` prunes `basil-cache-*` by the embedded date or the image `created` time). The cache repo is `--cache-to`, else `BASIL_CACHE_REF`, else the deliverable's repo; module builds cache their own stages under the module's repo.
+**Caching:** No per-step layer cache (`buildah --layers` is not used); caching lives at the stage level. Every non-deliverable stage is exported as `<repo>:basil-cache-<stageHash>` (the stage's own `tagHash`) and reconciled by existence on both the build and idempotent-skip paths — a missing cache image is built per-instruction, pushed, then removed locally. The deliverable's build starts from `FROM <cache ref>` for internal stage bases, so the final build pulls its intermediates instead of rebuilding them, and `OUTPUT` extraction reads the same cache refs (a pull, never a rebuild). A content-tagged image already present in local storage is pushed without replaying the build. The registry content tag (`<push-ref>:basil-<tagHash>`) is the idempotency key that skips rebuilds; cache refs accumulate and age out on a retention schedule (`basil gc` prunes `basil-cache-*` by the embedded date or the image `created` time). The cache repo is `--cache-to`, else `BASIL_CACHE_REF`, else the deliverable's repo; module builds cache their own stages under the module's repo.
 
 **Storage:** containers/storage owned by rootless buildah for layer/build state; the registry v2 HTTP API via `reqwest` (rustls) for manifest HEADs, tag listing, deletes, config-blob reads, and immutable manifest PUTs. Redirects are followed only with a bounded policy; wrong-host redirects surface the final URL and content-type instead of being silently believed.
 
