@@ -31,6 +31,64 @@ pub fn parse(source: &str) -> Result<File, Error> {
     .parse_file()
 }
 
+/// Semantic check over a whole parsed file: every ON reaction's BUILD and
+/// DO lists must reference targets that actually exist, in the shapes the
+/// event path expects -- BUILD must name a publishable deliverable (a
+/// qualified target name or a REGISTER ref), DO must name a target with a
+/// TASK clause. The grammar accepts any names; this pass rejects dangling
+/// reaction references so basil handle fails with the reaction's line
+/// instead of a late, cryptic failure after matching. It is called by the
+/// event path (the only consumer of reactions); the parser itself stays a
+/// pure grammar so reaction fragments can still be parsed standalone.
+pub fn validate_reactions(file: &File) -> Result<(), Error> {
+    for r in &file.reactions {
+        for b in &r.build {
+            let t = file
+                .targets
+                .iter()
+                .find(|t| &t.name == b || t.register.as_deref() == Some(b.as_str()));
+            match t {
+                None => {
+                    return Err(Error {
+                        line: r.line,
+                        message: format!(
+                            "ON reaction: BUILD \"{b}\" matches no target (each BUILD must be a target's AS name or REGISTER ref)"
+                        ),
+                    })
+                }
+                Some(t) if t.register.is_none() && t.name.split('/').count() < 2 => {
+                    return Err(Error {
+                        line: r.line,
+                        message: format!(
+                            "ON reaction: BUILD \"{b}\" is not a deliverable (give the target a qualified name or a REGISTER ref)"
+                        ),
+                    })
+                }
+                Some(_) => {}
+            }
+        }
+        for d in &r.do_list {
+            let t = file.targets.iter().find(|t| &t.name == d);
+            match t {
+                None => {
+                    return Err(Error {
+                        line: r.line,
+                        message: format!("ON reaction: DO \"{d}\" matches no target"),
+                    })
+                }
+                Some(t) if t.task.is_none() => {
+                    return Err(Error {
+                        line: r.line,
+                        message: format!("ON reaction: DO \"{d}\" has no TASK clause to run"),
+                    })
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Split an instruction line into its keyword and the remainder.
 fn split_keyword(line: &str) -> (&str, &str) {
     let s = line.trim_start();
@@ -64,7 +122,10 @@ impl Parser {
     }
 
     fn err_at(&self, line: usize, message: impl Into<String>) -> Error {
-        Error { line, message: message.into() }
+        Error {
+            line,
+            message: message.into(),
+        }
     }
 
     fn parse_file(mut self) -> Result<File, Error> {
@@ -200,7 +261,12 @@ impl Parser {
         // Optional leading platform selector: `FROM --platform=<sel> <base>`.
         let mut platform = None;
         if parts[0].starts_with("--platform=") {
-            platform = Some(parts.remove(0).trim_start_matches("--platform=").to_string());
+            platform = Some(
+                parts
+                    .remove(0)
+                    .trim_start_matches("--platform=")
+                    .to_string(),
+            );
             if parts.is_empty() {
                 return self.err(line, "FROM --platform=... requires a base image");
             }
@@ -228,7 +294,12 @@ impl Parser {
             name: name.unwrap_or_else(|| raw.clone()),
             register: None,
             given: None,
-            base: Base::Image(BaseImage { raw, tag, digest, platform }),
+            base: Base::Image(BaseImage {
+                raw,
+                tag,
+                digest,
+                platform,
+            }),
             instructions: Vec::new(),
             task: None,
             platforms: None,
@@ -277,10 +348,7 @@ impl Parser {
                     parts.clear();
                 }
                 other => {
-                    return self.err(
-                        line,
-                        format!("unexpected token `{other}` in MODULE line"),
-                    )
+                    return self.err(line, format!("unexpected token `{other}` in MODULE line"))
                 }
             }
         }
@@ -288,7 +356,12 @@ impl Parser {
             name: name.unwrap_or_else(|| path.clone()),
             register: None,
             given: None,
-            base: Base::Module(ModuleRef { path, file, target, line }),
+            base: Base::Module(ModuleRef {
+                path,
+                file,
+                target,
+                line,
+            }),
             instructions: Vec::new(),
             task: None,
             platforms: None,
@@ -305,10 +378,7 @@ impl Parser {
     ) -> Result<(), Error> {
         match kw {
             "SHELL" | "STOPSIGNAL" | "HEALTHCHECK" | "ONBUILD" => {
-                return self.err(
-                    line,
-                    format!("`{kw}` is not supported in basil v1"),
-                )
+                return self.err(line, format!("`{kw}` is not supported in basil v1"))
             }
             _ => {}
         }
@@ -337,9 +407,7 @@ impl Parser {
                 }
                 Instruction::Commit
             }
-            _ => {
-                return self.err(line, format!("unknown instruction `{kw}`"))
-            }
+            _ => return self.err(line, format!("unknown instruction `{kw}`")),
         };
         target.instructions.push(instr);
         Ok(())
@@ -401,8 +469,7 @@ impl Parser {
                     continue;
                 } else if bytes[i + 1].is_ascii_alphanumeric() || bytes[i + 1] == b'_' {
                     let mut j = i + 1;
-                    while j < bytes.len()
-                        && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
                     {
                         j += 1;
                     }
@@ -450,7 +517,12 @@ impl Parser {
         if raw.is_empty() {
             return self.err(line, "IMPORT requires an image reference");
         }
-        Ok(Instruction::Import(ImportImage { raw, tag, digest, line }))
+        Ok(Instruction::Import(ImportImage {
+            raw,
+            tag,
+            digest,
+            line,
+        }))
     }
 
     fn parse_arg(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
@@ -459,7 +531,10 @@ impl Parser {
             return self.err(line, "ARG requires a name");
         }
         if s.split_whitespace().count() > 1 {
-            return self.err(line, "ARG supports one name per line (name or name=default)");
+            return self.err(
+                line,
+                "ARG supports one name per line (name or name=default)",
+            );
         }
         let (name, default) = match s.split_once('=') {
             Some((n, d)) => (n.trim().to_string(), Some(d.trim().to_string())),
@@ -468,7 +543,11 @@ impl Parser {
         if name.is_empty() {
             return self.err(line, "ARG name is empty");
         }
-        Ok(Instruction::Arg(Arg { name, default, line }))
+        Ok(Instruction::Arg(Arg {
+            name,
+            default,
+            line,
+        }))
     }
 
     fn parse_env(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
@@ -555,7 +634,10 @@ impl Parser {
     /// input).
     fn validate_given_path(&self, p: &str, line: usize) -> Result<(), Error> {
         if p.starts_with('/') {
-            return self.err(line, format!("GIVEN path `{p}` must be relative to the context"));
+            return self.err(
+                line,
+                format!("GIVEN path `{p}` must be relative to the context"),
+            );
         }
         if p.split(['/', '\\']).any(|c| c == "..") {
             return self.err(line, format!("GIVEN path `{p}` may not contain `..`"));
@@ -566,7 +648,8 @@ impl Parser {
     fn parse_add(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
         if detect_heredoc(rest) {
             return self.err(line, "ADD heredocs (<<EOF) are deferred in basil v1");
-        }        let (flags, args) = parse_flags(rest).map_err(|m| self.err_at(line, m))?;
+        }
+        let (flags, args) = parse_flags(rest).map_err(|m| self.err_at(line, m))?;
         for name in flags.keys() {
             match name.as_str() {
                 "chown" | "chmod" => {}
@@ -600,12 +683,20 @@ impl Parser {
                 mounts.push(self.parse_mount(&spec, line)?);
                 command_text = rest2;
             } else if t.starts_with("--network=") {
-                let val = t.trim_start_matches("--network=").split_whitespace().next().unwrap_or("").to_string();
+                let val = t
+                    .trim_start_matches("--network=")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
                 if !matches!(val.as_str(), "none" | "host" | "default") {
                     return self.err(line, format!("unsupported RUN --network value `{val}`"));
                 }
                 network = Some(val);
-                let rest3 = t.trim_start_matches("--network=").trim_start_matches(&network.clone().unwrap()).to_string();
+                let rest3 = t
+                    .trim_start_matches("--network=")
+                    .trim_start_matches(&network.clone().unwrap())
+                    .to_string();
                 command_text = rest3;
             } else if t.starts_with("--security=") {
                 return self.err(line, "RUN --security is deferred in basil v1");
@@ -619,12 +710,19 @@ impl Parser {
             return self.err(line, "RUN requires a command");
         }
         let command = self.parse_command(&command_text, line)?;
-        Ok(Instruction::Run(Run { mounts, network, command }))
+        Ok(Instruction::Run(Run {
+            mounts,
+            network,
+            command,
+        }))
     }
 
     fn parse_mount(&self, spec: &str, line: usize) -> Result<Mount, Error> {
         let entries = parse_mount_map(spec);
-        let typev = entries.get("type").cloned().unwrap_or_else(|| "bind".to_string());
+        let typev = entries
+            .get("type")
+            .cloned()
+            .unwrap_or_else(|| "bind".to_string());
         let target = entries.get("target").cloned();
         let id = entries.get("id").cloned();
         match typev.as_str() {
@@ -672,7 +770,9 @@ impl Parser {
         if s.is_empty() {
             return self.err(line, "WORKDIR requires a path");
         }
-        Ok(Instruction::Workdir(Workdir { path: s.to_string() }))
+        Ok(Instruction::Workdir(Workdir {
+            path: s.to_string(),
+        }))
     }
 
     fn parse_label(&self, rest: &str, line: usize) -> Result<Instruction, Error> {
@@ -684,9 +784,7 @@ impl Parser {
         for tok in items {
             match tok.split_once('=') {
                 Some((k, v)) => pairs.push((k.to_string(), v.to_string())),
-                None => {
-                    return self.err(line, format!("LABEL expects key=value, got `{tok}`"))
-                }
+                None => return self.err(line, format!("LABEL expects key=value, got `{tok}`")),
             }
         }
         Ok(Instruction::Label(pairs))
@@ -803,9 +901,17 @@ fn parse_event_match(rest: &str) -> Result<(EventMatch, String), String> {
         let inner: String = chars[sel_start..end].iter().collect();
         selectors = split_selectors(&inner);
         let after_chars = &chars[end + 1..];
-        after = after_chars.iter().collect::<String>().trim_start().to_string();
+        after = after_chars
+            .iter()
+            .collect::<String>()
+            .trim_start()
+            .to_string();
     } else {
-        after = chars[i..].iter().collect::<String>().trim_start().to_string();
+        after = chars[i..]
+            .iter()
+            .collect::<String>()
+            .trim_start()
+            .to_string();
     }
 
     let event = EventMatch {
@@ -1091,10 +1197,14 @@ mod tests {
     fn parses_import_bare_and_qualified() {
         let f = parse("FROM alpine AS app\nIMPORT alpine\nIMPORT ghcr.io/a/b:v1\n").unwrap();
         let instrs = &f.targets[0].instructions;
-        let Instruction::Import(a) = &instrs[0] else { panic!() };
+        let Instruction::Import(a) = &instrs[0] else {
+            panic!()
+        };
         assert_eq!(a.raw, "alpine");
         assert_eq!(a.tag, None);
-        let Instruction::Import(b) = &instrs[1] else { panic!() };
+        let Instruction::Import(b) = &instrs[1] else {
+            panic!()
+        };
         assert_eq!(b.raw, "ghcr.io/a/b");
         assert_eq!(b.tag.as_deref(), Some("v1"));
     }
@@ -1104,9 +1214,17 @@ mod tests {
         let e = parse("IMPORT alpine\n").unwrap_err();
         assert!(e.message.contains("outside any target"), "{}", e.message);
         let e = parse("FROM alpine\nIMPORT\n").unwrap_err();
-        assert!(e.message.contains("exactly one image reference"), "{}", e.message);
+        assert!(
+            e.message.contains("exactly one image reference"),
+            "{}",
+            e.message
+        );
         let e = parse("FROM alpine\nIMPORT a b\n").unwrap_err();
-        assert!(e.message.contains("exactly one image reference"), "{}", e.message);
+        assert!(
+            e.message.contains("exactly one image reference"),
+            "{}",
+            e.message
+        );
         let e = parse("FROM alpine\nIMPORT scratch\n").unwrap_err();
         assert!(e.message.contains("no-op"), "{}", e.message);
         let e = parse("FROM alpine\nIMPORT --platform=linux/amd64 alpine\n").unwrap_err();
@@ -1138,14 +1256,20 @@ mod tests {
     #[test]
     fn parses_from_platform_buildplatform() {
         let f = parse("FROM --platform=$BUILDPLATFORM alpine AS build\n").unwrap();
-        assert_eq!(f.targets[0].base_image().unwrap().platform.as_deref(), Some("$BUILDPLATFORM"));
+        assert_eq!(
+            f.targets[0].base_image().unwrap().platform.as_deref(),
+            Some("$BUILDPLATFORM")
+        );
         assert_eq!(f.targets[0].base_image().unwrap().raw, "alpine");
     }
 
     #[test]
     fn parses_from_platform_literal() {
         let f = parse("FROM --platform=linux/arm64 alpine\n").unwrap();
-        assert_eq!(f.targets[0].base_image().unwrap().platform.as_deref(), Some("linux/arm64"));
+        assert_eq!(
+            f.targets[0].base_image().unwrap().platform.as_deref(),
+            Some("linux/arm64")
+        );
     }
 
     #[test]
@@ -1228,9 +1352,17 @@ mod tests {
     #[test]
     fn module_line_requires_path_and_rejects_junk() {
         let e = parse("MODULE\n").unwrap_err();
-        assert!(e.message.contains("MODULE requires a context path"), "{}", e.message);
+        assert!(
+            e.message.contains("MODULE requires a context path"),
+            "{}",
+            e.message
+        );
         let e = parse("MODULE vendor/x -f\n").unwrap_err();
-        assert!(e.message.contains("-f requires a file name"), "{}", e.message);
+        assert!(
+            e.message.contains("-f requires a file name"),
+            "{}",
+            e.message
+        );
         let e = parse("MODULE vendor/x bogus AS a\n").unwrap_err();
         assert!(e.message.contains("bogus"), "{}", e.message);
         let e = parse("MODULE vendor/x AS\n").unwrap_err();
@@ -1242,7 +1374,9 @@ mod tests {
         let src = "FROM alpine AS notify\nRUN echo hi\nTASK notify-my-thing.sh\n";
         let f = parse(src).unwrap();
         let t = &f.targets[0];
-        assert!(matches!(&t.task, Some(TaskCmd { command: Command::Shell(s) }) if s == "notify-my-thing.sh"));
+        assert!(
+            matches!(&t.task, Some(TaskCmd { command: Command::Shell(s) }) if s == "notify-my-thing.sh")
+        );
     }
 
     #[test]
@@ -1279,9 +1413,13 @@ mod tests {
     #[test]
     fn register_expands_global_arg_var() {
         // `REGISTER ${registry}/fennel` resolves the file-level global ARG.
-        let src = "ARG registry=127.0.0.1:5001\nFROM alpine AS fennel\nREGISTER ${registry}/fennel\n";
+        let src =
+            "ARG registry=127.0.0.1:5001\nFROM alpine AS fennel\nREGISTER ${registry}/fennel\n";
         let f = parse(src).unwrap();
-        assert_eq!(f.targets[0].register.as_deref(), Some("127.0.0.1:5001/fennel"));
+        assert_eq!(
+            f.targets[0].register.as_deref(),
+            Some("127.0.0.1:5001/fennel")
+        );
         assert_eq!(f.targets[0].push_ref(), "127.0.0.1:5001/fennel");
     }
 
@@ -1291,7 +1429,10 @@ mod tests {
         let src = "ARG h=127.0.0.1\nARG port=5001\n\
 FROM alpine AS app\nREGISTER $h:${port}/app:$$tag\n";
         let f = parse(src).unwrap();
-        assert_eq!(f.targets[0].register.as_deref(), Some("127.0.0.1:5001/app:$tag"));
+        assert_eq!(
+            f.targets[0].register.as_deref(),
+            Some("127.0.0.1:5001/app:$tag")
+        );
     }
 
     #[test]
@@ -1308,14 +1449,22 @@ ARG registry=127.0.0.1:5001\nREGISTER ${registry}/app\n";
         // A pushed location must never silently become empty: an undeclared
         // variable is a parse error, not an empty substitution.
         let e = parse("FROM alpine AS app\nREGISTER ${registry}/app\n").unwrap_err();
-        assert!(e.message.contains("no ARG with a default declares it"), "{}", e.message);
+        assert!(
+            e.message.contains("no ARG with a default declares it"),
+            "{}",
+            e.message
+        );
         assert!(e.message.contains("${registry}"), "{}", e.message);
     }
 
     #[test]
     fn register_undeclared_bare_var_is_error() {
         let e = parse("FROM alpine AS app\nREGISTER $host/app\n").unwrap_err();
-        assert!(e.message.contains("no ARG with a default declares it"), "{}", e.message);
+        assert!(
+            e.message.contains("no ARG with a default declares it"),
+            "{}",
+            e.message
+        );
         assert!(e.message.contains("$host"), "{}", e.message);
     }
 
@@ -1325,7 +1474,13 @@ ARG registry=127.0.0.1:5001\nREGISTER ${registry}/app\n";
         let f = parse(src).unwrap();
         assert_eq!(
             f.targets[0].given.as_deref(),
-            Some(&["Cargo.toml".to_string(), "src/".to_string(), "config/*.yaml".to_string()][..])
+            Some(
+                &[
+                    "Cargo.toml".to_string(),
+                    "src/".to_string(),
+                    "config/*.yaml".to_string()
+                ][..]
+            )
         );
     }
 
@@ -1400,7 +1555,10 @@ ARG registry=127.0.0.1:5001\nREGISTER ${registry}/app\n";
     fn parses_target_platforms() {
         let src = "PLATFORM linux/amd64\nFROM alpine\nPLATFORM linux/arm64/v8\n";
         let f = parse(src).unwrap();
-        assert_eq!(f.targets[0].platforms.as_ref().unwrap()[0].variant, Some("v8".to_string()));
+        assert_eq!(
+            f.targets[0].platforms.as_ref().unwrap()[0].variant,
+            Some("v8".to_string())
+        );
     }
 
     #[test]
@@ -1422,11 +1580,14 @@ ARG registry=127.0.0.1:5001\nREGISTER ${registry}/app\n";
         assert_eq!(f.global_args[0].default.as_deref(), Some("\"\""));
         // The per-target ARG stays on the target, not the global list.
         assert_eq!(f.targets[0].instructions.len(), 2);
-        assert_eq!(f.targets[0].instructions[0], Instruction::Arg(crate::dsl::ast::Arg {
-            name: "LOCAL".to_string(),
-            default: Some("1".to_string()),
-            line: 3,
-        }));
+        assert_eq!(
+            f.targets[0].instructions[0],
+            Instruction::Arg(crate::dsl::ast::Arg {
+                name: "LOCAL".to_string(),
+                default: Some("1".to_string()),
+                line: 3,
+            })
+        );
     }
 
     #[test]
@@ -1506,7 +1667,8 @@ ARG registry=127.0.0.1:5001\nREGISTER ${registry}/app\n";
 
     #[test]
     fn command_exec_and_shell() {
-        let f = parse("FROM alpine\nCMD [\"/bin/sh\", \"-c\", \"echo\"]\nENTRYPOINT echo\n").unwrap();
+        let f =
+            parse("FROM alpine\nCMD [\"/bin/sh\", \"-c\", \"echo\"]\nENTRYPOINT echo\n").unwrap();
         let c1 = &f.targets[0].instructions[0];
         let c2 = &f.targets[0].instructions[1];
         assert!(matches!(c1, Instruction::Cmd(Command::Exec(_))));
@@ -1558,7 +1720,54 @@ ON image-published  DO notify smoke
         // image-published is a Custom token.
         assert!(matches!(f.reactions[1].event.token, EventToken::Custom(_)));
         assert_eq!(f.reactions[1].do_list.len(), 2);
-        assert!(matches!(f.targets[2].task.as_ref().unwrap().command, Command::Exec(_)));
+        assert!(matches!(
+            f.targets[2].task.as_ref().unwrap().command,
+            Command::Exec(_)
+        ));
+    }
+
+    #[test]
+    fn validates_reaction_targets() {
+        let src = "FROM scratch AS ghcr.io/mycompany/app\nFROM alpine AS notify\nTASK echo hi\nON push(main) BUILD ghcr.io/mycompany/app DO notify\n";
+        let f = parse(src).unwrap();
+        validate_reactions(&f).unwrap();
+    }
+
+    #[test]
+    fn build_by_register_ref_is_valid() {
+        let f = parse("FROM scratch AS app\nREGISTER 127.0.0.1:5001/app\nON push(main) BUILD 127.0.0.1:5001/app\n").unwrap();
+        validate_reactions(&f).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_build_target() {
+        let f = parse("FROM scratch AS app\nON push(main) BUILD nope\n").unwrap();
+        let e = validate_reactions(&f).unwrap_err();
+        assert!(e.message.contains("matches no target"), "{}", e.message);
+        assert!(e.message.contains("nope"), "{}", e.message);
+        assert_eq!(e.line, 2);
+    }
+
+    #[test]
+    fn rejects_non_deliverable_build() {
+        let f = parse("FROM scratch AS app\nON push(main) BUILD app\n").unwrap();
+        let e = validate_reactions(&f).unwrap_err();
+        assert!(e.message.contains("not a deliverable"), "{}", e.message);
+    }
+
+    #[test]
+    fn rejects_unknown_do_target() {
+        let f = parse("FROM alpine AS notify\nTASK echo hi\nON push(main) DO nope\n").unwrap();
+        let e = validate_reactions(&f).unwrap_err();
+        assert!(e.message.contains("matches no target"), "{}", e.message);
+        assert!(e.message.contains("DO "), "{}", e.message);
+    }
+
+    #[test]
+    fn rejects_taskless_do_target() {
+        let f = parse("FROM alpine AS notify\nON push(main) DO notify\n").unwrap();
+        let e = validate_reactions(&f).unwrap_err();
+        assert!(e.message.contains("no TASK"), "{}", e.message);
     }
 
     #[test]

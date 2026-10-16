@@ -9,5 +9,11 @@ FROM alpine AS notify
 COPY notify-my-thing.sh /usr/local/bin/
 TASK notify-my-thing.sh
 
+FROM alpine AS migrate
+TASK echo "migrate ran"
+
+FROM alpine AS migrate-again
+TASK echo "migrate-again ran"
+
 ON pr-merged BUILD ghcr.io/mycompany/app DO migrate migrate-again
 ON push(main) BUILD ghcr.io/mycompany/app
