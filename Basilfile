@@ -9,9 +9,11 @@ COPY Cargo.toml Cargo.lock .
 # A placeholder target so `cargo fetch` can resolve the manifest before the
 # real sources are copied in (cargo needs a lib/main to pick a target).
 RUN mkdir -p src/main && echo 'fn main() {}' > src/main.rs && cargo fetch
-COPY . .
 # ring/other native crates need the musl C toolchain + headers.
 RUN apk add --no-cache musl-dev gcc binutils
+COMMIT
+
+COPY . .
 RUN cargo build --release --bin basil
 
 OUTPUT /src/target/release/basil target/basil
