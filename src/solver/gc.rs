@@ -3,7 +3,8 @@
 //! Only basil's own ephemeral tags are pruned: the date-encoded `cache-*` tags
 //! (by the date embedded in the name) and `cache-<tagHash>` / content `<tagHash>`
 //! tags (by the image's `created` time). Version tags (`vX.Y.Z`) are never
-//! pruned.
+//! pruned. `--cache-only` restricts pruning to the `basil-cache-*`
+//! namespace: the content tag of a published deliverable is left untouched.
 
 use crate::solver::registry::RegistryClient;
 
@@ -36,7 +37,7 @@ enum Kind {
     Foreign,
 }
 
-fn classify(tag: &str) -> Kind {
+fn classify(tag: &str, cache_only: bool) -> Kind {
     // Basil-owned tags live in the `basil-` namespace: cache namespaces
     // (`basil-cache-*`) sort above content tags (`basil-<tagHash>`). Tags
     // outside the namespace — including any bare 64-hex or `cache-*` tag — are
@@ -50,12 +51,23 @@ fn classify(tag: &str) -> Kind {
     }
     if let Some(rest) = tag.strip_prefix(crate::solver::registry::BASIL_TAG_PREFIX) {
         if rest.len() == 64 && rest.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Kind::CacheHash;
+            // Content tags are the deliverable's published identity, not
+            // cache: with --cache-only they are deferred (never pruned),
+            // like version tags; only the basil-cache-* namespace goes.
+            return if cache_only {
+                Kind::Foreign
+            } else {
+                Kind::CacheHash
+            };
         }
         return Kind::Foreign;
     }
     if let Some(rest) = tag.strip_prefix('v') {
-        if !rest.is_empty() && rest.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+        if !rest.is_empty()
+            && rest
+                .split('.')
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        {
             return Kind::Version;
         }
     }
@@ -93,30 +105,29 @@ pub async fn gc_repo(
     age_secs: u64,
     now: u64,
     dry_run: bool,
+    cache_only: bool,
 ) -> Result<Vec<String>, String> {
     let tags = client.list_tags(repo).await?;
     let cutoff = now.saturating_sub(age_secs);
     let mut deleted = Vec::new();
 
     for tag in tags {
-        let prune = match classify(&tag) {
+        let prune = match classify(&tag, cache_only) {
             Kind::Version | Kind::Foreign => false,
-            Kind::CacheDate(ymd, width) => {
-                match date_to_unix(ymd, width) {
-                    Some(start) => {
-                        let period_len = match width {
-                            8 => 86400,
-                            6 => 31 * 86400,
-                            _ => 365 * 86400,
-                        };
-                        start + period_len <= cutoff
-                    }
-                    None => {
-                        tracing::warn!("unparseable cache date in `{tag}`");
-                        false
-                    }
+            Kind::CacheDate(ymd, width) => match date_to_unix(ymd, width) {
+                Some(start) => {
+                    let period_len = match width {
+                        8 => 86400,
+                        6 => 31 * 86400,
+                        _ => 365 * 86400,
+                    };
+                    start + period_len <= cutoff
                 }
-            }
+                None => {
+                    tracing::warn!("unparseable cache date in `{tag}`");
+                    false
+                }
+            },
             Kind::CacheHash => match client.get_config_created(repo, &tag).await {
                 Ok(Some(created)) => created < cutoff,
                 Ok(None) => {
@@ -167,29 +178,57 @@ mod tests {
     #[test]
     fn prunes_only_basil_namespaced_tags() {
         assert!(matches!(
-            classify("basil-cache-20240901"),
+            classify("basil-cache-20240901", false),
             Kind::CacheDate(20240901, 8)
         ));
         assert!(matches!(
-            classify("basil-cache-202409"),
+            classify("basil-cache-202409", false),
             Kind::CacheDate(202409, 6)
         ));
         assert!(matches!(
-            classify("basil-cache-0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609"),
+            classify(
+                "basil-cache-0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609",
+                false
+            ),
             Kind::CacheHash
         ));
         assert!(matches!(
-            classify("basil-0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609"),
+            classify(
+                "basil-0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609",
+                false
+            ),
             Kind::CacheHash
         ));
-        assert!(matches!(classify("v1.5.8"), Kind::Version));
-        assert!(matches!(classify("latest"), Kind::Foreign));
+        assert!(matches!(classify("v1.5.8", false), Kind::Version));
+        assert!(matches!(classify("latest", false), Kind::Foreign));
         // Pre-namespace shapes are foreign now (no transition needed): a bare
         // 64-hex tag could be anyone's, and a bare `cache-*` is not basil's.
         assert!(matches!(
-            classify("0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609"),
+            classify(
+                "0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609",
+                false
+            ),
             Kind::Foreign
         ));
-        assert!(matches!(classify("cache-20240901"), Kind::Foreign));
+        assert!(matches!(classify("cache-20240901", false), Kind::Foreign));
+    }
+
+    #[test]
+    fn cache_only_defers_content_tags() {
+        // Default: a content tag is prunable by age (CacheHash).
+        let hs = "0cc970bb04c43e8bd05099f7d58df63c3de606d6e0234dba9997d7f02387d609";
+        assert!(matches!(
+            classify(&format!("basil-{}", hs), false),
+            Kind::CacheHash
+        ));
+        // --cache-only: the content tag is deferred, cache tags unchanged.
+        assert!(matches!(
+            classify(&format!("basil-{}", hs), true),
+            Kind::Foreign
+        ));
+        assert!(matches!(
+            classify(&format!("basil-cache-{}", hs), true),
+            Kind::CacheHash
+        ));
     }
 }

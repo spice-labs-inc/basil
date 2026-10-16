@@ -62,11 +62,9 @@ fn main() -> anyhow::Result<()> {
             // base fails hard, matching the offline closure rule).
             let index = basil::identity::modules::discover_module_index(&parsed.targets, file_dir)
                 .map_err(anyhow::Error::msg)?;
-            let module_digests = basil::identity::modules::compute_module_digests(
-                &index,
-                &mut CliResolver,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let module_digests =
+                basil::identity::modules::compute_module_digests(&index, &mut CliResolver)
+                    .map_err(anyhow::Error::msg)?;
             let tags = basil::identity::closure::compute_closure(
                 &parsed.targets,
                 &parsed.default_platforms,
@@ -78,12 +76,20 @@ fn main() -> anyhow::Result<()> {
                 &module_digests.deliverable,
             )
             .map_err(anyhow::Error::msg)?;
-            println!("{} target(s), {} reaction(s)\n", parsed.targets.len(), parsed.reactions.len());
+            println!(
+                "{} target(s), {} reaction(s)\n",
+                parsed.targets.len(),
+                parsed.reactions.len()
+            );
             for t in &parsed.targets {
-                let tag = basil::identity::closure::hex(
-                    &tags.get(&t.name).copied().unwrap_or([0; 32]),
+                let tag =
+                    basil::identity::closure::hex(&tags.get(&t.name).copied().unwrap_or([0; 32]));
+                let n = format!(
+                    "  {:<42}  {} instr     tag: {}",
+                    t.name,
+                    t.instructions.len(),
+                    tag
                 );
-                let n = format!("  {:<42}  {} instr     tag: {}", t.name, t.instructions.len(), tag);
                 println!("{n}");
             }
             Ok(())
@@ -117,7 +123,9 @@ fn main() -> anyhow::Result<()> {
                     None => {
                         let mut s = String::new();
                         use std::io::Read;
-                        std::io::stdin().read_to_string(&mut s).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        std::io::stdin()
+                            .read_to_string(&mut s)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
                         s
                     }
                 };
@@ -174,8 +182,11 @@ fn main() -> anyhow::Result<()> {
         Command::Pin(args) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
-                let src = basil::fsctx::fs_err(std::fs::read_to_string(&args.file), &args.file, "read")?;
-                let pinned = basil::solver::pin::pin_file(&src).await.map_err(anyhow::Error::msg)?;
+                let src =
+                    basil::fsctx::fs_err(std::fs::read_to_string(&args.file), &args.file, "read")?;
+                let pinned = basil::solver::pin::pin_file(&src)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
                 if pinned == src {
                     println!("basil: no unpinned bases in {}", args.file);
                 } else {
@@ -236,7 +247,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         .base_url(),
                     );
-                    let deleted = basil::solver::gc::gc_repo(&client, repo, age_secs, now, args.dry_run)
+                    let deleted = basil::solver::gc::gc_repo(&client, repo, age_secs, now, args.dry_run, args.cache_only)
                         .await
                         .map_err(anyhow::Error::msg)?;
                     println!("gc[{}]: {repo} -> {} tag(s) {}", i, deleted.len(), if args.dry_run { "(dry-run)" } else { "deleted" });

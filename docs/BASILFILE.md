@@ -362,7 +362,7 @@ basil build [CONTEXT] [-f FILE] [-t TARGET] [--force] [--cache-to REPO]  # build
 basil handle [CONTEXT] [-f FILE] [--event F] [--cache-to REPO] # read an event (stdin or --event) and react
 basil promote <VERSION> [CONTEXT] [-f FILE] [-t TARGET] # set the immutable v<VERSION> tags on the deliverables' published images (the content tags must already exist — promotion never builds)
 basil pin [FILE]                            # resolve unpinned bases to @sha256 in place
-basil gc <AGE> [CONTEXT] [-f FILE] [--repo FQ] [--dry-run]   # prune basil-owned tags older than <AGE> (repos from qualified AS names AND REGISTER refs)
+basil gc <AGE> [CONTEXT] [-f FILE] [--repo FQ] [--dry-run] [--cache-only]   # prune basil-owned tags older than <AGE> (--cache-only prunes only the basil-cache-* namespace) (repos from qualified AS names AND REGISTER refs)
 ```
 
 The context is a bare positional arg, docker-style: the DSL file defaults to

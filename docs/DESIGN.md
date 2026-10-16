@@ -524,6 +524,9 @@ so it never matches today.)
     `-<YYYYMM>`, `-<YYYY>`) are pruned directly from the tag name;
     `basil-cache-<tagHash>` by the image's `created` time.
   - content tags (`<name>:basil-<tagHash>`), by the image's `created` time.
+    - with `--cache-only` this class is deferred: content tags are
+      left untouched whatever their age, and only the `basil-cache-*`
+      namespace is pruned.
   - version tags (`<name>:vX.Y.Z`) are **never pruned** — they are
     user-created releases, not basil's to reclaim (no `--include-versions`).
 - **Safety** — `--dry-run` lists what would be deleted without deleting.

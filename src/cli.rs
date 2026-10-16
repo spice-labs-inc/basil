@@ -20,7 +20,7 @@ pub enum Command {
     /// Run a non-published target's `TASK` clause in a one-shot container,
     /// without an event and without publishing anything (a manual `DO` for
     /// non-published targets). Registered (REGISTER-clause) targets are
-    /// excluded.
+    /// excluded
     Run(RunArgs),
     /// Set the immutable `v<version>` tags on the deliverables' published images.
     Promote(PromoteArgs),
@@ -148,4 +148,9 @@ pub struct GcArgs {
     /// List what would be deleted without deleting.
     #[arg(long)]
     pub dry_run: bool,
+    /// Leave the content tags (basil-<tagHash>, the published deliverable
+    /// identity) untouched; prune only the intermediate-stage cache
+    /// namespace (basil-cache-*).
+    #[arg(long)]
+    pub cache_only: bool,
 }
