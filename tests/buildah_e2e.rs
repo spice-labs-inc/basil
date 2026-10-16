@@ -3,7 +3,7 @@
 //! digest match basil's closure tagHash. Skipped when `buildah` is unavailable
 //! or the local registry is not reachable.
 
-use basil::solver::orchestrate::{BuildInput, build_targets, handle_event};
+use basil::solver::orchestrate::{build_targets, handle_event, BuildInput};
 use serde_json::Value;
 
 /// All buildah-backed tests share one global containers/storage, and the OUTPUT
@@ -69,7 +69,10 @@ async fn buildah_e2e_build_and_config() {
     // the bare closure hash.
     let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
     let ctag = |h: &str| format!("basil-{h}");
-    let (_, manifest) = c.get_manifest("bah_e2e_probe", &ctag(&digest)).await.unwrap();
+    let (_, manifest) = c
+        .get_manifest("bah_e2e_probe", &ctag(&digest))
+        .await
+        .unwrap();
     let m: Value = serde_json::from_slice(&manifest).unwrap();
     let cfg_digest = m["config"]["digest"].as_str().unwrap().to_string();
     // Fetch the config blob directly (async).
@@ -105,8 +108,14 @@ async fn buildah_e2e_build_and_config() {
         .map(|(_, v)| v.clone())
         .unwrap();
     assert_eq!(digest2, digest, "noop re-derives the same content tag");
-    let (_, manifest2) = c.get_manifest("bah_e2e_probe", &ctag(&digest2)).await.unwrap();
-    assert!(!manifest2.is_empty(), "registered image must remain pullable");
+    let (_, manifest2) = c
+        .get_manifest("bah_e2e_probe", &ctag(&digest2))
+        .await
+        .unwrap();
+    assert!(
+        !manifest2.is_empty(),
+        "registered image must remain pullable"
+    );
 
     // --force bypasses the idempotent check: the same event rebuilds and
     // re-pushes even though the content tag is registered (no idempotent-skip
@@ -115,14 +124,23 @@ async fn buildah_e2e_build_and_config() {
     forced.force = true;
     let results3 = handle_event(forced).await.unwrap();
     let result3 = results3.iter().find(|(k, _)| k == "result");
-    assert!(result3.is_none(), "--force must take the build path, got {result3:?}");
+    assert!(
+        result3.is_none(),
+        "--force must take the build path, got {result3:?}"
+    );
     let digest3 = results3
         .iter()
         .find(|(k, _)| k == "digest")
         .map(|(_, v)| v.clone())
         .unwrap();
-    assert_eq!(digest3, digest, "forced rebuild re-derives the same content tag");
-    let (_, manifest3) = c.get_manifest("bah_e2e_probe", &ctag(&digest3)).await.unwrap();
+    assert_eq!(
+        digest3, digest,
+        "forced rebuild re-derives the same content tag"
+    );
+    let (_, manifest3) = c
+        .get_manifest("bah_e2e_probe", &ctag(&digest3))
+        .await
+        .unwrap();
     assert!(!manifest3.is_empty(), "re-pushed image must be pullable");
 
     // Idempotence invariant: if the image does not exist it must be built (and
@@ -131,8 +149,14 @@ async fn buildah_e2e_build_and_config() {
     c.delete_tag("bah_e2e_probe", &ctag(&digest)).await.unwrap();
     let results4 = handle_event(inp.clone()).await.unwrap();
     let result4 = results4.iter().find(|(k, _)| k == "result");
-    assert!(result4.is_none(), "deleted artifact must rebuild, got {result4:?}");
-    let (_, manifest4) = c.get_manifest("bah_e2e_probe", &ctag(&digest)).await.unwrap();
+    assert!(
+        result4.is_none(),
+        "deleted artifact must rebuild, got {result4:?}"
+    );
+    let (_, manifest4) = c
+        .get_manifest("bah_e2e_probe", &ctag(&digest))
+        .await
+        .unwrap();
     assert!(!manifest4.is_empty(), "deleted artifact must be re-pushed");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -158,7 +182,10 @@ async fn local_image_count() -> usize {
         .output()
         .await
         .unwrap();
-    String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count()
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
 }
 
 async fn local_container_count() -> usize {
@@ -167,7 +194,10 @@ async fn local_container_count() -> usize {
         .output()
         .await
         .unwrap();
-    String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count()
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
 }
 
 /// Count locally untagged (`<none>`) images. The OUTPUT temp images are
@@ -203,7 +233,10 @@ async fn local_image_names() -> Vec<String> {
         .output()
         .await
         .unwrap();
-    String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string()).collect()
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect()
 }
 
 /// OUTPUT on two *intermediate* (non-deliverable) stages: each needs its own
@@ -254,8 +287,18 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
     handle_event(inp.clone()).await.unwrap();
     // Both stages' files land on the host — neither target build clobbered the
     // other.
-    assert_eq!(std::fs::read_to_string(dir.join("out/one.txt")).unwrap().trim(), "ONE");
-    assert_eq!(std::fs::read_to_string(dir.join("out/two.txt")).unwrap().trim(), "TWO");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out/one.txt"))
+            .unwrap()
+            .trim(),
+        "ONE"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out/two.txt"))
+            .unwrap()
+            .trim(),
+        "TWO"
+    );
     // No leak: the per-stage temp images must be removed again (their absence
     // shows as no growth in untagged images) and nothing may be minted under a
     // temp tag. New images = the deliverable + the cached intermediate stages
@@ -304,11 +347,24 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
     let names_before2 = local_image_names().await;
     let results = handle_event(inp.clone()).await.unwrap();
     assert_eq!(
-        results.iter().find(|(k, _)| k == "result").map(|(_, v)| v.as_str()),
+        results
+            .iter()
+            .find(|(k, _)| k == "result")
+            .map(|(_, v)| v.as_str()),
         Some("idempotent-skip")
     );
-    assert_eq!(std::fs::read_to_string(dir.join("out/one.txt")).unwrap().trim(), "ONE");
-    assert_eq!(std::fs::read_to_string(dir.join("out/two.txt")).unwrap().trim(), "TWO");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out/one.txt"))
+            .unwrap()
+            .trim(),
+        "ONE"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out/two.txt"))
+            .unwrap()
+            .trim(),
+        "TWO"
+    );
     assert_eq!(
         local_untagged_image_count().await,
         untagged_before2,
@@ -347,21 +403,42 @@ async fn seed_importsrc() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("buildah from: {e}"))?;
     let container = String::from_utf8_lossy(&c.stdout).trim().to_string();
     let _ = tokio::process::Command::new("buildah")
-        .args(["copy", &container, marker.to_str().unwrap(), "/imported.txt"])
+        .args([
+            "copy",
+            &container,
+            marker.to_str().unwrap(),
+            "/imported.txt",
+        ])
         .status()
         .await;
     let _ = tokio::process::Command::new("buildah")
-        .args(["commit", "--format=oci", &container, "127.0.0.1:5001/importsrc:latest"])
+        .args([
+            "commit",
+            "--format=oci",
+            &container,
+            "127.0.0.1:5001/importsrc:latest",
+        ])
         .status()
         .await;
-    let _ = tokio::process::Command::new("buildah").args(["rm", &container]).status().await;
+    let _ = tokio::process::Command::new("buildah")
+        .args(["rm", &container])
+        .status()
+        .await;
     let push = tokio::process::Command::new("buildah")
-        .args(["push", "--tls-verify=false", "127.0.0.1:5001/importsrc:latest", "docker://127.0.0.1:5001/importsrc:latest"])
+        .args([
+            "push",
+            "--tls-verify=false",
+            "127.0.0.1:5001/importsrc:latest",
+            "docker://127.0.0.1:5001/importsrc:latest",
+        ])
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("spawning buildah push: {e}"))?;
     if !push.status.success() {
-        anyhow::bail!("seed push failed: {}", String::from_utf8_lossy(&push.stderr).trim());
+        anyhow::bail!(
+            "seed push failed: {}",
+            String::from_utf8_lossy(&push.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -404,17 +481,38 @@ async fn buildah_e2e_import_inlines_content() {
         .output()
         .await
         .unwrap();
-    assert!(c.status.success(), "pull failed: {}", String::from_utf8_lossy(&c.stderr));
+    assert!(
+        c.status.success(),
+        "pull failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
     let container = String::from_utf8_lossy(&c.stdout).trim().to_string();
     let out = tokio::process::Command::new("buildah")
-        .args(["run", &container, "--", "/bin/sh", "-c", "cat /out.txt; echo ---; cat /imported.txt; echo ---; cat /merged.txt"])
+        .args([
+            "run",
+            &container,
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat /out.txt; echo ---; cat /imported.txt; echo ---; cat /merged.txt",
+        ])
         .output()
         .await
         .unwrap();
-    let _ = tokio::process::Command::new("buildah").args(["rm", &container]).status().await;
+    let _ = tokio::process::Command::new("buildah")
+        .args(["rm", &container])
+        .status()
+        .await;
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(text.contains("hello import"), "context COPY missing: {text}");
+    assert!(
+        out.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("hello import"),
+        "context COPY missing: {text}"
+    );
     assert!(
         text.contains("from-import"),
         "IMPORT content missing — the inlined rootfs must be present: {text}"
@@ -431,21 +529,32 @@ async fn buildah_e2e_import_inlines_content() {
     // Idempotent skip: second delivery noops; the content tag stays pullable.
     let results2 = handle_event(inp.clone()).await.unwrap();
     assert_eq!(
-        results2.iter().find(|(k, _)| k == "result").map(|(_, v)| v.as_str()),
+        results2
+            .iter()
+            .find(|(k, _)| k == "result")
+            .map(|(_, v)| v.as_str()),
         Some("idempotent-skip")
     );
 
     // Deleted content tag -> the next delivery must rebuild and re-register
     // (the invariant: if the image does not exist it must be built).
     let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
-    c.delete_tag("bah_e2e_import", &format!("basil-{digest}")).await.unwrap();
+    c.delete_tag("bah_e2e_import", &format!("basil-{digest}"))
+        .await
+        .unwrap();
     let results3 = handle_event(inp.clone()).await.unwrap();
     assert!(
         results3.iter().all(|(k, _)| k != "result"),
         "deleted artifact must rebuild (no idempotent-skip), got {results3:?}"
     );
-    let (_, manifest) = c.get_manifest("bah_e2e_import", &format!("basil-{digest}")).await.unwrap();
-    assert!(!manifest.is_empty(), "rebuilt image must be registered again");
+    let (_, manifest) = c
+        .get_manifest("bah_e2e_import", &format!("basil-{digest}"))
+        .await
+        .unwrap();
+    assert!(
+        !manifest.is_empty(),
+        "rebuilt image must be registered again"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -491,10 +600,17 @@ async fn buildah_e2e_import_intermediate_stage() {
     // (a pull, never a rebuild): the files prove the cache image carries the
     // inlined import content AND the stage's own RUN output.
     assert_eq!(
-        std::fs::read_to_string(dir.join("out/imported.txt")).unwrap().trim(),
+        std::fs::read_to_string(dir.join("out/imported.txt"))
+            .unwrap()
+            .trim(),
         "from-import"
     );
-    assert_eq!(std::fs::read_to_string(dir.join("out/built.txt")).unwrap().trim(), "built");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out/built.txt"))
+            .unwrap()
+            .trim(),
+        "built"
+    );
 
     // The intermediate stage's cache image is published under the basil-cache
     // namespace (at least one: seed_importsrc rebuilds importsrc with a fresh
@@ -508,7 +624,10 @@ async fn buildah_e2e_import_intermediate_stage() {
         .into_iter()
         .filter(|t| t.starts_with("basil-cache-"))
         .collect();
-    assert!(!cache_tags.is_empty(), "builder cache image must be published: {cache_tags:?}");
+    assert!(
+        !cache_tags.is_empty(),
+        "builder cache image must be published: {cache_tags:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -526,8 +645,8 @@ TASK sh -c 'grep -q base-content /b.txt && [ \"$BASIL_TARGET\" = runner ] && ech
 
 #[tokio::test]
 async fn buildah_e2e_run_builds_dependencies_and_runs_task() {
-    if !buildah_present() {
-        eprintln!("skipping: buildah unavailable");
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
         return;
     }
     let _guard = E2E_LOCK.lock().await;
@@ -571,7 +690,10 @@ async fn buildah_e2e_run_builds_dependencies_and_runs_task() {
     let err = basil::solver::orchestrate::run_target(&bad_file, &bad, "failing", None)
         .await
         .unwrap_err();
-    assert!(format!("{err:#}").contains("exit 7"), "task failure must surface: {err:#}");
+    assert!(
+        format!("{err:#}").contains("exit 7"),
+        "task failure must surface: {err:#}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&bad);
@@ -643,7 +765,11 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_commit\n"
         .into_iter()
         .filter(|t| t.starts_with("basil-cache-"))
         .collect();
-    assert_eq!(cache_tags.len(), 1, "only the stage cache is pushed (checkpoints are local): {cache_tags:?}");
+    assert_eq!(
+        cache_tags.len(),
+        1,
+        "only the stage cache is pushed (checkpoints are local): {cache_tags:?}"
+    );
     assert!(
         !cache_tags.iter().any(|t| t.starts_with("basil-checkpoint")),
         "checkpoints must never be pushed: {cache_tags:?}"
@@ -651,11 +777,17 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_commit\n"
     let parsed = basil::dsl::parser::parse(&build_file_txt).unwrap();
     struct Pinned;
     impl basil::identity::closure::BaseResolver for Pinned {
-        fn resolve(&mut self, raw: &str, _t: Option<&str>, d: Option<&str>) -> Result<String, String> {
+        fn resolve(
+            &mut self,
+            raw: &str,
+            _t: Option<&str>,
+            d: Option<&str>,
+        ) -> Result<String, String> {
             if raw == "scratch" {
                 return Ok("scratch-empty".to_string());
             }
-            d.map(|d| d.to_string()).ok_or_else(|| "pinned only".to_string())
+            d.map(|d| d.to_string())
+                .ok_or_else(|| "pinned only".to_string())
         }
     }
     let closures = basil::identity::closure::compute_closure(
@@ -669,9 +801,14 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_commit\n"
         &std::collections::BTreeMap::new(),
     )
     .unwrap();
-    let stage_tag =
-        format!("basil-cache-{}", basil::identity::closure::hex(&closures["build"]));
-    assert!(cache_tags.contains(&stage_tag), "{stage_tag} not in {cache_tags:?}");
+    let stage_tag = format!(
+        "basil-cache-{}",
+        basil::identity::closure::hex(&closures["build"])
+    );
+    assert!(
+        cache_tags.contains(&stage_tag),
+        "{stage_tag} not in {cache_tags:?}"
+    );
     // The checkpoint ref is derived from the prefix closure and lives locally.
     let ck = basil::identity::closure::compute_checkpoint_closures(
         &parsed.targets,
@@ -703,7 +840,9 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_commit\n"
     // the content tag (so the idempotent check does not skip); keep the
     // checkpoint tag so build 2 resumes from it.
     c.delete_tag("bah_e2e_commit", &stage_tag).await.unwrap();
-    c.delete_tag("bah_e2e_commit", &format!("basil-{digest}")).await.unwrap();
+    c.delete_tag("bah_e2e_commit", &format!("basil-{digest}"))
+        .await
+        .unwrap();
 
     let r2 = handle_event(inp.clone()).await.unwrap();
     let digest2 = r2
@@ -711,13 +850,26 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_commit\n"
         .find(|(k, _)| k == "digest")
         .map(|(_, v)| v.clone())
         .unwrap();
-    assert_eq!(digest2, digest, "resumed rebuild must derive the same content tag");
-    let (_, manifest) = c.get_manifest("bah_e2e_commit", &format!("basil-{digest2}")).await.unwrap();
-    assert!(!manifest.is_empty(), "rebuilt deliverable must be registered");
+    assert_eq!(
+        digest2, digest,
+        "resumed rebuild must derive the same content tag"
+    );
+    let (_, manifest) = c
+        .get_manifest("bah_e2e_commit", &format!("basil-{digest2}"))
+        .await
+        .unwrap();
+    assert!(
+        !manifest.is_empty(),
+        "rebuilt deliverable must be registered"
+    );
 
     // The rebuilt stage cache carries the SAME prefix content — proof the
     // checkpoint was resumed, not re-executed.
-    let marker2 = run_grep_marker(&format!("127.0.0.1:5001/bah_e2e_commit:{stage_tag}"), "/s1.txt").await;
+    let marker2 = run_grep_marker(
+        &format!("127.0.0.1:5001/bah_e2e_commit:{stage_tag}"),
+        "/s1.txt",
+    )
+    .await;
     assert_eq!(
         marker2, marker,
         "prefix must be resumed from the checkpoint, not re-run (timestamps differ)"
@@ -733,14 +885,21 @@ async fn run_grep_marker(ref_str: &str, path: &str) -> String {
         .output()
         .await
         .unwrap();
-    assert!(c.status.success(), "from {ref_str}: {}", String::from_utf8_lossy(&c.stderr));
+    assert!(
+        c.status.success(),
+        "from {ref_str}: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
     let container = String::from_utf8_lossy(&c.stdout).trim().to_string();
     let out = tokio::process::Command::new("buildah")
         .args(["run", &container, "--", "/bin/cat", path])
         .output()
         .await
         .unwrap();
-    let _ = tokio::process::Command::new("buildah").args(["rm", &container]).status().await;
+    let _ = tokio::process::Command::new("buildah")
+        .args(["rm", &container])
+        .status()
+        .await;
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -806,7 +965,10 @@ async fn buildah_e2e_registered_stage_dependency_uses_published_ref() {
         .expect("build_targets reports the app content tag");
     // The build path returns the bare digest; the idempotent-skip path the
     // namespaced `basil-<hash>`. Accept both.
-    let app_tag = app_tag.strip_prefix("basil-").unwrap_or(&app_tag).to_string();
+    let app_tag = app_tag
+        .strip_prefix("basil-")
+        .unwrap_or(&app_tag)
+        .to_string();
     assert!(
         app_tag.len() == 64 && app_tag.chars().all(|c| c.is_ascii_hexdigit()),
         "app content tag malformed: {app_tag}"
@@ -833,12 +995,19 @@ async fn buildah_e2e_registered_stage_dependency_uses_published_ref() {
     // present in the published artifact.
     let marker = format!("127.0.0.1:5001/bah_e2e_regdep_app:basil-{app_tag}");
     let r = run_grep_marker(&marker, "/r.txt").await;
-    assert_eq!(r, "registered-content", "app must contain /r.txt from the registered stage: {r}");
+    assert_eq!(
+        r, "registered-content",
+        "app must contain /r.txt from the registered stage: {r}"
+    );
     let h = run_grep_marker(&marker, "/h.txt").await;
-    assert_eq!(h, "helper-content", "app must contain /h.txt from the registered stage: {h}");
+    assert_eq!(
+        h, "helper-content",
+        "app must contain /h.txt from the registered stage: {h}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 /// `ADD . .` must behave like a directory copy (docker-style): every
 /// dockerignore-filtered context file lands, subtree-preserving, per-file
 /// dest-reconstructed. A regression: the ADD executor arm once copied only
@@ -929,8 +1098,6 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_add\n",
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 
-
 /// A sibling module (its own context + Basilfile): the importer FROMs its
 /// image, so the module is built+published once, then the importer pulls it.
 /// The second delivery of the same event must not rebuild the module (its
@@ -938,7 +1105,8 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_add\n",
 const MODULE_BASILFILE: &str = "FROM alpine AS 127.0.0.1:5001/bah_e2e_mod\n\
 COPY mod.txt /mod.txt\n";
 
-const IMPORTER_BASILFILE: &str = "MODULE ../mod -f Basilfile TARGET 127.0.0.1:5001/bah_e2e_mod AS mod\n\
+const IMPORTER_BASILFILE: &str =
+    "MODULE ../mod -f Basilfile TARGET 127.0.0.1:5001/bah_e2e_mod AS mod\n\
 FROM scratch AS 127.0.0.1:5001/bah_e2e_imp\n\
 COPY --from=mod /mod.txt /out.txt\n\
 CMD [\"/bin/cat\",\"/out.txt\"]\n\
@@ -990,7 +1158,10 @@ async fn buildah_e2e_module_dependency() {
     let cfg_url = format!("http://127.0.0.1:5001/v2/bah_e2e_imp/blobs/{cfg_digest}");
     let resp = reqwest::Client::new().get(&cfg_url).send().await.unwrap();
     let cfg: Value = resp.json().await.unwrap();
-    assert_eq!(cfg["config"]["Cmd"], serde_json::json!(["/bin/cat", "/out.txt"]));
+    assert_eq!(
+        cfg["config"]["Cmd"],
+        serde_json::json!(["/bin/cat", "/out.txt"])
+    );
     // The module is published at `basil-<tagHash>`: its repo lists a namespaced
     // content tag alongside any mutable tags.
     let is_content_tag = |t: &str| {
@@ -1031,7 +1202,10 @@ async fn buildah_e2e_module_dependency() {
         .find(|(k, _)| k == "result")
         .map(|(k, v)| (k.clone(), v.clone()))
         .unwrap();
-    assert_eq!(result3, "idempotent-skip", "importer still skips after module deletion");
+    assert_eq!(
+        result3, "idempotent-skip",
+        "importer still skips after module deletion"
+    );
     let mod_tags_after = c.list_tags("bah_e2e_mod").await.unwrap();
     assert!(
         mod_tags_after.iter().any(|t| t == &content_tag),
