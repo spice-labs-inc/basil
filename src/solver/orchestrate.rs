@@ -2,7 +2,7 @@
 
 use crate::dsl::parser;
 use crate::event;
-use crate::identity::closure::{BaseResolver, compute_closure};
+use crate::identity::closure::{compute_closure, BaseResolver};
 use serde_json::Value as Json;
 use std::collections::HashMap;
 
@@ -14,7 +14,12 @@ struct RegistryResolver {
     resolved: HashMap<String, String>,
 }
 impl BaseResolver for RegistryResolver {
-    fn resolve(&mut self, raw: &str, tag: Option<&str>, digest: Option<&str>) -> Result<String, String> {
+    fn resolve(
+        &mut self,
+        raw: &str,
+        tag: Option<&str>,
+        digest: Option<&str>,
+    ) -> Result<String, String> {
         if raw == "scratch" {
             return Ok("scratch-empty".to_string());
         }
@@ -101,7 +106,9 @@ async fn resolve_unpinned_bases(
     // message). Dedup is shared with base pulls — same ref, one resolution.
     for t in targets {
         for instr in &t.instructions {
-            let crate::dsl::ast::Instruction::Import(im) = instr else { continue };
+            let crate::dsl::ast::Instruction::Import(im) = instr else {
+                continue;
+            };
             if im.digest.is_some() {
                 continue;
             }
@@ -200,11 +207,27 @@ async fn promote_on_tag(
         let client = ir.client();
         // Promote FROM the namespaced content tag (`basil-<hash>`) to the
         // immutable `v<version>` tag.
-        let src = format!("{}:{}", ir.repo, crate::solver::registry::content_tag(&tag_hash));
-        match client.retag(&ir.repo, &crate::solver::registry::content_tag(&tag_hash), &format!("v{version}")).await {
-            Ok(d) => tracing::info!("promote `{push_ref}:{src}` -> v{version} (digest {})", &d[..d.len().min(24)]),
+        let src = format!(
+            "{}:{}",
+            ir.repo,
+            crate::solver::registry::content_tag(&tag_hash)
+        );
+        match client
+            .retag(
+                &ir.repo,
+                &crate::solver::registry::content_tag(&tag_hash),
+                &format!("v{version}"),
+            )
+            .await
+        {
+            Ok(d) => tracing::info!(
+                "promote `{push_ref}:{src}` -> v{version} (digest {})",
+                &d[..d.len().min(24)]
+            ),
             Err(e) => {
-                anyhow::bail!("promotion immutability/retag failure for `{push_ref}:v{version}`: {e}")
+                anyhow::bail!(
+                    "promotion immutability/retag failure for `{push_ref}:v{version}`: {e}"
+                )
             }
         }
     }
@@ -293,7 +316,11 @@ async fn solve(
     // -t <target>, that's the target + its transitive FROM / COPY --from stage
     // deps — unrelated deliverables aren't built or hashed.
     let subset = dependency_subset(&parsed.targets, &names);
-    println!("basil: {} target(s) in scope (of {} total)", subset.len(), parsed.targets.len());
+    println!(
+        "basil: {} target(s) in scope (of {} total)",
+        subset.len(),
+        parsed.targets.len()
+    );
 
     // The build file's own path/context; module paths resolve against its
     // directory (D4: file-relative).
@@ -301,8 +328,13 @@ async fn solve(
     let build_file_owned = build_file.clone();
 
     // Discover module dependencies (recursive, cycle-checked, pure file walk).
-    let index = crate::identity::modules::discover_module_index(&subset, build_file_owned.parent().unwrap_or(std::path::Path::new(".")))
-        .map_err(anyhow::Error::msg)?;
+    let index = crate::identity::modules::discover_module_index(
+        &subset,
+        build_file_owned
+            .parent()
+            .unwrap_or(std::path::Path::new(".")),
+    )
+    .map_err(anyhow::Error::msg)?;
     if !index.order.is_empty() {
         println!("basil: {} module(s) discovered", index.order.len());
     }
@@ -321,15 +353,18 @@ async fn solve(
             .map_err(anyhow::Error::msg)?;
         resolved.extend(module_resolved);
     }
-    println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
+    println!(
+        "basil: resolved {} base(s) in {:.1}s",
+        resolved.len(),
+        t0.elapsed().as_secs_f64()
+    );
     let t0 = std::time::Instant::now();
     println!("basil: computing identity ({} target(s))...", subset.len());
     let mut resolver = RegistryResolver { resolved };
     // Module deliverable digests first (their own bases resolved above), so
     // the importer closure folds `base.module.*` from them.
-    let module_digests =
-        crate::identity::modules::compute_module_digests(&index, &mut resolver)
-            .map_err(anyhow::Error::msg)?;
+    let module_digests = crate::identity::modules::compute_module_digests(&index, &mut resolver)
+        .map_err(anyhow::Error::msg)?;
     let closures = compute_closure(
         &subset,
         &parsed.default_platforms,
@@ -349,7 +384,11 @@ async fn solve(
         let tag = crate::identity::closure::hex(&module_digests.deliverable[key]);
         module_refs.insert(
             key.clone(),
-            format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
+            format!(
+                "{}:{}",
+                e.push_ref,
+                crate::solver::registry::content_tag(&tag)
+            ),
         );
     }
     // Checkpoint identities (`COMMIT`): the closure of each sealed prefix,
@@ -367,12 +406,12 @@ async fn solve(
         &module_digests.deliverable,
     )
     .map_err(anyhow::Error::msg)?;
-    println!("basil: identity computed in {:.1}s", t0.elapsed().as_secs_f64());
+    println!(
+        "basil: identity computed in {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
     for name in &names {
-        println!(
-            "basil: identity {name} -> {}",
-            digest_of(name, &closures)?
-        );
+        println!("basil: identity {name} -> {}", digest_of(name, &closures)?);
     }
 
     Ok(SolveContext {
@@ -473,7 +512,11 @@ pub async fn run_target(
             let tag = crate::identity::closure::hex(&module_digests.deliverable[key]);
             module_refs.insert(
                 key.clone(),
-                format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
+                format!(
+                    "{}:{}",
+                    e.push_ref,
+                    crate::solver::registry::content_tag(&tag)
+                ),
             );
         }
         // Checkpoint identities (`COMMIT`) — the closure of each sealed prefix.
@@ -570,7 +613,14 @@ fn effective_run_cache_to(flag: Option<&str>, target: &crate::dsl::ast::Target) 
 fn resolve_task_target<'a>(
     parsed: &'a crate::dsl::ast::File,
     filter: &str,
-) -> Result<(&'a str, &'a crate::dsl::ast::Target, &'a crate::dsl::ast::TaskCmd), String> {
+) -> Result<
+    (
+        &'a str,
+        &'a crate::dsl::ast::Target,
+        &'a crate::dsl::ast::TaskCmd,
+    ),
+    String,
+> {
     let target = parsed
         .targets
         .iter()
@@ -578,7 +628,12 @@ fn resolve_task_target<'a>(
         .ok_or_else(|| {
             format!(
                 "target `{filter}` not found in file (known: {})",
-                parsed.targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                parsed
+                    .targets
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         })?;
     // A REGISTERed target is a published deliverable; `run` is the manual DO
@@ -664,9 +719,23 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
             // Stages are reconciled by existence too: a missing cache image is
             // rebuilt and pushed even on the noop path (D2).
-            let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+            let cache_g = crate::solver::buildah::Graph::new(
+                &subset,
+                &parsed.global_args,
+                &file_dir,
+                &module_refs,
+                &stage_cache,
+                &checkpoint_refs,
+            );
             ensure_stages_cached(cache_g, inp.context, &build_file, &deliverables).await?;
-            let g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+            let g = crate::solver::buildah::Graph::new(
+                &subset,
+                &parsed.global_args,
+                &file_dir,
+                &module_refs,
+                &stage_cache,
+                &checkpoint_refs,
+            );
             for (name, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
                 // OUTPUT still runs: pull the published image and extract.
@@ -691,7 +760,14 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
     // Every intermediate stage must exist as its cache image before the
     // deliverable's Containerfile references it (reconcile by existence).
-    let cache_g = crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+    let cache_g = crate::solver::buildah::Graph::new(
+        &subset,
+        &parsed.global_args,
+        &file_dir,
+        &module_refs,
+        &stage_cache,
+        &checkpoint_refs,
+    );
     ensure_stages_cached(cache_g, inp.context, &build_file, &deliverables).await?;
 
     for (name, push_ref) in &deliverables {
@@ -700,7 +776,14 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&subset, &parsed.global_args, &file_dir, &module_refs, &stage_cache, &checkpoint_refs),
+            crate::solver::buildah::Graph::new(
+                &subset,
+                &parsed.global_args,
+                &file_dir,
+                &module_refs,
+                &stage_cache,
+                &checkpoint_refs,
+            ),
             name,
             push_ref,
             &tag,
@@ -734,9 +817,16 @@ pub async fn promote_version(
     version: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let solved = solve(file, context, target_filter).await?;
-    let SolveContext { deliverables, closures, .. } = solved;
+    let SolveContext {
+        deliverables,
+        closures,
+        ..
+    } = solved;
     let version = version.trim_start_matches('v').to_string();
-    if version.split('.').any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+    if version
+        .split('.')
+        .any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()))
+    {
         anyhow::bail!("invalid version `{version}` (expected e.g. 1.2.3)");
     }
 
@@ -757,16 +847,15 @@ pub async fn promote_version(
                 );
             }
             Err(e) => {
-                tracing::warn!("promote probe for `{push_ref}:{content}` failed ({e}); will attempt retag");
+                tracing::warn!(
+                    "promote probe for `{push_ref}:{content}` failed ({e}); will attempt retag"
+                );
             }
         }
         let dest = format!("v{version}");
-        client
-            .retag(&ir.repo, &content, &dest)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("promotion immutability/retag failure for `{push_ref}:v{version}`: {e}")
-            })?;
+        client.retag(&ir.repo, &content, &dest).await.map_err(|e| {
+            anyhow::anyhow!("promotion immutability/retag failure for `{push_ref}:v{version}`: {e}")
+        })?;
         println!("basil: promoted {push_ref}:{dest} -> {content}");
         promoted.push((push_ref.clone(), dest));
     }
@@ -776,7 +865,11 @@ pub async fn promote_version(
 /// The subset of targets reachable from `roots`: each root plus every stage it
 /// depends on via `FROM <stage>` or `COPY --from=<stage>`, transitively. This
 /// lets a targeted build avoid computing identity/render for unrelated stages.
-pub fn dependency_subset(all: &[crate::dsl::ast::Target], roots: &[String]) -> Vec<crate::dsl::ast::Target> {    let by_name: std::collections::HashMap<&str, &crate::dsl::ast::Target> =
+pub fn dependency_subset(
+    all: &[crate::dsl::ast::Target],
+    roots: &[String],
+) -> Vec<crate::dsl::ast::Target> {
+    let by_name: std::collections::HashMap<&str, &crate::dsl::ast::Target> =
         all.iter().map(|t| (t.name.as_str(), t)).collect();
     let mut keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut stack: Vec<String> = roots.to_vec();
@@ -865,7 +958,10 @@ RUN echo other
         let f = parse(src).unwrap();
         // By the AS name.
         let e = resolve_task_target(&f, "notify").unwrap_err();
-        assert!(e.contains("REGISTER") && e.contains("excludes registered"), "{e}");
+        assert!(
+            e.contains("REGISTER") && e.contains("excludes registered"),
+            "{e}"
+        );
         assert!(e.contains("127.0.0.1:5001/notify"), "{e}");
         // By the REGISTER ref.
         let e = resolve_task_target(&f, "127.0.0.1:5001/notify").unwrap_err();
@@ -923,9 +1019,15 @@ COPY --from=reg /x /x
         );
         // Non-registered intermediates keep the cache ref.
         let base = refs.get("base").expect("base maps to a cache ref");
-        assert!(base.starts_with("127.0.0.1:5001/cache:basil-cache-"), "{base}");
+        assert!(
+            base.starts_with("127.0.0.1:5001/cache:basil-cache-"),
+            "{base}"
+        );
         // The deliverable itself is excluded.
-        assert!(!refs.contains_key("app"), "deliverable must not appear in stage refs");
+        assert!(
+            !refs.contains_key("app"),
+            "deliverable must not appear in stage refs"
+        );
     }
 
     #[test]
@@ -942,6 +1044,121 @@ COPY --from=reg /x /x
         let n = &plain.targets[0];
         assert_eq!(base_stage_name(&plain, n), None);
     }
+
+    #[test]
+    fn do_targets_mixed_build_and_do_reactions() {
+        // A reaction pair BUILD app DO deploy must yield both - the deploy
+        // runs after the build, not only when no deliverable is built.
+        let src = "FROM alpine AS app\nRUN echo a\n\nFROM alpine AS deploy\nTASK echo deploy\nON push(main) BUILD app DO deploy\n";
+        let f = parse(src).unwrap();
+        let refs: Vec<&crate::dsl::ast::Reaction> = vec![&f.reactions[0]];
+        let runs = do_targets_for(&refs, &f.targets);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].0, "deploy");
+    }
+
+    #[test]
+    fn do_targets_skips_unknown_and_taskless() {
+        // Unknown names and task-less targets are no-ops (the original
+        // DO-only path's semantics, preserved).
+        let src =
+            "FROM alpine AS a\nTASK echo a\nFROM alpine AS b\nON push(main) DO a DO b DO nope\n";
+        let f = parse(src).unwrap();
+        let refs: Vec<&crate::dsl::ast::Reaction> = vec![&f.reactions[0]];
+        let runs = do_targets_for(&refs, &f.targets);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].0, "a");
+    }
+
+    #[test]
+    fn do_targets_preserve_reaction_order() {
+        let src = "FROM alpine AS one\nTASK echo 1\nFROM alpine AS two\nTASK echo 2\nON push(main) DO two\nON release DO one\n";
+        let f = parse(src).unwrap();
+        let refs: Vec<&crate::dsl::ast::Reaction> = vec![&f.reactions[0], &f.reactions[1]];
+        let runs = do_targets_for(&refs, &f.targets);
+        let names: Vec<&str> = runs.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["two", "one"]);
+    }
+
+    #[test]
+    fn unmatched_event_is_a_noop() {
+        // An event matching no reaction returns Ok(vec![]) - never a registry
+        // touch, never a hard error: basil handle is fed every webhook event.
+        let dir = std::env::temp_dir().join(format!("basil-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Basilfile");
+        std::fs::write(
+            &file,
+            "FROM alpine AS ghcr.io/x/app\nON push(main) BUILD ghcr.io/x/app\n",
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(handle_event(BuildInput {
+            file: file.to_str().unwrap(),
+            context: std::path::Path::new(&dir),
+            event_json: Some(r#"{"ref": "refs/heads/other"}"#),
+            target_filter: None,
+            force: false,
+            cache_to: None,
+        }));
+        match res {
+            Ok(pairs) => assert!(pairs.is_empty(), "{pairs:?}"),
+            Err(e) => panic!("unmatched event must be a no-op, got: {e:#}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The ordered DO executions a set of matched reactions implies: every
+/// DO <name> in reaction order, mapped to its target. A DO naming an
+/// unknown target, or a target without a TASK clause, is a no-op (skipped),
+/// matching the original DO-only path's semantics. The target's TASK runs on
+/// its resolved base image; see run_do_tasks.
+fn do_targets_for<'a>(
+    matched: &[&'a crate::dsl::ast::Reaction],
+    targets: &'a [crate::dsl::ast::Target],
+) -> Vec<(&'a str, &'a crate::dsl::ast::Target)> {
+    let mut out = Vec::new();
+    for r in matched {
+        for do_name in &r.do_list {
+            if let Some(t) = targets.iter().find(|t| &t.name == do_name) {
+                if t.task.is_some() {
+                    out.push((do_name.as_str(), t));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Run every DO task a set of matched reactions implies, one-shot, in
+/// reaction order, each on its target's resolved base image with
+/// BASIL_EVENT set. A non-zero task exit fails the invocation. Called on
+/// the DO-only path and after the deliverable build / idempotent-skip paths,
+/// so a reaction pair like BUILD app DO deploy runs the deploy after the
+/// artifact is published either way.
+async fn run_do_tasks(
+    matched: &[&crate::dsl::ast::Reaction],
+    targets: &[crate::dsl::ast::Target],
+    event_ref: &str,
+) -> anyhow::Result<()> {
+    for (do_name, t) in do_targets_for(matched, targets) {
+        let Some(task) = &t.task else {
+            continue; // do_targets_for filters to task-bearing targets; no panic path
+        };
+        let crate::dsl::ast::Base::Image(base_image) = &t.base else {
+            anyhow::bail!("DO task `{do_name}`: module bases are not runnable as tasks");
+        };
+        let image = resolved_image(base_image);
+        let env = vec![format!("BASIL_EVENT={}", event_ref)];
+        let code = crate::solver::buildah::run_task(&image, &task.command, &env).await?;
+        if code != 0 {
+            anyhow::bail!("DO task `{do_name}` failed with exit {code}");
+        }
+        tracing::info!("DO task `{do_name}` completed (exit 0)");
+    }
+    Ok(())
 }
 
 /// Build using the buildah backend (plain subprocess, no daemon), driven by
@@ -950,9 +1167,12 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     let src = crate::fsctx::fs_err(std::fs::read_to_string(inp.file), inp.file, "read")?;
     println!("basil: parsed {}", inp.file);
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
+    parser::validate_reactions(&parsed).map_err(anyhow::Error::msg)?;
 
     let event_payload: Json = match inp.event_json {
-        Some(j) => serde_json::from_str(j).map_err(|e| anyhow::anyhow!("invalid event JSON: {e}"))?,
+        Some(j) => {
+            serde_json::from_str(j).map_err(|e| anyhow::anyhow!("invalid event JSON: {e}"))?
+        }
         None => {
             return Err(anyhow::anyhow!(
                 "build requires an event (stdin JSON) or a manual --target"
@@ -976,37 +1196,31 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
                 .targets
                 .iter()
                 .find(|t| &t.name == b || t.register.as_ref() == Some(b));
-            let entry = t.map(|t| (t.name.clone(), t.push_ref().to_string()))
-                .unwrap_or_else(|| (b.clone(), b.clone()));
+            let entry = t
+                .map(|t| (t.name.clone(), t.push_ref().to_string()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ON reaction BUILD \"{b}\" matches no target - reactions are validated at parse; refusing to proceed"
+                    )
+                })?;
             if !deliverables.contains(&entry) {
                 deliverables.push(entry);
             }
         }
     }
     let deliverable_names: Vec<String> = deliverables.iter().map(|(n, _)| n.clone()).collect();
+    // An event that matches no reaction is a no-op: basil handle is fed
+    // every event from a webhook/CI forwarder, so an unrelated push must not
+    // fail the job - there is simply nothing for it to do.
     if matched.is_empty() {
-        return Err(anyhow::anyhow!("no matching reactions for the delivered event"));
+        println!("basil: event matched no reactions -- nothing to do");
+        return Ok(vec![]);
     }
-    // DO-only: run tasks via buildah run.
+    // DO-only reactions: run the tasks one-shot, in reaction order. When the
+    // event also matches BUILD reactions, the DOs run *after* the build (see
+    // below) so a task like deploy sees what was just built.
     if deliverable_names.is_empty() {
-        for r in &matched {
-            for do_name in &r.do_list {
-                if let Some(t) = parsed.targets.iter().find(|t| &t.name == do_name) {
-                    if let Some(task) = &t.task {
-                        let crate::dsl::ast::Base::Image(base_image) = &t.base else {
-                            anyhow::bail!("DO task `{do_name}`: module bases are not runnable as tasks");
-                        };
-                        let image = resolved_image(base_image);
-                        let env = vec![format!("BASIL_EVENT={}", event_ref)];
-                        let code = crate::solver::buildah::run_task(&image, &task.command, &env).await?;
-                        if code != 0 {
-                            anyhow::bail!("DO task `{do_name}` failed with exit {code}");
-                        }
-                        tracing::info!("DO task `{do_name}` completed (exit 0)");
-                    }
-                }
-            }
-        }
+        run_do_tasks(&matched, &parsed.targets, &event_ref).await?;
         return Ok(vec![]);
     }
 
@@ -1026,7 +1240,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     if let Some(version) = version_arg {
         build_args.insert("VERSION".to_string(), version);
     }
-    println!("basil: resolving {} base(s) from registries...", parsed.targets.len());
+    println!(
+        "basil: resolving {} base(s) from registries...",
+        parsed.targets.len()
+    );
     let t0 = std::time::Instant::now();
     let mut resolved = resolve_unpinned_bases(&parsed.targets)
         .await
@@ -1048,15 +1265,21 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             .map_err(anyhow::Error::msg)?;
         resolved.extend(module_resolved);
     }
-    println!("basil: resolved {} base(s) in {:.1}s", resolved.len(), t0.elapsed().as_secs_f64());
+    println!(
+        "basil: resolved {} base(s) in {:.1}s",
+        resolved.len(),
+        t0.elapsed().as_secs_f64()
+    );
     let t1 = std::time::Instant::now();
-    println!("basil: computing identity ({} targets)...", parsed.targets.len());
+    println!(
+        "basil: computing identity ({} targets)...",
+        parsed.targets.len()
+    );
     let mut resolver = RegistryResolver { resolved };
     // Module deliverable digests first (their own bases resolved above), so
     // the importer closure folds `base.module.*` from them.
-    let module_digests =
-        crate::identity::modules::compute_module_digests(&index, &mut resolver)
-            .map_err(anyhow::Error::msg)?;
+    let module_digests = crate::identity::modules::compute_module_digests(&index, &mut resolver)
+        .map_err(anyhow::Error::msg)?;
     let closures = compute_closure(
         &parsed.targets,
         &parsed.default_platforms,
@@ -1076,7 +1299,11 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         let tag = crate::identity::closure::hex(&module_digests.deliverable[key]);
         module_refs.insert(
             key.clone(),
-            format!("{}:{}", e.push_ref, crate::solver::registry::content_tag(&tag)),
+            format!(
+                "{}:{}",
+                e.push_ref,
+                crate::solver::registry::content_tag(&tag)
+            ),
         );
     }
     // Checkpoint identities (`COMMIT`) — the closure of each sealed prefix.
@@ -1092,7 +1319,10 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         &module_digests.deliverable,
     )
     .map_err(anyhow::Error::msg)?;
-    println!("basil: identity computed in {:.1}s", t1.elapsed().as_secs_f64());
+    println!(
+        "basil: identity computed in {:.1}s",
+        t1.elapsed().as_secs_f64()
+    );
 
     // Every non-deliverable stage in scope gets a cache image
     // (`<repo>:basil-cache-<stageHash>`). The cache repo is `--cache-to`, else
@@ -1115,9 +1345,23 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             // re-registered (same tagHash — the importer image stays valid).
             ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
             // Stages are reconciled by existence too (D2).
-            let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+            let cache_g = crate::solver::buildah::Graph::new(
+                &parsed.targets,
+                &parsed.global_args,
+                file_dir,
+                &module_refs,
+                &stage_cache,
+                &checkpoint_refs,
+            );
             ensure_stages_cached(cache_g, inp.context, &build_file, &deliverables).await?;
-            let g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+            let g = crate::solver::buildah::Graph::new(
+                &parsed.targets,
+                &parsed.global_args,
+                file_dir,
+                &module_refs,
+                &stage_cache,
+                &checkpoint_refs,
+            );
             for (_, push_ref, tag) in &published {
                 println!("basil: image {push_ref}:{tag} (registered)");
             }
@@ -1131,11 +1375,22 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
                 )
                 .await?;
             }
-            promote_on_tag(&matched, &event_payload, &event_ref, &closures, &parsed.targets).await?;
+            promote_on_tag(
+                &matched,
+                &event_payload,
+                &event_ref,
+                &closures,
+                &parsed.targets,
+            )
+            .await?;
+            run_do_tasks(&matched, &parsed.targets, &event_ref).await?;
             println!("basil: done ({})", deliverable_names.join(", "));
             return Ok(vec![
                 ("result".to_string(), "idempotent-skip".to_string()),
-                ("digest".to_string(), digest_of(&deliverable_names[0], &closures)?),
+                (
+                    "digest".to_string(),
+                    digest_of(&deliverable_names[0], &closures)?,
+                ),
             ]);
         }
     }
@@ -1146,7 +1401,14 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     // still reconciled by existence, only the importer is force-built.
     ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
     // Every intermediate stage must exist as its cache image first (D2).
-    let cache_g = crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache, &checkpoint_refs);
+    let cache_g = crate::solver::buildah::Graph::new(
+        &parsed.targets,
+        &parsed.global_args,
+        file_dir,
+        &module_refs,
+        &stage_cache,
+        &checkpoint_refs,
+    );
     ensure_stages_cached(cache_g, inp.context, &build_file, &deliverables).await?;
 
     // Build each deliverable with buildah.
@@ -1156,7 +1418,14 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             .map(|ir| ir.is_local())
             .unwrap_or(false);
         crate::solver::buildah::build_deliverable(
-            crate::solver::buildah::Graph::new(&parsed.targets, &parsed.global_args, file_dir, &module_refs, &stage_cache, &checkpoint_refs),
+            crate::solver::buildah::Graph::new(
+                &parsed.targets,
+                &parsed.global_args,
+                file_dir,
+                &module_refs,
+                &stage_cache,
+                &checkpoint_refs,
+            ),
             name,
             push_ref,
             &tag,
@@ -1169,7 +1438,15 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         .await?;
     }
 
-    promote_on_tag(&matched, &event_payload, &event_ref, &closures, &parsed.targets).await?;
+    promote_on_tag(
+        &matched,
+        &event_payload,
+        &event_ref,
+        &closures,
+        &parsed.targets,
+    )
+    .await?;
+    run_do_tasks(&matched, &parsed.targets, &event_ref).await?;
     println!("basil: done ({})", deliverable_names.join(", "));
     Ok(vec![(
         "digest".to_string(),
@@ -1194,7 +1471,9 @@ async fn ensure_modules_built(
         // `from_ref` is `<push-ref>:basil-<hash>`; keep the full namespaced tag
         // for the existence probe (that is the tag as stored in the registry)
         // but hand build_deliverable the bare hash — it re-prefixes internally.
-        let full_tag = from_ref.strip_prefix(&format!("{}:", e.push_ref)).unwrap_or(from_ref);
+        let full_tag = from_ref
+            .strip_prefix(&format!("{}:", e.push_ref))
+            .unwrap_or(from_ref);
         let hash = full_tag
             .strip_prefix(crate::solver::registry::BASIL_TAG_PREFIX)
             .unwrap_or(full_tag);
@@ -1220,8 +1499,7 @@ async fn ensure_modules_built(
         );
         // `COMMIT` checkpoints inside the module: their refs use the module's
         // cache repo like its stage caches.
-        let module_checkpoint_refs =
-            checkpoint_refs(&module_closures.checkpoints[key]);
+        let module_checkpoint_refs = checkpoint_refs(&module_closures.checkpoints[key]);
         let g_for_cache = crate::solver::buildah::Graph::new(
             &e.parsed.targets,
             &e.parsed.global_args,
@@ -1267,10 +1545,7 @@ async fn ensure_modules_built(
 
 /// The cache repo for intermediate-stage images: `--cache-to`, else
 /// `BASIL_CACHE_REF`, else the first deliverable's repo (the D1 default).
-fn effective_cache_to(
-    flag: Option<&str>,
-    deliverables: &[(String, String)],
-) -> String {
+fn effective_cache_to(flag: Option<&str>, deliverables: &[(String, String)]) -> String {
     if let Some(f) = flag {
         return f.to_string();
     }
@@ -1319,7 +1594,9 @@ fn stage_cache_refs(
         if deliv.contains(t.name.as_str()) {
             continue;
         }
-        let Some(hash) = closures.get(&t.name) else { continue };
+        let Some(hash) = closures.get(&t.name) else {
+            continue;
+        };
         let hex = crate::identity::closure::hex(hash);
         let ref_str = if t.register.is_some() {
             // A REGISTERed stage is a published deliverable: dependents use
@@ -1362,7 +1639,9 @@ async fn ensure_stages_cached(
         if deliv.contains(t.name.as_str()) {
             continue;
         }
-        let Some(ref_str) = g.stage_cache.get(&t.name) else { continue };
+        let Some(ref_str) = g.stage_cache.get(&t.name) else {
+            continue;
+        };
         // `<cache-to>:basil-cache-<hash>` -> repo + tag.
         let (repo, tag) = ref_str
             .rsplit_once(':')
@@ -1477,8 +1756,6 @@ fn digest_of(
         .map(|t| crate::identity::closure::hex(t))
         .ok_or_else(|| anyhow::anyhow!("no identity computed for `{name}`"))
 }
-
-
 
 fn resolved_image(base: &crate::dsl::ast::BaseImage) -> String {
     let mut s = base.raw.clone();
