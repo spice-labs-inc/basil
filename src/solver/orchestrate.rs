@@ -414,7 +414,7 @@ async fn solve(
         let e = &index.entries[key];
         let module_resolved = resolve_unpinned_bases(&e.parsed.targets)
             .await
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|msg| crate::fsctx::with_module(anyhow_tracing::anyhow!("{msg}"), &key))?;
         resolved.extend(module_resolved);
     }
     println!(
@@ -551,7 +551,7 @@ pub async fn run_target(
             let e = &index.entries[key];
             let module_resolved = resolve_unpinned_bases(&e.parsed.targets)
                 .await
-                .map_err(anyhow::Error::msg)?;
+                .map_err(|msg| crate::fsctx::with_module(anyhow_tracing::anyhow!("{msg}"), &key))?;
             resolved.extend(module_resolved);
         }
         let mut resolver = RegistryResolver { resolved };
@@ -1331,7 +1331,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         let e = &index.entries[key];
         let module_resolved = resolve_unpinned_bases(&e.parsed.targets)
             .await
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|msg| crate::fsctx::with_module(anyhow_tracing::anyhow!("{msg}"), &key))?;
         resolved.extend(module_resolved);
     }
     println!(
