@@ -338,7 +338,7 @@ pub(crate) fn target_env(target: &Target) -> std::collections::BTreeMap<String, 
     env
 }
 
-fn target_platform_list(target: &Target, file_default: &[Platform]) -> Vec<Platform> {
+pub(crate) fn target_platform_list(target: &Target, file_default: &[Platform]) -> Vec<Platform> {
     // Per-target platforms override the file-wide default (inherited). A target
     // with no declaration and no file default contributes none (the builder's
     // native platform is a Phase 5 concern).

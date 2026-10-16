@@ -23,6 +23,9 @@ use crate::dsl::ast::{Arg, Base, Command, Instruction, Target};
 pub struct Graph<'a> {
     pub targets: &'a [Target],
     pub global_args: &'a [Arg],
+    /// The file-wide default platform list (PLATFORM before the first FROM),
+    /// for targets without their own PLATFORM declaration.
+    pub default_platforms: &'a [crate::dsl::ast::Platform],
     /// Directory of the importing Basilfile — module paths resolve against it.
     pub file_dir: &'a std::path::Path,
     /// Module key -> `FROM`-ready ref (`<push-ref>:<tagHash>`).
@@ -43,6 +46,7 @@ impl<'a> Graph<'a> {
     pub fn new(
         targets: &'a [Target],
         global_args: &'a [Arg],
+        default_platforms: &'a [crate::dsl::ast::Platform],
         file_dir: &'a std::path::Path,
         modules: &'a std::collections::BTreeMap<String, String>,
         stage_cache: &'a std::collections::BTreeMap<String, String>,
@@ -51,6 +55,7 @@ impl<'a> Graph<'a> {
         Graph {
             targets,
             global_args,
+            default_platforms,
             file_dir,
             modules,
             stage_cache,

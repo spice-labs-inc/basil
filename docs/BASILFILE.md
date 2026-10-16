@@ -136,12 +136,12 @@ yet).
 FROM [--platform=<sel>] <base> [AS <name>]
 ```
 The target's base image and optional stage name. `--platform=<sel>` picks the
-base's platform: `$BUILDPLATFORM` (build host's native platform) or
-`$TARGETPLATFORM` (the target platform, defaulting to the host when no explicit
-target is selected) — both expand to the host platform under basil's
-per-instruction model — or a literal `linux/arm64` selects that platform
-directly. A build stage that must run natively uses
-`FROM --platform=$BUILDPLATFORM …`.
+base's platform: `$BUILDPLATFORM` expands to the build host's native platform;
+`$TARGETPLATFORM` expands to the target's declared `PLATFORM` (per-target
+`PLATFORM`, else the file-wide default); when the target declares none (or
+several) it falls back to the build host's platform. A literal `linux/arm64`
+selects that platform directly. A build stage that must run natively uses
+FROM --platform=`$BUILDPLATFORM` ...
 See [Targets](#targets).
 
 ### `MODULE`

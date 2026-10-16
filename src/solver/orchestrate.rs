@@ -544,6 +544,7 @@ pub async fn run_target(
         let g = crate::solver::buildah::Graph::new(
             &subset,
             &parsed.global_args,
+            &parsed.default_platforms,
             file_dir,
             &module_refs,
             &stage_cache,
@@ -722,6 +723,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             let cache_g = crate::solver::buildah::Graph::new(
                 &subset,
                 &parsed.global_args,
+                &parsed.default_platforms,
                 &file_dir,
                 &module_refs,
                 &stage_cache,
@@ -731,6 +733,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             let g = crate::solver::buildah::Graph::new(
                 &subset,
                 &parsed.global_args,
+                &parsed.default_platforms,
                 &file_dir,
                 &module_refs,
                 &stage_cache,
@@ -763,6 +766,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     let cache_g = crate::solver::buildah::Graph::new(
         &subset,
         &parsed.global_args,
+        &parsed.default_platforms,
         &file_dir,
         &module_refs,
         &stage_cache,
@@ -779,6 +783,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             crate::solver::buildah::Graph::new(
                 &subset,
                 &parsed.global_args,
+                &parsed.default_platforms,
                 &file_dir,
                 &module_refs,
                 &stage_cache,
@@ -1348,6 +1353,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             let cache_g = crate::solver::buildah::Graph::new(
                 &parsed.targets,
                 &parsed.global_args,
+                &parsed.default_platforms,
                 file_dir,
                 &module_refs,
                 &stage_cache,
@@ -1357,6 +1363,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             let g = crate::solver::buildah::Graph::new(
                 &parsed.targets,
                 &parsed.global_args,
+                &parsed.default_platforms,
                 file_dir,
                 &module_refs,
                 &stage_cache,
@@ -1404,6 +1411,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     let cache_g = crate::solver::buildah::Graph::new(
         &parsed.targets,
         &parsed.global_args,
+        &parsed.default_platforms,
         file_dir,
         &module_refs,
         &stage_cache,
@@ -1421,6 +1429,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
             crate::solver::buildah::Graph::new(
                 &parsed.targets,
                 &parsed.global_args,
+                &parsed.default_platforms,
                 file_dir,
                 &module_refs,
                 &stage_cache,
@@ -1503,6 +1512,7 @@ async fn ensure_modules_built(
         let g_for_cache = crate::solver::buildah::Graph::new(
             &e.parsed.targets,
             &e.parsed.global_args,
+            &e.parsed.default_platforms,
             &e.context,
             module_refs,
             &stage_cache,
@@ -1521,6 +1531,7 @@ async fn ensure_modules_built(
         let g = crate::solver::buildah::Graph::new(
             &e.parsed.targets,
             &e.parsed.global_args,
+            &e.parsed.default_platforms,
             &e.context,
             module_refs,
             &stage_cache,

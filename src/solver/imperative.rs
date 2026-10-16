@@ -53,24 +53,25 @@ impl SubstCtx {
     }
 }
 
-/// `buildah from <base>`, with the base's `--platform` selector and image ref
+/// buildah from <base>, with the base's --platform selector and image ref
 /// passed as separate argv (gluing them breaks buildah's arg parser) and
-/// `--tls-verify=false` for local/insecure hosts. The build-staged platform
-/// variables (`$BUILDPLATFORM`/`$TARGETPLATFORM`) expand to the host platform
-/// — the same value `buildah bud` would use when no `--platform` flag is given;
-/// any other `$VAR` in a selector is a hard error (it could not be resolved
-/// faithfully).
+/// --tls-verify=false for local/insecure hosts. $BUILDPLATFORM expands to the
+/// build host's native platform; $TARGETPLATFORM expands to the target's
+/// declared PLATFORM (a single declaration, per-target or file-wide) or the
+/// host platform when none is declared (multi-platform targets are not yet
+/// built). Any other $VAR in a selector is a hard error (it could not be
+/// resolved faithfully).
 async fn buildah_from_resolved(
     base: &crate::solver::buildah::ResolvedBase,
+    target_platform: Option<&str>,
 ) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("buildah");
     cmd.arg("from");
     if let Some(p) = &base.platform {
-        let p = expand_platform_selector(p);
+        let p = expand_platform_selector(p, target_platform);
         if p.contains('$') {
             anyhow::bail!(
-                "FROM --platform={p}: unexpandable platform variable (only $BUILDPLATFORM / \
-                 $TARGETPLATFORM, resolved to the host platform, or a literal platform)"
+                "FROM --platform={p}: unexpandable platform variable (only $BUILDPLATFORM resolved to the host platform, or $TARGETPLATFORM resolved to the target platform, or a literal platform)"
             );
         }
         cmd.arg(format!("--platform={p}"));
@@ -94,14 +95,33 @@ async fn buildah_from_resolved(
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Expand the build-staged platform variables to the host platform (the value
-/// `buildah bud` assumes when basil passes no `--platform` flag).
-fn expand_platform_selector(sel: &str) -> String {
+/// Expand the build-staged platform variables: $BUILDPLATFORM is the build
+/// host's native platform; $TARGETPLATFORM is the target's declared PLATFORM
+/// (a single declaration, per-target or file-wide) or falls back to the host
+/// platform when none is declared (multi-platform targets are not yet built).
+
+/// The single platform a target's container is built for: exactly one declared
+/// PLATFORM (per-target, else the file-wide default) -> that platform; none or
+/// several -> None, keeping the builder on the host platform (multi-platform
+/// building is not implemented).
+fn target_platform_override(
+    target: &Target,
+    file_default: &[crate::dsl::ast::Platform],
+) -> Option<String> {
+    let list = crate::identity::closure::target_platform_list(target, file_default);
+    match list.len() {
+        1 => list.into_iter().next().map(|p| p.to_string()),
+        _ => None,
+    }
+}
+
+fn expand_platform_selector(sel: &str, target_platform: Option<&str>) -> String {
     let host = host_platform();
+    let target = target_platform.unwrap_or(host.as_str());
     sel.replace("${BUILDPLATFORM}", &host)
         .replace("$BUILDPLATFORM", &host)
-        .replace("${TARGETPLATFORM}", &host)
-        .replace("$TARGETPLATFORM", &host)
+        .replace("${TARGETPLATFORM}", target)
+        .replace("$TARGETPLATFORM", target)
 }
 
 fn host_platform() -> String {
@@ -138,6 +158,10 @@ pub(crate) async fn build_stage_imperative(
         .iter()
         .find(|t| t.name == stage)
         .ok_or_else(|| anyhow::anyhow!("imperative build: stage `{stage}` not in scope"))?;
+    // The platform this stage's container is built for: its declared PLATFORM
+    // (exactly one, per-target or file-wide) or the host when none is declared.
+    let target_platform = target_platform_override(target, g.default_platforms);
+
     let base = crate::solver::buildah::resolve_base_ref(
         &target.base,
         g.file_dir,
@@ -177,7 +201,7 @@ pub(crate) async fn build_stage_imperative(
         }
         None => {
             println!("basil: build {stage} from {}", base.image);
-            container = buildah_from_resolved(&base).await?;
+            container = buildah_from_resolved(&base, target_platform.as_deref()).await?;
         }
     }
     // Instructions run, then the container is committed to `local_ref`. The
@@ -791,17 +815,21 @@ mod tests {
     }
 
     #[test]
-    fn platform_vars_expand_to_host() {
+    fn platform_vars_expand_to_host_without_target() {
         let host = host_platform();
-        assert_eq!(expand_platform_selector("$BUILDPLATFORM"), host);
-        assert_eq!(expand_platform_selector("${BUILDPLATFORM}"), host);
+        assert_eq!(expand_platform_selector("$BUILDPLATFORM", None), host);
+        assert_eq!(expand_platform_selector("${BUILDPLATFORM}", None), host);
         assert_eq!(
-            expand_platform_selector("linux/$TARGETPLATFORM"),
+            expand_platform_selector("linux/$TARGETPLATFORM", None),
             format!("linux/{host}")
         );
-        assert_eq!(expand_platform_selector("linux/amd64"), "linux/amd64");
+        assert_eq!(
+            expand_platform_selector("linux/$TARGETPLATFORM", Some("linux/arm64")),
+            "linux/linux/arm64"
+        );
+        assert_eq!(expand_platform_selector("linux/amd64", None), "linux/amd64");
         // Unknown vars stay literal; buildah_from_resolved rejects the `$`.
-        assert_eq!(expand_platform_selector("$NOPE"), "$NOPE");
+        assert_eq!(expand_platform_selector("$NOPE", None), "$NOPE");
     }
 
     #[test]
@@ -999,5 +1027,90 @@ mod tests {
         assert_eq!(exec_form(&c, &ctx), r#"["/bin/sh","-c","echo hi bar"]"#);
         let exec = Command::Exec(vec!["/app".to_string(), "$FOO".to_string()]);
         assert_eq!(exec_form(&exec, &ctx), r#"["/app","bar"]"#);
+    }
+}
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use crate::dsl::parser::parse;
+
+    #[test]
+    fn target_platform_expands_to_declared_platform() {
+        assert_eq!(
+            expand_platform_selector("$TARGETPLATFORM", Some("linux/arm64")),
+            "linux/arm64"
+        );
+        assert_eq!(
+            expand_platform_selector("${TARGETPLATFORM}", Some("linux/arm64")),
+            "linux/arm64"
+        );
+    }
+
+    #[test]
+    fn target_platform_falls_back_to_host() {
+        assert_eq!(
+            expand_platform_selector("$TARGETPLATFORM", None),
+            host_platform()
+        );
+    }
+
+    #[test]
+    fn build_platform_is_always_host() {
+        assert_eq!(
+            expand_platform_selector("$BUILDPLATFORM", Some("linux/arm64")),
+            host_platform()
+        );
+    }
+
+    #[test]
+    fn literal_platform_passes_through() {
+        assert_eq!(
+            expand_platform_selector("linux/amd64", Some("linux/arm64")),
+            "linux/amd64"
+        );
+    }
+
+    #[test]
+    fn single_declared_platform_is_the_target_platform() {
+        let f = parse("FROM alpine AS a\nPLATFORM linux/arm64\n").unwrap();
+        let t = &f.targets[0];
+        assert_eq!(
+            target_platform_override(t, &[]).as_deref(),
+            Some("linux/arm64")
+        );
+    }
+
+    #[test]
+    fn file_default_platform_is_inherited() {
+        let f = parse("PLATFORM linux/arm64\nFROM alpine AS a\n").unwrap();
+        let t = &f.targets[0];
+        assert_eq!(
+            target_platform_override(t, &f.default_platforms).as_deref(),
+            Some("linux/arm64")
+        );
+    }
+
+    #[test]
+    fn no_declared_platform_stays_host() {
+        let f = parse("FROM alpine AS a\n").unwrap();
+        let t = &f.targets[0];
+        assert_eq!(target_platform_override(t, &[]), None);
+    }
+
+    #[test]
+    fn multiple_declared_platforms_stay_host() {
+        let f = parse("FROM alpine AS a\nPLATFORM linux/amd64 linux/arm64\n").unwrap();
+        let t = &f.targets[0];
+        assert_eq!(target_platform_override(t, &[]), None);
+    }
+
+    #[test]
+    fn per_target_platform_overrides_file_default() {
+        let f = parse("PLATFORM linux/riscv64\nFROM alpine AS a\nPLATFORM linux/arm64\n").unwrap();
+        let t = &f.targets[0];
+        assert_eq!(
+            target_platform_override(t, &f.default_platforms).as_deref(),
+            Some("linux/arm64")
+        );
     }
 }
