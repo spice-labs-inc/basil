@@ -303,6 +303,7 @@ pub async fn is_changed(
 /// Everything a build/promote entry point needs after parsing + identity:
 /// the file AST, the selected deliverables, the in-scope target subset, module
 /// discovery/closure tables, and the importer's closures.
+#[derive(Debug)]
 pub struct SolveContext {
     pub parsed: crate::dsl::ast::File,
     pub deliverables: Vec<(String, String)>,
@@ -1884,6 +1885,60 @@ REGISTER 127.0.0.1:5001/x
         let res = rt.block_on(is_changed(&file, &dir, &["app".to_string()]));
         let e = res.unwrap_err();
         assert!(e.to_string().contains("not a deliverable"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod module_context_tests {
+    use super::*;
+
+    /// A module whose unpinned base fails to resolve must surface with a
+    /// module= field naming the module (relative to the cwd), like every
+    /// other basil error carries filename=.
+    #[test]
+    fn module_resolution_failure_carries_module_field() {
+        let dir = std::env::temp_dir().join(format!("basil-mod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("mod")).unwrap();
+        std::fs::write(
+            dir.join("Basilfile"),
+            "FROM scratch AS ghcr.io/x/app
+MODULE mod AS mod
+FROM scratch AS ghcr.io/x/app2
+COPY --from=mod /out.txt /mod2.txt
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("mod/Basilfile"),
+            "FROM 127.0.0.1:1/nope AS out
+REGISTER 127.0.0.1:5001/modout
+",
+        )
+        .unwrap();
+        let file = dir.join("Basilfile").to_str().unwrap().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(solve(&file, &dir, None));
+        let e = res.unwrap_err();
+        let text = e.to_string();
+        assert!(text.contains("module="), "{text}");
+        assert!(text.contains("127.0.0.1:1"), "{text}");
+        // The module= value itself must be relative to the cwd (no leading /).
+        let value = text
+            .split("module=")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches(']');
+        assert!(
+            !value.starts_with('/'),
+            "module value not relative: {value}"
+        );
+        assert!(
+            value.contains(".."),
+            "module value should walk up to the tmp dir: {value}"
+        );
+        assert!(value.ends_with("/mod/Basilfile"), "{value}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

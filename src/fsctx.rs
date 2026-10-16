@@ -151,4 +151,30 @@ mod tests {
         assert!(!text.contains(cwd.to_str().unwrap()), "{text}");
         assert!(!text.contains("file="), "{text}");
     }
+
+    #[test]
+    fn rel_to_cwd_steps_outside_the_cwd_with_dotdot() {
+        // A path outside the cwd must render relative (no leading /), and
+        // joining it back onto the cwd must round-trip to the original.
+        let cwd = std::env::current_dir().unwrap();
+        let abs = std::env::temp_dir().join("basil-rel-roundtrip/file.txt");
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let rel = rel_to_cwd(&abs);
+        assert!(std::path::Path::new(&rel).is_relative(), "{rel}");
+        assert!(rel.contains(".."), "{rel}");
+        let joined = cwd.join(&rel);
+        // canonicalize resolves the .. steps back to the real directory.
+        // Compare canonicalized parents: the file itself need not exist.
+        assert_eq!(
+            joined.parent().unwrap().canonicalize().unwrap(),
+            abs.parent().unwrap().canonicalize().unwrap(),
+            "{rel} must resolve back to {abs:?}"
+        );
+    }
+
+    #[test]
+    fn rel_to_cwd_renders_the_cwd_itself_as_dot() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(rel_to_cwd(&cwd), ".");
+    }
 }
