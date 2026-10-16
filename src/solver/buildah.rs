@@ -330,11 +330,15 @@ async fn extract_outputs(
         let image = if stage == deliverable {
             image_ref.to_string()
         } else {
-            g.stage_cache.get(stage).cloned().unwrap_or_else(|| {
-                // A stage with OUTPUT that isn't cached would rebuild on every
-                // run: surface it rather than silently rebuilding.
-                format!("basil-stage-cache-missing:{stage}")
-            })
+            g.stage_cache.get(stage).cloned().ok_or_else(|| {
+                // stage_cache is total over non-deliverable subset stages and
+                // ensure_stages_cached reconciled them before extraction, so a
+                // miss here is a basil bug (an ordering/coverage break), never
+                // operator error - say so instead of faking a registry pull.
+                anyhow::anyhow!(
+                    "internal invariant broken: stage `{stage}` declares OUTPUT but has no cache ref; ensure_stages_cached must cover every OUTPUT stage before extraction"
+                )
+            })?
         };
         extract_into(&image, stage, &outs, context).await?;
     }
