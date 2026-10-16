@@ -234,6 +234,70 @@ async fn promote_on_tag(
     Ok(())
 }
 
+/// Whether any of the named targets would change on a build: its current
+/// content tagHash is not yet published at its push ref. A change-detection
+/// gate for CI - exit 0 if changed for any target, 1 if none. Each name
+/// must resolve to a deliverable (qualified AS name or REGISTER ref); a
+/// registry probe failure is an error, never a silent "unchanged".
+pub async fn is_changed(
+    file: &str,
+    context: &std::path::Path,
+    targets: &[String],
+) -> anyhow::Result<bool> {
+    if targets.is_empty() {
+        anyhow::bail!("is-changed needs at least one target");
+    }
+    let ctx = solve(file, context, None).await?;
+    // Validate every requested name before probing anything (fail closed:
+    // a typo'd target must not silently report "unchanged").
+    let resolved: Vec<(String, String, String)> = targets
+        .iter()
+        .map(|name| {
+            let t = ctx
+                .parsed
+                .targets
+                .iter()
+                .find(|x| x.name.as_str() == name || x.register.as_deref() == Some(name))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "target {name} not found in {file} (known: {})",
+                        ctx.parsed
+                            .targets
+                            .iter()
+                            .map(|x| format!("{}({})", x.name, x.push_ref()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            if !is_deliverable(t) {
+                anyhow::bail!(
+                    "target {name} is not a deliverable: give it a qualified name or a REGISTER ref"
+                );
+            }
+            let hash = digest_of(&t.name, &ctx.closures)?;
+            Ok((t.name.clone(), t.push_ref().to_string(), hash))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut changed = false;
+    for (name, push_ref, hash) in resolved {
+        let ir = crate::solver::registry::parse_ref(&push_ref, "")
+            .map_err(|e| anyhow::anyhow!("is-changed {push_ref}: {e}"))?;
+        let client = ir.client();
+        let tag = crate::solver::registry::content_tag(&hash);
+        let exists = client
+            .manifest_exists(&ir.repo, &tag)
+            .await
+            .map_err(|e| anyhow::anyhow!("probing {push_ref}:{tag}: {e}"))?;
+        if exists {
+            println!("basil: {name} unchanged ({push_ref}:{tag})");
+        } else {
+            println!("basil: {name} changed ({push_ref}:{tag} not published)");
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// Build one or more deliverable targets directly (no event): the `-t`
 /// target, or every qualified deliverable target when none is given. Computes
 /// Everything a build/promote entry point needs after parsing + identity:
@@ -1779,4 +1843,47 @@ fn resolved_image(base: &crate::dsl::ast::BaseImage) -> String {
         s.push_str(d);
     }
     s
+}
+
+#[cfg(test)]
+mod is_changed_tests {
+    use super::*;
+
+    fn tmp_ctx(tag: &str, content: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("basil-ischg-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Basilfile");
+        std::fs::write(&file, content).unwrap();
+        (dir, file.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn is_changed_errors_on_unknown_target() {
+        let (dir, file) = tmp_ctx(
+            "unknown",
+            "FROM scratch AS app
+REGISTER 127.0.0.1:5001/x
+",
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(is_changed(&file, &dir, &["nope".to_string()]));
+        let e = res.unwrap_err();
+        assert!(e.to_string().contains("not found"), "{e}");
+        assert!(e.to_string().contains("nope"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_changed_errors_on_non_deliverable() {
+        let (dir, file) = tmp_ctx(
+            "nd",
+            "FROM scratch AS app\nFROM scratch AS 127.0.0.1:5001/ok\n",
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(is_changed(&file, &dir, &["app".to_string()]));
+        let e = res.unwrap_err();
+        assert!(e.to_string().contains("not a deliverable"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

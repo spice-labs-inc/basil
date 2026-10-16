@@ -1098,6 +1098,52 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_add\n",
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `basil is-changed` reflects registry state: nothing published
+/// -> changed (exit-0 condition); after a build publishes the content tag ->
+/// unchanged; deleting the content tag flips it back to changed.
+#[tokio::test]
+async fn buildah_e2e_is_changed_flips_after_build() {
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    let dir = tempfile();
+    std::fs::write(
+        dir.join("Basilfile"),
+        "FROM alpine AS 127.0.0.1:5001/bah_e2e_chg\n\
+ON push(main) BUILD 127.0.0.1:5001/bah_e2e_chg\n",
+    )
+    .unwrap();
+    let file = dir.join("Basilfile").to_str().unwrap().to_string();
+    let tgt = "127.0.0.1:5001/bah_e2e_chg".to_string();
+    let before = basil::solver::orchestrate::is_changed(&file, &dir, &[tgt.clone()])
+        .await
+        .unwrap();
+    assert!(before, "nothing published yet must be reported changed");
+
+    let event = r#"{"ref":"refs/heads/main","before":"0","after":"1"}"#;
+    let inp = BuildInput {
+        file: &file,
+        context: &dir,
+        event_json: Some(event),
+        target_filter: None,
+        force: false,
+        cache_to: None,
+    };
+    let results = handle_event(inp).await.unwrap();
+    assert!(
+        results.iter().any(|(k, _)| k == "digest"),
+        "must publish, got {results:?}"
+    );
+    let after = basil::solver::orchestrate::is_changed(&file, &dir, &[tgt.clone()])
+        .await
+        .unwrap();
+    assert!(!after, "published image must be reported unchanged");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A sibling module (its own context + Basilfile): the importer FROMs its
 /// image, so the module is built+published once, then the importer pulls it.
 /// The second delivery of the same event must not rebuild the module (its

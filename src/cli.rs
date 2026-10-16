@@ -24,6 +24,10 @@ pub enum Command {
     Run(RunArgs),
     /// Set the immutable `v<version>` tags on the deliverables' published images.
     Promote(PromoteArgs),
+    /// Exit 0 if any of the given targets would change (its closure hash is
+    /// not yet published at its registry ref), 1 if none changed, 2 on
+    /// error. A change-detection gate for CI.
+    IsChanged(IsChangedArgs),
     /// Resolve unpinned image bases to @sha256 and rewrite the file to pin them.
     Pin(PinArgs),
     /// Prune basil-owned registry tags older than a given age.
@@ -153,4 +157,18 @@ pub struct GcArgs {
     /// namespace (basil-cache-*).
     #[arg(long)]
     pub cache_only: bool,
+}
+
+#[derive(clap::Args)]
+pub struct IsChangedArgs {
+    /// Build context root (where COPY/ADD and `.dockerignore` resolve).
+    #[arg(default_value = ".", required = true)]
+    pub context: String,
+    /// DSL file to parse; defaults to `<context>/Basilfile` (docker-style).
+    /// A relative `-f` flag resolves against the current directory.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<String>,
+    /// Target AS names (or REGISTER refs) to check; at least one required.
+    #[arg(required = true, value_name = "TARGET")]
+    pub targets: Vec<String>,
 }

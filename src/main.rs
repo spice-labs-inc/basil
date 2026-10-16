@@ -179,6 +179,27 @@ fn main() -> anyhow::Result<()> {
             })?;
             Ok(())
         }
+        Command::IsChanged(args) => {
+            let file = resolve_build_file(&args.file, &args.context);
+            let rt = tokio::runtime::Runtime::new()?;
+            let changed = rt.block_on(async move {
+                basil::solver::orchestrate::is_changed(
+                    &file,
+                    std::path::Path::new(&args.context),
+                    &args.targets,
+                )
+                .await
+            });
+            // Exit contract: 0 = at least one target changed, 1 = none
+            // changed, 2 = error (distinct from both boolean states).
+            match changed {
+                Ok(c) => std::process::exit(if c { 0 } else { 1 }),
+                Err(e) => {
+                    eprintln!("basil: {e:#}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Command::Pin(args) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
