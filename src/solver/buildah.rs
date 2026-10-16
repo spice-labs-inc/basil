@@ -48,7 +48,14 @@ impl<'a> Graph<'a> {
         stage_cache: &'a std::collections::BTreeMap<String, String>,
         checkpoints: &'a std::collections::BTreeMap<(String, usize), String>,
     ) -> Self {
-        Graph { targets, global_args, file_dir, modules, stage_cache, checkpoints }
+        Graph {
+            targets,
+            global_args,
+            file_dir,
+            modules,
+            stage_cache,
+            checkpoints,
+        }
     }
 }
 
@@ -71,14 +78,23 @@ pub(crate) fn resolve_base_ref(
     stage_cache: &std::collections::BTreeMap<String, String>,
 ) -> ResolvedBase {
     match base {
-        Base::Module(_) => ResolvedBase { platform: None, image: written_base(base, file_dir, modules) },
+        Base::Module(_) => ResolvedBase {
+            platform: None,
+            image: written_base(base, file_dir, modules),
+        },
         Base::Image(b) => {
             if let Some(cached) = stage_cache.get(&b.raw) {
                 if b.platform.is_none() && b.tag.is_none() && b.digest.is_none() {
-                    return ResolvedBase { platform: None, image: cached.clone() };
+                    return ResolvedBase {
+                        platform: None,
+                        image: cached.clone(),
+                    };
                 }
             }
-            ResolvedBase { platform: b.platform.clone(), image: written_base(base, file_dir, modules) }
+            ResolvedBase {
+                platform: b.platform.clone(),
+                image: written_base(base, file_dir, modules),
+            }
         }
     }
 }
@@ -128,10 +144,17 @@ fn push_authfile() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(p));
     }
     let home = std::env::var("HOME").ok()?;
-    let podman = std::path::PathBuf::from(&home).join(".config").join("containers").join("auth.json");
-    let docker = std::path::PathBuf::from(&home).join(".docker").join("config.json");
+    let podman = std::path::PathBuf::from(&home)
+        .join(".config")
+        .join("containers")
+        .join("auth.json");
+    let docker = std::path::PathBuf::from(&home)
+        .join(".docker")
+        .join("config.json");
     if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
-        let rt = std::path::PathBuf::from(&d).join("containers").join("auth.json");
+        let rt = std::path::PathBuf::from(&d)
+            .join("containers")
+            .join("auth.json");
         if rt.exists() {
             return Some(rt);
         }
@@ -240,13 +263,8 @@ pub(crate) async fn push_tagged(
     if let Some(authfile) = push_authfile() {
         push.arg("--authfile").arg(&authfile);
     }
-    push.arg(tag_ref)
-        .arg(format!("docker://{push_ref}:{tag}"))
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-    let pstatus = push
-        .status()
+    push.arg(tag_ref).arg(format!("docker://{push_ref}:{tag}"));
+    let pstatus = run_buildah_relayed(push, "buildah push")
         .await
         .map_err(|e| anyhow::anyhow!("running buildah push: {e}"))?;
     if !pstatus.success() {
@@ -370,12 +388,8 @@ async fn extract_into(
                 .arg("--volume")
                 .arg(format!("{}:/hostout", abs_parent.display()))
                 .arg(&working)
-                .args(["cp", src, &format!("/hostout/{fname}")])
-                .stdin(std::process::Stdio::inherit())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit());
-            let status = cmd
-                .status()
+                .args(["cp", src, &format!("/hostout/{fname}")]);
+            let status = run_buildah_relayed(cmd, "buildah run (OUTPUT)")
                 .await
                 .map_err(|e| anyhow::anyhow!("buildah run (OUTPUT {stage}): {e}"))?;
             if !status.success() {
@@ -435,6 +449,39 @@ pub async fn run_task(image: &str, cmd: &Command, env: &[String]) -> anyhow::Res
     Ok(if out.status.success() { 0 } else { code })
 }
 
+/// Spawn a buildah command with stdout/stderr as **pipes**, relayed 1:1 to
+/// basil's own stdout/stderr, and stdin closed. The child never sees a
+/// terminal: build steps cannot become interactive (no progress spinners,
+/// colors, or readline) and can never consume the operator's terminal input
+/// — a build step that reads stdin gets EOF, not the user's keystrokes.
+/// Output order between the two streams is not guaranteed to interleave
+/// exactly as a shared tty would.
+pub(crate) async fn run_buildah_relayed(
+    mut cmd: tokio::process::Command,
+    what: &str,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawning {what}: {e}"))?;
+    let mut so = child.stdout.take().unwrap();
+    let mut se = child.stderr.take().unwrap();
+    let mut basil_out = tokio::io::stdout();
+    let mut basil_err = tokio::io::stderr();
+    let (ro, re) = tokio::join!(
+        tokio::io::copy(&mut so, &mut basil_out),
+        tokio::io::copy(&mut se, &mut basil_err),
+    );
+    ro.map_err(|e| anyhow::anyhow!("{what}: relaying stdout: {e}"))?;
+    re.map_err(|e| anyhow::anyhow!("{what}: relaying stderr: {e}"))?;
+    child
+        .wait()
+        .await
+        .map_err(|e| anyhow::anyhow!("{what}: {e}"))
+}
+
 /// `buildah from <image>` — a working container for a plain image ref
 /// (deliverable pulls, OUTPUT extraction, task runs). Localhost/insecure
 /// hosts get `--tls-verify=false` (buildah autodetects localhost for `build`
@@ -453,7 +500,11 @@ pub(crate) async fn buildah_from(image: &str) -> anyhow::Result<String> {
         .await
         .map_err(|e| anyhow::anyhow!("buildah from: {e}"))?;
     if !out.status.success() {
-        anyhow::bail!("buildah from {} failed: {}", image, String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "buildah from {} failed: {}",
+            image,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -465,7 +516,10 @@ mod tests {
     #[test]
     fn push_authfile_prefers_registry_env() {
         std::env::set_var("REGISTRY_AUTH_FILE", "/tmp/fa.json");
-        assert_eq!(push_authfile(), Some(std::path::PathBuf::from("/tmp/fa.json")));
+        assert_eq!(
+            push_authfile(),
+            Some(std::path::PathBuf::from("/tmp/fa.json"))
+        );
         std::env::remove_var("REGISTRY_AUTH_FILE");
     }
 }

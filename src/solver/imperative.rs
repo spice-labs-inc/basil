@@ -15,7 +15,7 @@
 //! program — identity stays the contract for what gets built.
 
 use crate::dsl::ast::{Command, Instruction, Mount, Target};
-use crate::identity::closure::{Args, target_env};
+use crate::identity::closure::{target_env, Args};
 use crate::identity::program_hash::expand_vars;
 use crate::solver::buildah::Graph;
 use std::collections::HashMap;
@@ -30,7 +30,11 @@ struct SubstCtx {
 }
 
 impl SubstCtx {
-    fn new(target: &Target, global_args: &[crate::dsl::ast::Arg], overrides: &HashMap<String, String>) -> Self {
+    fn new(
+        target: &Target,
+        global_args: &[crate::dsl::ast::Arg],
+        overrides: &HashMap<String, String>,
+    ) -> Self {
         SubstCtx {
             args: Args::from_target(target, global_args, overrides),
             env: target_env(target),
@@ -56,7 +60,9 @@ impl SubstCtx {
 /// — the same value `buildah bud` would use when no `--platform` flag is given;
 /// any other `$VAR` in a selector is a hard error (it could not be resolved
 /// faithfully).
-async fn buildah_from_resolved(base: &crate::solver::buildah::ResolvedBase) -> anyhow::Result<String> {
+async fn buildah_from_resolved(
+    base: &crate::solver::buildah::ResolvedBase,
+) -> anyhow::Result<String> {
     let mut cmd = tokio::process::Command::new("buildah");
     cmd.arg("from");
     if let Some(p) = &base.platform {
@@ -132,7 +138,12 @@ pub(crate) async fn build_stage_imperative(
         .iter()
         .find(|t| t.name == stage)
         .ok_or_else(|| anyhow::anyhow!("imperative build: stage `{stage}` not in scope"))?;
-    let base = crate::solver::buildah::resolve_base_ref(&target.base, g.file_dir, g.modules, g.stage_cache);
+    let base = crate::solver::buildah::resolve_base_ref(
+        &target.base,
+        g.file_dir,
+        g.modules,
+        g.stage_cache,
+    );
     // COMMIT positions (indices into the instruction list), 1-based seq.
     let commit_indices: Vec<usize> = target
         .instructions
@@ -288,7 +299,8 @@ async fn execute_instructions(
                 let mut cmd = tokio::process::Command::new("buildah");
                 cmd.arg("config");
                 for (k, v) in &e.pairs {
-                    cmd.arg("--env").arg(format!("{}={}", ctx.expand(k), ctx.expand(v)));
+                    cmd.arg("--env")
+                        .arg(format!("{}={}", ctx.expand(k), ctx.expand(v)));
                 }
                 cmd.arg(container);
                 run_quiet(cmd, "config --env").await?;
@@ -313,13 +325,18 @@ async fn execute_instructions(
             }
             Instruction::Workdir(w) => {
                 let v = ctx.expand(&w.path);
-                run_quiet(config_cmd(container, "--workingdir", &v), "config --workingdir").await?;
+                run_quiet(
+                    config_cmd(container, "--workingdir", &v),
+                    "config --workingdir",
+                )
+                .await?;
             }
             Instruction::Label(pairs) => {
                 let mut cmd = tokio::process::Command::new("buildah");
                 cmd.arg("config");
                 for (k, v) in pairs {
-                    cmd.arg("--label").arg(format!("{}={}", ctx.expand(k), ctx.expand(v)));
+                    cmd.arg("--label")
+                        .arg(format!("{}={}", ctx.expand(k), ctx.expand(v)));
                 }
                 cmd.arg(container);
                 run_quiet(cmd, "config --label").await?;
@@ -393,12 +410,15 @@ async fn execute_instructions(
                         run_quiet(cmd, "add <url>").await?;
                         continue;
                     }
-                    let s = std::slice::from_ref(src);
-                    let (abs, dest) = copy_pairs(s, &a.dest, context, build_file)?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("ADD source `{src}` matched no context files"))?;
-                    copy_files_into(container, &[abs], &dest, &a.chown, &a.chmod, "add").await?;
+                    // ADD is a directory/globbing copy like COPY: every file in
+                    // the dockerignore-filtered set lands, dest-reconstructed
+                    // per file. (A single-file source must still be one file.)
+                    for (abs, dest) in
+                        copy_pairs(std::slice::from_ref(src), &a.dest, context, build_file)?
+                    {
+                        copy_files_into(container, &[abs], &dest, &a.chown, &a.chmod, "add")
+                            .await?;
+                    }
                 }
             }
             Instruction::Run(r) => {
@@ -413,21 +433,21 @@ async fn execute_instructions(
                 let ref_str = ctx.expand(&ref_str);
                 println!("basil: (import) inline {ref_str}");
                 ensure_from_image_local(&ref_str).await?;
-                let out = tokio::process::Command::new("buildah")
-                    .arg("add")
+                let mut add = tokio::process::Command::new("buildah");
+                add.arg("add")
                     .arg("--from")
                     .arg(&ref_str)
                     .arg(container)
                     .arg("/")
-                    .arg("/")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit())
-                    .status()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("spawning buildah add (IMPORT {ref_str}): {e}"))?;
-                if !out.success() {
-                    anyhow::bail!("IMPORT {ref_str} failed (exit {out})");
+                    .arg("/");
+                let status =
+                    crate::solver::buildah::run_buildah_relayed(add, "buildah add (IMPORT)")
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("spawning buildah add (IMPORT {ref_str}): {e}")
+                        })?;
+                if !status.success() {
+                    anyhow::bail!("IMPORT {ref_str} failed (exit {status})");
                 }
             }
         }
@@ -477,7 +497,11 @@ async fn run_step(
     }
     for m in &r.mounts {
         match m {
-            Mount::Bind { source, target, read_only } => {
+            Mount::Bind {
+                source,
+                target,
+                read_only,
+            } => {
                 // A sourced bind mount reads from the build context (the bud
                 // `from=context` semantic); an unsourced one is a host path.
                 let src = match source {
@@ -507,7 +531,9 @@ async fn run_step(
                         "RUN --mount=type=secret,id={id} needs `{env}` to point at the secret file"
                     )
                 })?;
-                let t = target.clone().unwrap_or_else(|| format!("/run/secrets/{id}"));
+                let t = target
+                    .clone()
+                    .unwrap_or_else(|| format!("/run/secrets/{id}"));
                 cmd.arg("--volume").arg(format!("{src}:{t}"));
             }
             Mount::Ssh { .. } => {
@@ -534,11 +560,7 @@ async fn run_step(
             cmd.args(&expanded);
         }
     }
-    let status = cmd
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
+    let status = crate::solver::buildah::run_buildah_relayed(cmd, "buildah run")
         .await
         .map_err(|e| anyhow::anyhow!("spawning buildah run ({}): {e}", target.name))?;
     if !status.success() {
@@ -588,9 +610,9 @@ pub(crate) fn copy_pairs(
 ) -> anyhow::Result<Vec<(PathBuf, String)>> {
     let dest_dir = dest.ends_with('/')
         || sources.len() > 1
-        || sources.iter().any(|s| {
-            looks_like_url(s) || has_glob_meta(s) || s == "." || context.join(s).is_dir()
-        });
+        || sources
+            .iter()
+            .any(|s| looks_like_url(s) || has_glob_meta(s) || s == "." || context.join(s).is_dir());
     let mut out = Vec::new();
     for src in sources {
         if looks_like_url(src) {
@@ -758,7 +780,11 @@ mod tests {
     }
 
     fn first_copy(target: &Target) -> &crate::dsl::ast::Copy {
-        match target.instructions.iter().find(|i| matches!(i, Instruction::Copy(c) if c.from.is_none())) {
+        match target
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Copy(c) if c.from.is_none()))
+        {
             Some(Instruction::Copy(c)) => c,
             _ => panic!("no context COPY"),
         }
@@ -769,7 +795,10 @@ mod tests {
         let host = host_platform();
         assert_eq!(expand_platform_selector("$BUILDPLATFORM"), host);
         assert_eq!(expand_platform_selector("${BUILDPLATFORM}"), host);
-        assert_eq!(expand_platform_selector("linux/$TARGETPLATFORM"), format!("linux/{host}"));
+        assert_eq!(
+            expand_platform_selector("linux/$TARGETPLATFORM"),
+            format!("linux/{host}")
+        );
         assert_eq!(expand_platform_selector("linux/amd64"), "linux/amd64");
         // Unknown vars stay literal; buildah_from_resolved rejects the `$`.
         assert_eq!(expand_platform_selector("$NOPE"), "$NOPE");
@@ -779,32 +808,69 @@ mod tests {
     fn single_file_lands_at_dest() {
         let dir = ctx_dir("one", &[("a.txt", "a")]);
         let f = parse("FROM alpine\nCOPY a.txt /x\n").unwrap();
-        let pairs = copy_pairs(&first_copy(&f.targets[0]).sources, "/x", &dir, std::path::Path::new("__bf__")).unwrap();
+        let pairs = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/x",
+            &dir,
+            std::path::Path::new("__bf__"),
+        )
+        .unwrap();
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, dir.join("a.txt"));
-        assert_eq!(pairs[0].1, "/x", "single file + no trailing slash -> the file itself");
+        assert_eq!(
+            pairs[0].1, "/x",
+            "single file + no trailing slash -> the file itself"
+        );
     }
 
     #[test]
     fn trailing_slash_dest_is_dir() {
         let dir = ctx_dir("trail", &[("a.txt", "a")]);
         let f = parse("FROM alpine\nCOPY a.txt /x/\n").unwrap();
-        let pairs = copy_pairs(&first_copy(&f.targets[0]).sources, "/x/", &dir, std::path::Path::new("__bf__")).unwrap();
+        let pairs = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/x/",
+            &dir,
+            std::path::Path::new("__bf__"),
+        )
+        .unwrap();
         assert_eq!(pairs[0].1, "/x/a.txt");
     }
 
     #[test]
     fn dir_copy_preserves_subtree() {
-        let dir = ctx_dir("dir", &[("src/a.txt", "a"), ("src/sub/b.txt", "b"), ("other.txt", "o")]);
+        let dir = ctx_dir(
+            "dir",
+            &[
+                ("src/a.txt", "a"),
+                ("src/sub/b.txt", "b"),
+                ("other.txt", "o"),
+            ],
+        );
         let f = parse("FROM alpine\nCOPY src /app\n").unwrap();
-        let pairs = copy_pairs(&first_copy(&f.targets[0]).sources, "/app", &dir, std::path::Path::new("__bf__")).unwrap();
-        let mut got: Vec<(String, String)> = pairs.iter().map(|(a, d)| (a.display().to_string(), d.clone())).collect();
+        let pairs = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/app",
+            &dir,
+            std::path::Path::new("__bf__"),
+        )
+        .unwrap();
+        let mut got: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(a, d)| (a.display().to_string(), d.clone()))
+            .collect();
         got.sort();
         assert_eq!(
             got,
             vec![
-                (dir.join("src/a.txt").display().to_string(), "/app/a.txt".to_string()),
-                (dir.join("src/sub/b.txt").display().to_string(), "/app/sub/b.txt".to_string()),
+                (
+                    dir.join("src/a.txt").display().to_string(),
+                    "/app/a.txt".to_string()
+                ),
+                (
+                    dir.join("src/sub/b.txt").display().to_string(),
+                    "/app/sub/b.txt".to_string()
+                ),
             ],
             "dir copy must preserve src's subtree under dest"
         );
@@ -814,7 +880,13 @@ mod tests {
     fn dot_copy_whole_tree() {
         let dir = ctx_dir("dot", &[("a.txt", "a"), ("sub/b.txt", "b")]);
         let f = parse("FROM alpine\nCOPY . /app\n").unwrap();
-        let pairs = copy_pairs(&first_copy(&f.targets[0]).sources, "/app", &dir, std::path::Path::new("__bf__")).unwrap();
+        let pairs = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/app",
+            &dir,
+            std::path::Path::new("__bf__"),
+        )
+        .unwrap();
         let mut got: Vec<&str> = pairs.iter().map(|(_, d)| d.as_str()).collect();
         got.sort();
         assert_eq!(got, vec!["/app/a.txt", "/app/sub/b.txt"]);
@@ -822,23 +894,44 @@ mod tests {
 
     #[test]
     fn dockerignore_filters_copy() {
-        let dir = ctx_dir("ign", &[
-            (".dockerignore", "*.tmp\n"),
-            ("keep.txt", "k"),
-            ("drop.tmp", "d"),
-        ]);
+        let dir = ctx_dir(
+            "ign",
+            &[
+                (".dockerignore", "*.tmp\n"),
+                ("keep.txt", "k"),
+                ("drop.tmp", "d"),
+            ],
+        );
         let f = parse("FROM alpine\nCOPY . /app\n").unwrap();
-        let pairs = copy_pairs(&first_copy(&f.targets[0]).sources, "/app", &dir, std::path::Path::new("__bf__")).unwrap();
+        let pairs = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/app",
+            &dir,
+            std::path::Path::new("__bf__"),
+        )
+        .unwrap();
         let dests: Vec<String> = pairs.iter().map(|(_, d)| d.clone()).collect();
         assert!(dests.contains(&"/app/keep.txt".to_string()));
-        assert!(!dests.contains(&"/app/drop.tmp".to_string()), "dockerignored file must not be copied: {dests:?}");
+        assert!(
+            !dests.contains(&"/app/drop.tmp".to_string()),
+            "dockerignored file must not be copied: {dests:?}"
+        );
     }
 
     #[test]
     fn glob_copy_keeps_no_prefix() {
-        let dir = ctx_dir("glob", &[("a.json", "{}"), ("b.json", "{}"), ("c.txt", "x")]);
+        let dir = ctx_dir(
+            "glob",
+            &[("a.json", "{}"), ("b.json", "{}"), ("c.txt", "x")],
+        );
         let f = parse("FROM alpine\nCOPY *.json /x/\n").unwrap();
-        let pairs = copy_pairs(&first_copy(&f.targets[0]).sources, "/x/", &dir, std::path::Path::new("__bf__")).unwrap();
+        let pairs = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/x/",
+            &dir,
+            std::path::Path::new("__bf__"),
+        )
+        .unwrap();
         let mut got: Vec<&str> = pairs.iter().map(|(_, d)| d.as_str()).collect();
         got.sort();
         assert_eq!(got, vec!["/x/a.json", "/x/b.json"]);
@@ -848,7 +941,13 @@ mod tests {
     fn explicit_dockerignored_source_errors() {
         let dir = ctx_dir("excl", &[(".dockerignore", "a.txt\n"), ("a.txt", "a")]);
         let f = parse("FROM alpine\nCOPY a.txt /x\n").unwrap();
-        let err = copy_pairs(&first_copy(&f.targets[0]).sources, "/x", &dir, std::path::Path::new("__bf__")).unwrap_err();
+        let err = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/x",
+            &dir,
+            std::path::Path::new("__bf__"),
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("dockerignore"), "{err:#}");
     }
 
@@ -856,9 +955,18 @@ mod tests {
     fn build_file_is_excluded_from_copy() {
         // The Basilfile sits inside the context, like the fixture. Identity
         // excludes it (programHash represents it); the imperative copy must too.
-        let dir = ctx_dir("self", &[("Basilfile", "FROM alpine\nCOPY . /x\n"), ("a.txt", "a")]);
+        let dir = ctx_dir(
+            "self",
+            &[("Basilfile", "FROM alpine\nCOPY . /x\n"), ("a.txt", "a")],
+        );
         let f = parse("FROM alpine\nCOPY . /x\n").unwrap();
-        let pairs = copy_pairs(&first_copy(&f.targets[0]).sources, "/x", &dir, std::path::Path::new("Basilfile")).unwrap();
+        let pairs = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/x",
+            &dir,
+            std::path::Path::new("Basilfile"),
+        )
+        .unwrap();
         let abs: Vec<PathBuf> = pairs.iter().map(|(a, _)| a.clone()).collect();
         assert!(abs.contains(&dir.join("a.txt")));
         assert!(!abs.contains(&dir.join("Basilfile")));
@@ -868,7 +976,13 @@ mod tests {
     fn multi_source_dest_is_dir() {
         let dir = ctx_dir("multi", &[("a.txt", "a"), ("b.txt", "b")]);
         let f = parse("FROM alpine\nCOPY a.txt b.txt /x\n").unwrap();
-        let pairs = copy_pairs(&first_copy(&f.targets[0]).sources, "/x", &dir, std::path::Path::new("__bf__")).unwrap();
+        let pairs = copy_pairs(
+            &first_copy(&f.targets[0]).sources,
+            "/x",
+            &dir,
+            std::path::Path::new("__bf__"),
+        )
+        .unwrap();
         let mut got: Vec<&str> = pairs.iter().map(|(_, d)| d.as_str()).collect();
         got.sort();
         assert_eq!(got, vec!["/x/a.txt", "/x/b.txt"]);

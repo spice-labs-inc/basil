@@ -839,6 +839,97 @@ async fn buildah_e2e_registered_stage_dependency_uses_published_ref() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// `ADD . .` must behave like a directory copy (docker-style): every
+/// dockerignore-filtered context file lands, subtree-preserving, per-file
+/// dest-reconstructed. A regression: the ADD executor arm once copied only
+/// the first file, so `cargo metadata` inside a real build failed on a
+/// missing Cargo.toml.
+#[tokio::test]
+async fn buildah_e2e_add_dot_copies_whole_context() {
+    if !buildah_present() || !registry_up().await {
+        eprintln!("skipping: buildah or registry unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    let dir = tempfile();
+    std::fs::write(
+        dir.join("Basilfile"),
+        "FROM alpine AS 127.0.0.1:5001/bah_e2e_add\n\
+WORKDIR /w\n\
+ADD . .\n\
+RUN find /w -type f | sort\n\
+ON push(main) BUILD 127.0.0.1:5001/bah_e2e_add\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/c.txt"), "c\n").unwrap();
+    // A dockerignored file must NOT land in the image.
+    std::fs::write(dir.join(".dockerignore"), "skip.tmp\n").unwrap();
+    std::fs::write(dir.join("skip.tmp"), "x\n").unwrap();
+
+    let event = r#"{"ref":"refs/heads/main","before":"0","after":"1"}"#;
+    let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
+    let inp = BuildInput {
+        file: &file_str,
+        context: &dir,
+        event_json: Some(event),
+        target_filter: None,
+        force: true, // always rebuild: the assertion inspects the RUN output
+        cache_to: None,
+    };
+    // Capture the stage RUN output: the deliverable is scratch, so the files
+    // land via ADD in an intermediate-ish stage; assert through the pushed
+    // content instead — the ADD stage is the deliverable here (alpine).
+    let results = handle_event(inp).await.unwrap();
+    let digest = results
+        .iter()
+        .find(|(k, _)| k == "digest")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let out = tokio::process::Command::new("buildah")
+        .args([
+            "from",
+            "--tls-verify=false",
+            &format!("127.0.0.1:5001/bah_e2e_add:basil-{digest}"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    let container = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let find = tokio::process::Command::new("buildah")
+        .args(["run", &container, "--", "find", "/w", "-type", "f"])
+        .output()
+        .await
+        .unwrap();
+    let _ = tokio::process::Command::new("buildah")
+        .args(["rm", &container])
+        .status()
+        .await;
+    let files: Vec<String> = String::from_utf8_lossy(&find.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("/w/").map(|s| s.to_string()))
+        .collect();
+    assert!(
+        files.iter().any(|f| f == "a.txt")
+            && files.iter().any(|f| f == "b.txt")
+            && files.iter().any(|f| f == "sub/c.txt"),
+        "ADD . . must copy the whole context subtree, got {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f == "skip.tmp"),
+        "dockerignored file must not be ADDed, got {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f == "Basilfile"),
+        "the build file must stay excluded, got {files:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 
 
 /// A sibling module (its own context + Basilfile): the importer FROMs its
 /// image, so the module is built+published once, then the importer pulls it.
