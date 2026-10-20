@@ -504,8 +504,8 @@ async fn run_quiet(mut cmd: tokio::process::Command, what: &str) -> anyhow::Resu
 
 /// One RUN step: `buildah run [--network=] [--mount=…] [--volume=…] …` with the
 /// declared build args exposed as env (mirroring buildah bud, which makes
-/// build args available to RUN) and the same secret/cache/bind mounts the
-/// Containerfile path supports. Shell form runs via `/bin/sh -c`, exec form
+/// build args available to RUN) and the same secret/cache/bind mounts
+/// buildah bud supports. Shell form runs via `/bin/sh -c`, exec form
 /// directly — exactly what `buildah bud` would produce.
 async fn run_step(
     target: &Target,

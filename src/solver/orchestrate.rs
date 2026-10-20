@@ -441,7 +441,7 @@ async fn solve(
         &module_digests.deliverable,
     )
     .map_err(anyhow::Error::msg)?;
-    // Module key -> `FROM <push-ref>:<tagHash>` for the importer's Containerfile.
+    // Module key -> the `FROM <push-ref>:<tagHash>` ref the importer builds from.
     let mut module_refs: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for key in &index.order {
@@ -827,7 +827,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
     // ensured when its digest was computed? No — ensure here, bottom-up).
     ensure_modules_built(&index, &module_refs, &module_digests, inp.cache_to).await?;
     // Every intermediate stage must exist as its cache image before the
-    // deliverable's Containerfile references it (reconcile by existence).
+    // deliverable's build FROMs it (reconcile by existence).
     let cache_g = crate::solver::buildah::Graph::new(
         &subset,
         &parsed.global_args,
@@ -1361,7 +1361,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         &module_digests.deliverable,
     )
     .map_err(anyhow::Error::msg)?;
-    // Module key -> `FROM <push-ref>:<tagHash>` for the importer's Containerfile.
+    // Module key -> the `FROM <push-ref>:<tagHash>` ref the importer builds from.
     let mut module_refs: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for key in &index.order {

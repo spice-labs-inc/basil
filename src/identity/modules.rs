@@ -3,8 +3,8 @@
 //! dependency artifact.
 //!
 //! The module is a separate closure domain: its deliverable's `tagHash` is
-//! folded into the importer's identity and the importer's Containerfile renders
-//! `FROM <module-push-ref>:<module-tagHash>` (use-or-build: that content tag is
+//! folded into the importer's identity; the module base resolves to
+//! `FROM <module-push-ref>:<module-tagHash>` at build time (use-or-build: that content tag is
 //! probed in the module's registry; missing → the module is built and pushed
 //! first). Importer identity never reads the module's raw bytes — only its
 //! derived artifact (D3: no auto-exclusion of module dirs from the importer's

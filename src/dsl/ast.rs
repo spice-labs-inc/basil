@@ -105,8 +105,8 @@ pub struct BaseImage {
 /// base image is another basil build — its own context + Basilfile.
 ///
 /// The module is a separate closure domain: its deliverable's `tagHash` is
-/// folded into the importer's identity and the importer's Containerfile renders
-/// `FROM <module-register>:<module-tagHash> AS <alias>`. Build semantics are
+/// folded into the importer's identity; the module base resolves to
+/// `FROM <module-register>:<module-tagHash> AS <alias>` at build time. Build semantics are
 /// use-or-build: if that content tag exists in the module's registry the image
 /// is pulled, otherwise the module is built and pushed first.
 #[derive(Debug, Clone, PartialEq, Eq)]
