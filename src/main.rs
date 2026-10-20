@@ -105,6 +105,7 @@ fn main() -> anyhow::Result<()> {
                     target_filter: args.target.as_ref(),
                     force: args.force,
                     cache_to: args.cache_to.as_deref(),
+                    build_args: args.build_arg,
                 };
                 let results = basil::solver::orchestrate::build_targets(inp).await?;
                 for (k, v) in &results {
@@ -136,6 +137,7 @@ fn main() -> anyhow::Result<()> {
                     target_filter: None,
                     force: args.force,
                     cache_to: args.cache_to.as_deref(),
+                    build_args: args.build_arg,
                 };
                 let results = basil::solver::orchestrate::handle_event(inp).await?;
                 for (k, v) in &results {
@@ -154,6 +156,7 @@ fn main() -> anyhow::Result<()> {
                     std::path::Path::new(&args.context),
                     &args.target,
                     args.cache_to.as_deref(),
+                    &args.build_arg,
                 )
                 .await?;
                 println!("basil: done ({})", args.target);

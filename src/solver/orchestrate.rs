@@ -155,6 +155,9 @@ pub struct BuildInput<'a> {
     /// Where intermediate-stage cache images are pushed (`basil-cache-*` refs);
     /// `None` defaults to each deliverable's own repo.
     pub cache_to: Option<&'a str>,
+    /// CLI build args (`K=V`); resolved into the targets' ARGs,
+    /// feeding identity and the task/run env.
+    pub build_args: Vec<String>,
 }
 async fn promote_on_tag(
     matched: &[&crate::dsl::ast::Reaction],
@@ -247,7 +250,7 @@ pub async fn is_changed(
     if targets.is_empty() {
         anyhow::bail!("is-changed needs at least one target");
     }
-    let ctx = solve(file, context, None).await?;
+    let ctx = solve(file, context, None, &std::collections::HashMap::new()).await?;
     // Validate every requested name before probing anything (fail closed:
     // a typo'd target must not silently report "unchanged").
     let resolved: Vec<(String, String, String)> = targets
@@ -320,6 +323,38 @@ pub struct SolveContext {
     pub checkpoint_closures: std::collections::BTreeMap<(String, usize), [u8; 32]>,
 }
 
+/// Parse raw `K=V` build-arg CLI values into the overrides map identity
+/// and RUN/task env resolve from. Malformed values are a hard error - a
+/// typo'd arg name must not silently become a value-less variable.
+fn cli_args(raw: &[String]) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut m = std::collections::HashMap::new();
+    for kv in raw {
+        let Some((k, v)) = kv.split_once('=') else {
+            anyhow::bail!("--build-arg expects K=V, got: {kv}");
+        };
+        if k.is_empty() {
+            anyhow::bail!("--build-arg: empty key in {kv}");
+        }
+        m.insert(k.to_string(), v.to_string());
+    }
+    Ok(m)
+}
+
+/// The side-effect env a task/run container gets for its target's resolved
+/// ARGs (CLI overrides resolved through `Args::from_target`), as `K=V`
+/// entries - a bare arg with no resolved value contributes nothing.
+fn arg_env(
+    target: &crate::dsl::ast::Target,
+    global_args: &[crate::dsl::ast::Arg],
+    overrides: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let args = crate::identity::closure::Args::from_target(target, global_args, overrides);
+    args.map
+        .iter()
+        .filter_map(|(k, v)| v.as_ref().map(|v| format!("{k}={v}")))
+        .collect()
+}
+
 /// Parse the file, select deliverables (`-t` filter, else every qualified
 /// deliverable), resolve module deps and unpinned bases, and compute closures
 /// — the shared preamble of `build_targets` and `promote_version`.
@@ -327,6 +362,7 @@ async fn solve(
     file: &str,
     context: &std::path::Path,
     target_filter: Option<&str>,
+    overrides: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<SolveContext> {
     let src = crate::fsctx::fs_err(std::fs::read_to_string(file), file, "read")?;
     println!("basil: parsed {file}");
@@ -436,7 +472,7 @@ async fn solve(
         &parsed.global_args,
         context,
         &build_file_owned,
-        &HashMap::new(),
+        overrides,
         &mut resolver,
         &module_digests.deliverable,
     )
@@ -466,7 +502,7 @@ async fn solve(
         &parsed.global_args,
         context,
         &build_file_owned,
-        &HashMap::new(),
+        overrides,
         &mut resolver,
         &module_digests.deliverable,
     )
@@ -517,7 +553,9 @@ pub async fn run_target(
     context: &std::path::Path,
     target_filter: &str,
     cache_to: Option<&str>,
+    args: &[String],
 ) -> anyhow::Result<i32> {
+    let overrides = cli_args(args)?;
     let src = crate::fsctx::fs_err(std::fs::read_to_string(file), file, "read")?;
     println!("basil: parsed {file}");
     let parsed = parser::parse(&src).map_err(anyhow::Error::msg)?;
@@ -565,7 +603,7 @@ pub async fn run_target(
             &parsed.global_args,
             context,
             &build_file,
-            &HashMap::new(),
+            &overrides,
             &mut resolver,
             &module_digests.deliverable,
         )
@@ -592,7 +630,7 @@ pub async fn run_target(
             &parsed.global_args,
             context,
             &build_file,
-            &HashMap::new(),
+            &overrides,
             &mut resolver,
             &module_digests.deliverable,
         )
@@ -640,7 +678,8 @@ pub async fn run_target(
     };
 
     // No delivered event; the target itself is the only task context.
-    let env = vec![format!("BASIL_TARGET={name}")];
+    let mut env = vec![format!("BASIL_TARGET={name}")];
+    env.extend(arg_env(target, &parsed.global_args, &overrides));
     println!("basil: run {name} from {task_image}");
     let code =
         crate::solver::buildah::run_task(&task_image, &task.command, &env, &task.mounts, context)
@@ -744,7 +783,14 @@ fn base_stage_name<'a>(
 /// `handle_event`), so a plain build of an image has no side-effects. Here we
 /// only compute the closure and run `build_deliverable`.
 pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, String)>> {
-    let solved = solve(inp.file, inp.context, inp.target_filter.map(String::as_str)).await?;
+    let overrides = cli_args(&inp.build_args)?;
+    let solved = solve(
+        inp.file,
+        inp.context,
+        inp.target_filter.map(String::as_str),
+        &overrides,
+    )
+    .await?;
     let SolveContext {
         parsed,
         deliverables,
@@ -861,7 +907,7 @@ pub async fn build_targets(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, S
             &tag,
             inp.context,
             &build_file,
-            &HashMap::new(),
+            &overrides,
             insecure,
             inp.force,
         )
@@ -888,7 +934,13 @@ pub async fn promote_version(
     target_filter: Option<&str>,
     version: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let solved = solve(file, context, target_filter).await?;
+    let solved = solve(
+        file,
+        context,
+        target_filter,
+        &std::collections::HashMap::new(),
+    )
+    .await?;
     let SolveContext {
         deliverables,
         closures,
@@ -1173,6 +1225,7 @@ COPY --from=reg /x /x
             target_filter: None,
             force: false,
             cache_to: None,
+            build_args: Vec::new(),
         }));
         match res {
             Ok(pairs) => assert!(pairs.is_empty(), "{pairs:?}"),
@@ -1215,6 +1268,8 @@ async fn run_do_tasks(
     targets: &[crate::dsl::ast::Target],
     event_ref: &str,
     context: &std::path::Path,
+    global_args: &[crate::dsl::ast::Arg],
+    overrides: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<()> {
     for (do_name, t) in do_targets_for(matched, targets) {
         let Some(task) = &t.task else {
@@ -1224,7 +1279,8 @@ async fn run_do_tasks(
             anyhow::bail!("DO task `{do_name}`: module bases are not runnable as tasks");
         };
         let image = resolved_image(base_image);
-        let env = vec![format!("BASIL_EVENT={}", event_ref)];
+        let mut env = vec![format!("BASIL_EVENT={}", event_ref)];
+        env.extend(arg_env(t, global_args, overrides));
         let code =
             crate::solver::buildah::run_task(&image, &task.command, &env, &task.mounts, context)
                 .await?;
@@ -1284,6 +1340,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         }
     }
     let deliverable_names: Vec<String> = deliverables.iter().map(|(n, _)| n.clone()).collect();
+    let mut build_args = cli_args(&inp.build_args)?;
     // An event that matches no reaction is a no-op: basil handle is fed
     // every event from a webhook/CI forwarder, so an unrelated push must not
     // fail the job - there is simply nothing for it to do.
@@ -1295,11 +1352,18 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     // event also matches BUILD reactions, the DOs run *after* the build (see
     // below) so a task like deploy sees what was just built.
     if deliverable_names.is_empty() {
-        run_do_tasks(&matched, &parsed.targets, &event_ref, inp.context).await?;
+        run_do_tasks(
+            &matched,
+            &parsed.targets,
+            &event_ref,
+            inp.context,
+            &parsed.global_args,
+            &build_args,
+        )
+        .await?;
         return Ok(vec![]);
     }
 
-    let mut build_args = HashMap::new();
     // Thread a VERSION build-arg when a Tag/Release reaction carries one (from
     // the git tag ref or the release tag_name). Only targets that reference it
     // consume it in their identity.
@@ -1460,7 +1524,15 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
                 &parsed.targets,
             )
             .await?;
-            run_do_tasks(&matched, &parsed.targets, &event_ref, inp.context).await?;
+            run_do_tasks(
+                &matched,
+                &parsed.targets,
+                &event_ref,
+                inp.context,
+                &parsed.global_args,
+                &build_args,
+            )
+            .await?;
             println!("basil: done ({})", deliverable_names.join(", "));
             return Ok(vec![
                 ("result".to_string(), "idempotent-skip".to_string()),
@@ -1525,7 +1597,15 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         &parsed.targets,
     )
     .await?;
-    run_do_tasks(&matched, &parsed.targets, &event_ref, inp.context).await?;
+    run_do_tasks(
+        &matched,
+        &parsed.targets,
+        &event_ref,
+        inp.context,
+        &parsed.global_args,
+        &build_args,
+    )
+    .await?;
     println!("basil: done ({})", deliverable_names.join(", "));
     Ok(vec![(
         "digest".to_string(),
@@ -1924,7 +2004,7 @@ REGISTER 127.0.0.1:5001/modout
         .unwrap();
         let file = dir.join("Basilfile").to_str().unwrap().to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let res = rt.block_on(solve(&file, &dir, None));
+        let res = rt.block_on(solve(&file, &dir, None, &std::collections::HashMap::new()));
         let e = res.unwrap_err();
         let text = e.to_string();
         assert!(text.contains("module="), "{text}");
@@ -1944,6 +2024,79 @@ REGISTER 127.0.0.1:5001/modout
             "module value should walk up to the tmp dir: {value}"
         );
         assert!(value.ends_with("/mod/Basilfile"), "{value}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod build_arg_tests {
+    use super::*;
+
+    #[test]
+    fn cli_args_parses_kv() {
+        let raw = vec!["A=1".to_string(), "B=C D".to_string()];
+        let m = cli_args(&raw).unwrap();
+        assert_eq!(m.get("A").map(String::as_str), Some("1"));
+        assert_eq!(m.get("B").map(String::as_str), Some("C D"));
+    }
+
+    #[test]
+    fn cli_args_rejects_malformed() {
+        let e = cli_args(&["NOPE".to_string()]).unwrap_err();
+        assert!(e.to_string().contains("K=V"), "{e}");
+    }
+
+    #[test]
+    fn arg_env_only_includes_resolved_values() {
+        let f = crate::dsl::parser::parse(
+            "FROM alpine AS a
+ARG GREET=default
+ARG BARE
+",
+        )
+        .unwrap();
+        let mut ov = std::collections::HashMap::new();
+        ov.insert("GREET".to_string(), "yo".to_string());
+        let env = arg_env(&f.targets[0], &f.global_args, &ov);
+        assert!(env.contains(&"GREET=yo".to_string()), "{env:?}");
+        assert!(!env.iter().any(|e| e.starts_with("BARE")), "{env:?}");
+    }
+
+    #[test]
+    fn build_args_change_identity() {
+        // A scratch-only file is offline: no registry resolution. The same
+        // target with different --build-arg values yields different tagHash.
+        let dir = std::env::temp_dir().join(format!("basil-args-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Basilfile"),
+            "FROM scratch AS 127.0.0.1:5001/x
+ARG WHO
+RUN echo $WHO
+",
+        )
+        .unwrap();
+        let file = dir.join("Basilfile").to_str().unwrap().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut ov_a = std::collections::HashMap::new();
+        ov_a.insert("WHO".to_string(), "a".to_string());
+        let ctx_a = rt.block_on(solve(&file, &dir, None, &ov_a)).unwrap();
+        let mut ov_b = std::collections::HashMap::new();
+        ov_b.insert("WHO".to_string(), "b".to_string());
+        let ctx_b = rt.block_on(solve(&file, &dir, None, &ov_b)).unwrap();
+        let ha = ctx_a
+            .closures
+            .values()
+            .next()
+            .map(|v| crate::identity::closure::hex(v))
+            .unwrap();
+        let hb = ctx_b
+            .closures
+            .values()
+            .next()
+            .map(|v| crate::identity::closure::hex(v))
+            .unwrap();
+        assert_ne!(ha, hb, "different args must yield different identity");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

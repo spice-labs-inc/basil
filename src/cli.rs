@@ -67,6 +67,10 @@ pub struct BuildArgs {
     /// `BASIL_CACHE_REF`, then the deliverable's own repo.
     #[arg(long, value_name = "REPO")]
     pub cache_to: Option<String>,
+    /// Build arg (`K=V`, repeatable): merged with any `VERSION`
+    /// threaded from a `tag`/`release` event into the resolved ARGs.
+    #[arg(long = "build-arg", value_name = "K=V")]
+    pub build_arg: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -89,6 +93,11 @@ pub struct HandleArgs {
     /// `BASIL_CACHE_REF`, then the deliverable's own repo.
     #[arg(long, value_name = "REPO")]
     pub cache_to: Option<String>,
+    /// Build arg (`K=V`, repeatable): resolved into the target's ARGs,
+    /// feeding identity (a different value changes the tagHash where
+    /// substituted into an instruction) and the task environment.
+    #[arg(long = "build-arg", value_name = "K=V")]
+    pub build_arg: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -107,6 +116,10 @@ pub struct RunArgs {
     /// to `BASIL_CACHE_REF`, then the target's own repo when it is qualified.
     #[arg(long, value_name = "REPO")]
     pub cache_to: Option<String>,
+    /// Build arg (`K=V`, repeatable): resolved into the target's ARGs;
+    /// the task container sees the resolved values as env.
+    #[arg(long = "build-arg", value_name = "K=V")]
+    pub build_arg: Vec<String>,
 }
 
 #[derive(clap::Args)]

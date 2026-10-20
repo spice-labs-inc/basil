@@ -57,6 +57,7 @@ async fn buildah_e2e_build_and_config() {
         target_filter: None,
         force: false,
         cache_to: None,
+        build_args: Vec::new(),
     };
     let results = handle_event(inp.clone()).await.unwrap();
     let digest = results
@@ -277,6 +278,7 @@ async fn buildah_e2e_output_stages_extract_without_leaking() {
         target_filter: None,
         force: false,
         cache_to: None,
+        build_args: Vec::new(),
     };
 
     let images_before = local_image_count().await;
@@ -464,6 +466,7 @@ async fn buildah_e2e_import_inlines_content() {
         target_filter: None,
         force: false,
         cache_to: None,
+        build_args: Vec::new(),
     };
 
     let results = handle_event(inp.clone()).await.unwrap();
@@ -593,6 +596,7 @@ async fn buildah_e2e_import_intermediate_stage() {
         target_filter: None,
         force: false,
         cache_to: None,
+        build_args: Vec::new(),
     };
 
     handle_event(inp.clone()).await.unwrap();
@@ -657,9 +661,10 @@ async fn buildah_e2e_run_builds_dependencies_and_runs_task() {
 
     // The internal base stage is built and its cache image published to the
     // cache repo (its /b.txt is visible to the task); the task succeeds.
-    let code = basil::solver::orchestrate::run_target(&file_str, &dir, "runner", Some(cache_repo))
-        .await
-        .unwrap();
+    let code =
+        basil::solver::orchestrate::run_target(&file_str, &dir, "runner", Some(cache_repo), &[])
+            .await
+            .unwrap();
     assert_eq!(code, 0, "task must run against the built base stage");
     let c = basil::solver::registry::RegistryClient::new("http://127.0.0.1:5001");
     let cache_tags: Vec<String> = c
@@ -687,7 +692,7 @@ async fn buildah_e2e_run_builds_dependencies_and_runs_task() {
     )
     .unwrap();
     let bad_file = bad.join("Basilfile").to_str().unwrap().to_string();
-    let err = basil::solver::orchestrate::run_target(&bad_file, &bad, "failing", None)
+    let err = basil::solver::orchestrate::run_target(&bad_file, &bad, "failing", None, &[])
         .await
         .unwrap_err();
     assert!(
@@ -718,7 +723,7 @@ TASK --mount=type=bind,source=.,target=/workspace sh -c 'grep -q MOUNTMARKER /wo
     )
     .unwrap();
     let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
-    let code = basil::solver::orchestrate::run_target(&file_str, &dir, "runner", None)
+    let code = basil::solver::orchestrate::run_target(&file_str, &dir, "runner", None, &[])
         .await
         .unwrap();
     assert_eq!(code, 0, "the mounted context must be visible to the task");
@@ -773,6 +778,7 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_commit\n"
         target_filter: None,
         force: false,
         cache_to: None,
+        build_args: Vec::new(),
     };
 
     // Build 1: full run; the COMMIT checkpoints the prefix into the LOCAL
@@ -982,6 +988,7 @@ async fn buildah_e2e_registered_stage_dependency_uses_published_ref() {
         target_filter: Some(&filter),
         force: false,
         cache_to: Some("127.0.0.1:5001/bah_e2e_regdep_cache"),
+        build_args: Vec::new(),
     };
     let results = build_targets(inp).await.unwrap();
     let app_tag = results
@@ -1073,6 +1080,7 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_add\n",
         target_filter: None,
         force: true, // always rebuild: the assertion inspects the RUN output
         cache_to: None,
+        build_args: Vec::new(),
     };
     // Capture the stage RUN output: the deliverable is scratch, so the files
     // land via ADD in an intermediate-ish stage; assert through the pushed
@@ -1156,6 +1164,7 @@ ON push(main) BUILD 127.0.0.1:5001/bah_e2e_chg\n",
         target_filter: None,
         force: false,
         cache_to: None,
+        build_args: Vec::new(),
     };
     let results = handle_event(inp).await.unwrap();
     assert!(
@@ -1212,6 +1221,7 @@ async fn buildah_e2e_module_dependency() {
         target_filter: None,
         force: false,
         cache_to: None,
+        build_args: Vec::new(),
     };
     // First delivery: builds the module (not yet registered), then the importer.
     let results = handle_event(inp.clone()).await.unwrap();
@@ -1284,4 +1294,29 @@ async fn buildah_e2e_module_dependency() {
         "deleted module must be re-registered at its content tag, got {mod_tags_after:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `basil run --build-arg` fills the target's ARGs: the task container
+/// sees the resolved values as env, and they feed identity (a different
+/// value changes the closure).
+#[tokio::test]
+async fn buildah_e2e_run_build_arg_reaches_task_env() {
+    if !buildah_present() {
+        eprintln!("skipping: buildah unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    let dir = tempfile();
+    std::fs::write(
+        dir.join("Basilfile"),
+        "FROM alpine AS runner\nARG GREET=default\nTASK sh -c '[ \"$GREET\" = yo ] && echo GREET_OK'\n",
+    )
+    .unwrap();
+    let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
+    let args = vec!["GREET=yo".to_string()];
+    let code = basil::solver::orchestrate::run_target(&file_str, &dir, "runner", None, &args)
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "the task must see the --build-arg value as env");
+    let _ = std::fs::remove_dir_all(&dir);
 }

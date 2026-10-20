@@ -174,9 +174,12 @@ COPY --from=shared /out/artifact /artifact
 ```
 ARG <name>[=<default>]
 ```
-A build arg. Resolved from `--build-arg` (a `tag` event also threads
-`VERSION`). Only a target that actually references the arg in a `RUN`/`ENV`
-value consumes it and changes its identity.
+A build arg. Resolved from `--build-arg K=V` on `basil build`/`handle`/`run`
+(repeatable; a `tag` event also threads `VERSION`). Only a target that
+actually references the arg in a `RUN`/`ENV` value consumes it and changes
+its identity - different values are different tasks. `basil run --build-arg
+K=V <target>` and `DO` tasks expose the target's resolved args to the task
+container as `K=V` env; `RUN` steps see them too.
 
 ### `ENV`
 ```
