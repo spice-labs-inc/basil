@@ -300,9 +300,20 @@ A target may carry a `TASK` — a side-effect command run on its base image as a
 one-shot container, **not part of any image**:
 
 ```
-TASK <command>          # shell form
-TASK ["prog", "arg"]    # exec form
+TASK <command>                              # shell form
+TASK ["prog", "arg"]                         # exec form
+TASK --mount=type=bind,source=.,target=/workspace ./deploy.sh
+TASK --mount=type=secret,id=token ./use-token.sh
 ```
+
+A task may declare `--mount` flags, like `RUN`: a sourced bind
+mount resolves relative to the build context (so `source=.` mounts the
+repository; an absolute source is used as-is); a secret mount reads the
+file from the `BASIL_SECRET_<ID>` environment variable and binds it in
+under its `--target` (default `/run/secrets/<id>`); a cache mount
+works like `RUN`. A task is never part of an image, so mounts
+never affect the content tag. Exit 0 = success.
+
 
 Tasks run when a matching reaction's `DO` names the target — or manually with
 `basil run <target>`. `basil run` excludes registered targets: a target with a

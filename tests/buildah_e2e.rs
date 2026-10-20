@@ -699,6 +699,32 @@ async fn buildah_e2e_run_builds_dependencies_and_runs_task() {
     let _ = std::fs::remove_dir_all(&bad);
 }
 
+/// A task that declares "TASK --mount=type=bind,source=.,target=/workspace"
+/// opts into mounting the build context: the container sees the repository,
+/// so the task can read its contents.
+#[tokio::test]
+async fn buildah_e2e_task_bind_mount_sees_context() {
+    if !buildah_present() {
+        eprintln!("skipping: buildah unavailable");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    let dir = tempfile();
+    std::fs::write(dir.join("marker.txt"), "MOUNTMARKER\n").unwrap();
+    std::fs::write(
+        dir.join("Basilfile"),
+        "FROM alpine AS runner\n\
+TASK --mount=type=bind,source=.,target=/workspace sh -c 'grep -q MOUNTMARKER /workspace/marker.txt && echo SAW_CONTEXT'\n",
+    )
+    .unwrap();
+    let file_str = dir.join("Basilfile").to_str().unwrap().to_string();
+    let code = basil::solver::orchestrate::run_target(&file_str, &dir, "runner", None)
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "the mounted context must be visible to the task");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `COMMIT` checkpoints the build so far into the layer cache: build 1 seals
 /// the prefix as a `basil-cache-<prefixHash>` image (same namespace as stage
 /// caches); a later build resumes from that checkpoint — the `RUN` before it

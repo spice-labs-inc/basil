@@ -428,12 +428,79 @@ async fn extract_into(
     result
 }
 
+/// Render the `buildah run` arguments for a task's `--mount` declarations.
+/// Mirrors the executor's RUN mounts: a sourced bind mount resolves relative
+/// to the build context (an absolute source is used as-is, since `Path::join`
+/// replaces on absolute input); secrets come from the `BASIL_SECRET_<ID>` env
+/// and bind-mount as a file (buildah run has no `--secret`); ssh is refused
+/// (buildah run has no ssh mount). Never touches image identity.
+fn task_mount_args(
+    mounts: &[crate::dsl::ast::Mount],
+    context: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for m in mounts {
+        match m {
+            crate::dsl::ast::Mount::Bind {
+                source,
+                target,
+                read_only,
+            } => {
+                let src = match source {
+                    Some(s) => context.join(s).display().to_string(),
+                    None => String::new(),
+                };
+                let mut spec = format!("type=bind,source={src},target={target}");
+                if *read_only {
+                    spec.push_str(",readonly");
+                }
+                out.push(format!("--mount={spec}"));
+            }
+            crate::dsl::ast::Mount::Cache { id, target } => {
+                let mut spec = format!("type=cache,target={target}");
+                if let Some(i) = id {
+                    spec.push_str(&format!(",id={i}"));
+                }
+                out.push(format!("--mount={spec}"));
+            }
+            crate::dsl::ast::Mount::Secret { id, target } => {
+                let env = format!("BASIL_SECRET_{}", id.to_uppercase());
+                let src = std::env::var(&env).map_err(|_| {
+                    anyhow::anyhow!(
+                        "TASK --mount=type=secret,id={id} needs `{env}` to point at the secret file"
+                    )
+                })?;
+                let t = target
+                    .clone()
+                    .unwrap_or_else(|| format!("/run/secrets/{id}"));
+                out.push(format!("--volume={src}:{t}"));
+            }
+            crate::dsl::ast::Mount::Ssh { .. } => {
+                anyhow::bail!(
+                    "TASK --mount=type=ssh is not supported (buildah run has no ssh mount)"
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Run a task command in `image` via `buildah run` (create a working
-/// container, run, then remove).
-pub async fn run_task(image: &str, cmd: &Command, env: &[String]) -> anyhow::Result<i32> {
+/// container, run, then remove), with the task's `--mount` declarations
+/// applied and task stdout/stderr relayed to basil's own (never a tty).
+pub async fn run_task(
+    image: &str,
+    cmd: &Command,
+    env: &[String],
+    mounts: &[crate::dsl::ast::Mount],
+    context: &std::path::Path,
+) -> anyhow::Result<i32> {
     let running = buildah_from(image).await?;
     let mut run = tokio::process::Command::new("buildah");
     run.arg("run");
+    for m in task_mount_args(mounts, context)? {
+        run.arg(m);
+    }
     for e in env {
         run.arg("--env").arg(e);
     }
@@ -446,16 +513,13 @@ pub async fn run_task(image: &str, cmd: &Command, env: &[String]) -> anyhow::Res
             run.args(args);
         }
     }
-    let out = run
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("buildah run: {e}"))?;
-    let code = out.status.code().unwrap_or(1);
+    let status = run_buildah_relayed(run, "task run").await?;
+    let code = status.code().unwrap_or(1);
     let _ = tokio::process::Command::new("buildah")
         .args(["rm", &running])
         .output()
         .await;
-    Ok(if out.status.success() { 0 } else { code })
+    Ok(if status.success() { 0 } else { code })
 }
 
 /// Spawn a buildah command with stdout/stderr as **pipes**, relayed 1:1 to
@@ -530,5 +594,90 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/fa.json"))
         );
         std::env::remove_var("REGISTRY_AUTH_FILE");
+    }
+
+    #[test]
+    fn task_mount_bind_resolves_relative_to_context() {
+        let args = task_mount_args(
+            &[crate::dsl::ast::Mount::Bind {
+                source: Some("sub".to_string()),
+                target: "/workspace".to_string(),
+                read_only: false,
+            }],
+            std::path::Path::new("/ctx"),
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec!["--mount=type=bind,source=/ctx/sub,target=/workspace"]
+        );
+    }
+
+    #[test]
+    fn task_mount_bind_absolute_source_passes_through() {
+        let args = task_mount_args(
+            &[crate::dsl::ast::Mount::Bind {
+                source: Some("/abs/path".to_string()),
+                target: "/data".to_string(),
+                read_only: true,
+            }],
+            std::path::Path::new("/ctx"),
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec!["--mount=type=bind,source=/abs/path,target=/data,readonly"]
+        );
+    }
+
+    #[test]
+    fn task_mount_cache_and_secret_render() {
+        std::env::set_var("BASIL_SECRET_TOKEN", "/tmp/secret-file");
+        let args = task_mount_args(
+            &[
+                crate::dsl::ast::Mount::Cache {
+                    id: Some("c1".to_string()),
+                    target: "/cache".to_string(),
+                },
+                crate::dsl::ast::Mount::Secret {
+                    id: "token".to_string(),
+                    target: Some("/run/secrets/t".to_string()),
+                },
+            ],
+            std::path::Path::new("/ctx"),
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--mount=type=cache,target=/cache,id=c1",
+                "--volume=/tmp/secret-file:/run/secrets/t"
+            ]
+        );
+        std::env::remove_var("BASIL_SECRET_TOKEN");
+    }
+
+    #[test]
+    fn task_mount_secret_without_env_fails() {
+        std::env::remove_var("BASIL_SECRET_MISSING");
+        let e = task_mount_args(
+            &[crate::dsl::ast::Mount::Secret {
+                id: "missing".to_string(),
+                target: None,
+            }],
+            std::path::Path::new("/ctx"),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("BASIL_SECRET_MISSING"), "{e:#}");
+    }
+
+    #[test]
+    fn task_mount_ssh_is_refused() {
+        let e = task_mount_args(
+            &[crate::dsl::ast::Mount::Ssh { id: None }],
+            std::path::Path::new("/ctx"),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("ssh"), "{e:#}");
     }
 }

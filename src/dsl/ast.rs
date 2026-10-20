@@ -269,10 +269,13 @@ pub struct Workdir {
 }
 
 /// A `TASK` clause — the side-effect command: the command itself, like `RUN`,
-/// run as a one-shot container on the target's resolved base image.
+/// run as a one-shot container on the target's resolved base image, with
+/// optional `--mount` declarations (bind/cache/secret) like `RUN`. A
+/// task is never part of any image, so mounts never affect identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCmd {
     pub command: Command,
+    pub mounts: Vec<Mount>,
 }
 
 /// An `ON` reaction.

@@ -205,8 +205,32 @@ impl Parser {
                         if target.task.is_some() {
                             return self.err(line.number, "duplicate TASK in target");
                         }
+                        let mut mounts = Vec::new();
+                        let mut command_text = rest.trim().to_string();
+                        loop {
+                            let t = command_text.trim_start();
+                            if t.starts_with("--mount=") {
+                                let (spec, rest2) = take_mount_spec(t);
+                                mounts.push(self.parse_mount(&spec, line.number)?);
+                                command_text = rest2;
+                            } else if t.starts_with("--") {
+                                return self.err(
+                                    line.number,
+                                    format!(
+                                        "unsupported TASK flag: {}",
+                                        t.split_whitespace().next().unwrap_or("")
+                                    ),
+                                );
+                            } else {
+                                break;
+                            }
+                        }
+                        if command_text.trim().is_empty() {
+                            return self.err(line.number, "TASK requires a command");
+                        }
                         target.task = Some(TaskCmd {
-                            command: self.parse_command(rest, line.number)?,
+                            command: self.parse_command(&command_text, line.number)?,
+                            mounts,
                         });
                     } else if kw == "REGISTER" {
                         if target.register.is_some() {
@@ -1375,7 +1399,7 @@ mod tests {
         let f = parse(src).unwrap();
         let t = &f.targets[0];
         assert!(
-            matches!(&t.task, Some(TaskCmd { command: Command::Shell(s) }) if s == "notify-my-thing.sh")
+            matches!(&t.task, Some(TaskCmd { command: Command::Shell(s), .. }) if s == "notify-my-thing.sh")
         );
     }
 
@@ -1768,6 +1792,54 @@ ON image-published  DO notify smoke
         let f = parse("FROM alpine AS notify\nON push(main) DO notify\n").unwrap();
         let e = validate_reactions(&f).unwrap_err();
         assert!(e.message.contains("no TASK"), "{}", e.message);
+    }
+
+    #[test]
+    fn parses_task_with_mounts() {
+        let f = parse(
+            "FROM alpine AS deploy
+TASK --mount=type=bind,source=.,target=/workspace ./deploy.sh
+",
+        )
+        .unwrap();
+        let task = f.targets[0].task.as_ref().unwrap();
+        assert_eq!(task.mounts.len(), 1);
+        assert!(matches!(
+            &task.mounts[0],
+            crate::dsl::ast::Mount::Bind { source: Some(s), target, .. }
+                if s == "." && target == "/workspace"
+        ));
+        assert!(matches!(&task.command, Command::Shell(c) if c == "./deploy.sh"));
+    }
+
+    #[test]
+    fn rejects_unsupported_task_flag() {
+        let err = parse(
+            "FROM alpine AS x
+TASK --network=host ./x
+",
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("unsupported TASK flag"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn task_requires_a_command() {
+        let err = parse(
+            "FROM alpine AS x
+TASK
+",
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("TASK requires a command"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

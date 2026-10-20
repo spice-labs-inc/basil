@@ -642,7 +642,9 @@ pub async fn run_target(
     // No delivered event; the target itself is the only task context.
     let env = vec![format!("BASIL_TARGET={name}")];
     println!("basil: run {name} from {task_image}");
-    let code = crate::solver::buildah::run_task(&task_image, &task.command, &env).await?;
+    let code =
+        crate::solver::buildah::run_task(&task_image, &task.command, &env, &task.mounts, context)
+            .await?;
     if code != 0 {
         anyhow::bail!("task `{name}` failed with exit {code}");
     }
@@ -1212,6 +1214,7 @@ async fn run_do_tasks(
     matched: &[&crate::dsl::ast::Reaction],
     targets: &[crate::dsl::ast::Target],
     event_ref: &str,
+    context: &std::path::Path,
 ) -> anyhow::Result<()> {
     for (do_name, t) in do_targets_for(matched, targets) {
         let Some(task) = &t.task else {
@@ -1222,7 +1225,9 @@ async fn run_do_tasks(
         };
         let image = resolved_image(base_image);
         let env = vec![format!("BASIL_EVENT={}", event_ref)];
-        let code = crate::solver::buildah::run_task(&image, &task.command, &env).await?;
+        let code =
+            crate::solver::buildah::run_task(&image, &task.command, &env, &task.mounts, context)
+                .await?;
         if code != 0 {
             anyhow::bail!("DO task `{do_name}` failed with exit {code}");
         }
@@ -1290,7 +1295,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
     // event also matches BUILD reactions, the DOs run *after* the build (see
     // below) so a task like deploy sees what was just built.
     if deliverable_names.is_empty() {
-        run_do_tasks(&matched, &parsed.targets, &event_ref).await?;
+        run_do_tasks(&matched, &parsed.targets, &event_ref, inp.context).await?;
         return Ok(vec![]);
     }
 
@@ -1455,7 +1460,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
                 &parsed.targets,
             )
             .await?;
-            run_do_tasks(&matched, &parsed.targets, &event_ref).await?;
+            run_do_tasks(&matched, &parsed.targets, &event_ref, inp.context).await?;
             println!("basil: done ({})", deliverable_names.join(", "));
             return Ok(vec![
                 ("result".to_string(), "idempotent-skip".to_string()),
@@ -1520,7 +1525,7 @@ pub async fn handle_event(inp: BuildInput<'_>) -> anyhow::Result<Vec<(String, St
         &parsed.targets,
     )
     .await?;
-    run_do_tasks(&matched, &parsed.targets, &event_ref).await?;
+    run_do_tasks(&matched, &parsed.targets, &event_ref, inp.context).await?;
     println!("basil: done ({})", deliverable_names.join(", "));
     Ok(vec![(
         "digest".to_string(),
