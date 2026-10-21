@@ -1,0 +1,153 @@
+name: build
+
+# Build the basil binary for every target we ship: static musl linux
+# (x86_64 + aarch64) and macOS (x86_64 + aarch64). One GitHub Actions
+# artifact per target triple is uploaded on every run; on v* tags the
+# binaries are also attached to a GitHub Release.
+#
+# Plain-process design: no docker buildkit, no cross containers, no
+# third-party actions beyond the official ones. Each linux arch builds
+# natively on its own arch runner so the musl C toolchain targets the
+# host arch (aws-lc-rs CI uses the same ubuntu-latest / ubuntu-24.04-arm
+# + musl-tools setup). One Apple Silicon macOS runner builds both darwin
+# arches: aarch64 natively, x86_64 cross-compiled (the macOS SDK is
+# dual-arch; the Intel-only macos-13 runner is retired).
+
+on:
+  push:
+    branches: [main, "as/ci"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux-${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - triple: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    env:
+      # aws-lc-rs / ring build C code against musl. musl-gcc is the
+      # arch-native musl compiler on each runner (symlinked from
+      # x86_64- / aarch64-linux-musl-gcc).
+      CC: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl C toolchain
+        # aws-lc-sys 0.45 (non-FIPS) builds from pre-generated bindings and
+        # needs only a C/C++ compiler -- no cmake, nasm, or bindgen.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools musl-dev
+
+      - name: Rust toolchain
+        run: |
+          rustup default stable
+          rustup target add ${{ matrix.triple }}
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.triple }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ matrix.triple }}-
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.triple }} --bin basil
+
+      - name: Inspect binary
+        # Confirms musl linkage (a static musl build prints "statically linked").
+        run: file target/${{ matrix.triple }}/release/basil
+
+      - name: Stage binary
+        run: cp target/${{ matrix.triple }}/release/basil basil-${{ matrix.triple }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: basil-${{ matrix.triple }}
+          path: basil-${{ matrix.triple }}
+
+  macos:
+    name: macos (aarch64 + x86_64)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build (aarch64 native, x86_64 cross-compiled)
+        run: >-
+          cargo build --release
+          --target aarch64-apple-darwin --target x86_64-apple-darwin
+          --bin basil
+
+      - name: Stage binaries
+        run: |
+          cp target/aarch64-apple-darwin/release/basil basil-aarch64-apple-darwin
+          cp target/x86_64-apple-darwin/release/basil basil-x86_64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: basil-aarch64-apple-darwin
+          path: basil-aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: basil-x86_64-apple-darwin
+          path: basil-x86_64-apple-darwin
+
+  release:
+    name: release (v* tags)
+    if: startsWith(github.ref, ${{ 'refs/tags/v' }})
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: (cd dist && sha256sum basil-* > sha256sums.txt)
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*
+          else
+            gh release create "$TAG" dist/* --title "basil $TAG" --generate-notes --verify-tag
+          fi
